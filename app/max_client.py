@@ -149,8 +149,16 @@ class MaxClient:
         await self._ws.send_str(raw)
         return seq
 
-    async def cmd(self, opcode: int, payload: dict, timeout: float = 10) -> dict:
-        """Send a request and wait for the response (cmd=1 with same seq)."""
+    async def cmd(
+        self, opcode: int, payload: dict, timeout: float = 10,
+        *, none_on_timeout: bool = False,
+    ) -> dict | None:
+        """Send a request and wait for the response (cmd=1 with same seq).
+
+        By default timeouts keep the legacy empty-dict result. Callers that
+        need to distinguish a valid empty MAX response from a timeout can set
+        none_on_timeout=True.
+        """
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[dict] = loop.create_future()
         seq = await self._send(opcode, payload)
@@ -159,7 +167,7 @@ class MaxClient:
             return await asyncio.wait_for(fut, timeout=timeout)
         except asyncio.TimeoutError:
             log.warning("cmd timeout: op=%d seq=%d", opcode, seq)
-            return {}
+            return None if none_on_timeout else {}
         finally:
             self._pending.pop(seq, None)
 
@@ -360,10 +368,16 @@ class MaxClient:
                  chat_id, len(attaches), "OK" if ok else "FAIL")
         return resp
 
-    async def leave_chat(self, chat_id) -> dict:
-        """Leave a MAX group/channel via opcode 58."""
-        resp = await self.cmd(OpCode.CHAT_LEAVE, {"chatId": chat_id})
-        ok = bool(resp) and "_max_error" not in resp
+    async def leave_chat(self, chat_id) -> dict | None:
+        """Leave a MAX group/channel via opcode 58.
+
+        MAX may confirm a successful leave with an empty payload {}.
+        None is reserved for an actual RPC timeout.
+        """
+        resp = await self.cmd(
+            OpCode.CHAT_LEAVE, {"chatId": chat_id}, none_on_timeout=True,
+        )
+        ok = resp is not None and "_max_error" not in resp
         log.info("leave_chat(chat=%s) → %s", chat_id, "OK" if ok else "FAIL")
         return resp
 

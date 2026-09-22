@@ -707,9 +707,154 @@ async def _cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+def _management_keyboard(max_chat_id, thread_id: int, *, include_back: bool = False):
+    rows = [[
+        InlineKeyboardButton(
+            "🚪 Выйти из MAX",
+            callback_data=f"leave:ask:{thread_id}:{max_chat_id}",
+        )
+    ]]
+    if thread_id > 0:
+        rows.append([
+            InlineKeyboardButton(
+                "🗑 Удалить только Telegram-топик",
+                callback_data=f"del:ask:{thread_id}:{max_chat_id}",
+            )
+        ])
+    if include_back:
+        rows.append([InlineKeyboardButton("← К списку", callback_data="menu:list")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Open a button-based management menu.
+
+    Inside a bound topic the menu targets that MAX chat directly. In General
+    it lists known MAX groups/channels by title so no numeric IDs are needed.
+    """
+    message = update.message
+    if message is None or not _is_admin_user(update, context):
+        return
+
+    topic_store: TopicStore = context.bot_data[TOPIC_STORE_KEY]
+    max_client: MaxClient | None = context.bot_data.get(MAX_CLIENT_KEY)
+    if max_client is None:
+        await message.reply_text("⚠️ Max клиент не подключён.")
+        return
+
+    thread_id = message.message_thread_id
+    if thread_id is not None and message.is_topic_message:
+        max_chat_id = topic_store.chat_for_topic(thread_id)
+        if max_chat_id is not None:
+            resolver = getattr(max_client, "resolver", None)
+            title = resolver.chat_name(max_chat_id) if resolver else str(max_chat_id)
+            await message.reply_text(
+                f"<b>{escape(title)}</b>\nВыбери действие:",
+                parse_mode="HTML",
+                reply_markup=_management_keyboard(max_chat_id, thread_id),
+            )
+            return
+
+    resolver = getattr(max_client, "resolver", None)
+    if resolver is None:
+        await message.reply_text("⚠️ Список MAX-чатов пока недоступен.")
+        return
+
+    rows = []
+    for chat_id, title in sorted(
+        resolver.chats.items(), key=lambda item: str(item[1]).casefold()
+    ):
+        ctype = resolver.chat_types.get(chat_id)
+        raw = resolver.chats_raw.get(chat_id) or {}
+        if ctype not in ("CHAT", "CHANNEL"):
+            continue
+        if raw.get("status") in ("LEFT", "CLOSED"):
+            continue
+        icon = "📢" if ctype == "CHANNEL" else "💬"
+        rows.append([
+            InlineKeyboardButton(
+                f"{icon} {str(title)[:48]}",
+                callback_data=f"menu:chat:{chat_id}",
+            )
+        ])
+        if len(rows) >= 30:
+            break
+
+    if not rows:
+        await message.reply_text("Не вижу активных групп или каналов MAX.")
+        return
+
+    await message.reply_text(
+        "<b>Управление MAX</b>\nВыбери чат или канал:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+async def _on_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None or not query.data:
+        return
+    await query.answer()
+    if not _is_admin_user(update, context):
+        return
+
+    max_client: MaxClient | None = context.bot_data.get(MAX_CLIENT_KEY)
+    topic_store: TopicStore = context.bot_data[TOPIC_STORE_KEY]
+    resolver = getattr(max_client, "resolver", None) if max_client else None
+
+    if query.data == "menu:list":
+        if resolver is None:
+            await query.edit_message_text("⚠️ Список MAX-чатов пока недоступен.")
+            return
+        rows = []
+        for chat_id, title in sorted(
+            resolver.chats.items(), key=lambda item: str(item[1]).casefold()
+        ):
+            ctype = resolver.chat_types.get(chat_id)
+            raw = resolver.chats_raw.get(chat_id) or {}
+            if ctype not in ("CHAT", "CHANNEL") or raw.get("status") in ("LEFT", "CLOSED"):
+                continue
+            icon = "📢" if ctype == "CHANNEL" else "💬"
+            rows.append([
+                InlineKeyboardButton(
+                    f"{icon} {str(title)[:48]}",
+                    callback_data=f"menu:chat:{chat_id}",
+                )
+            ])
+            if len(rows) >= 30:
+                break
+        await query.edit_message_text(
+            "<b>Управление MAX</b>\nВыбери чат или канал:",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+        return
+
+    parts = query.data.split(":")
+    if len(parts) != 3 or parts[:2] != ["menu", "chat"]:
+        return
+    try:
+        max_chat_id = int(parts[2])
+    except ValueError:
+        return
+
+    title = resolver.chat_name(max_chat_id) if resolver else str(max_chat_id)
+    thread_id = topic_store.get_topic(max_chat_id) or 0
+    await query.edit_message_text(
+        f"<b>{escape(title)}</b>\nВыбери действие:",
+        parse_mode="HTML",
+        reply_markup=_management_keyboard(
+            max_chat_id, thread_id, include_back=True,
+        ),
+    )
+
+
 HELP_TEXT = (
     "<b>max2tg — мост MAX ↔ Telegram</b>\n\n"
     "Команды в супергруппе:\n"
+    "• <code>/menu</code> — открыть кнопочное меню управления текущим "
+    "MAX-чатом или выбрать чат по названию из General.\n"
     "• <code>/bind &lt;chat_id или URL&gt; [название]</code> — привязать "
     "новый топик к чату MAX.\n"
     "• <code>/add &lt;https://max.ru/join/...&gt;</code> — открыть "
@@ -795,7 +940,7 @@ async def _on_del_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             pass
         return
 
-    if len(parts) != 4 or parts[0] != "del" or parts[1] != "ok":
+    if len(parts) != 4 or parts[0] != "del":
         return
     try:
         thread_id = int(parts[2])
@@ -805,6 +950,24 @@ async def _on_del_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         max_chat_id: int | str = int(parts[3])
     except ValueError:
         max_chat_id = parts[3]
+
+    if parts[1] == "ask":
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                "🗑 Да, удалить топик",
+                callback_data=f"del:ok:{thread_id}:{max_chat_id}",
+            ),
+            InlineKeyboardButton("Отмена", callback_data="del:cancel"),
+        ]])
+        await query.edit_message_text(
+            "Удалить Telegram-топик и локальную связь?\n\n"
+            "Из MAX-чата/канала ты при этом не выйдешь.",
+            reply_markup=kb,
+        )
+        return
+
+    if parts[1] != "ok":
+        return
 
     supergroup_id = context.bot_data[SUPERGROUP_KEY]
     topic_store: TopicStore = context.bot_data[TOPIC_STORE_KEY]
@@ -913,13 +1076,35 @@ async def _on_leave_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             pass
         return
 
-    if len(parts) != 4 or parts[0] != "leave" or parts[1] != "ok":
+    if len(parts) != 4 or parts[0] != "leave":
         return
 
     try:
         thread_id = int(parts[2])
         max_chat_id: int | str = int(parts[3])
     except ValueError:
+        return
+
+    if parts[1] == "ask":
+        max_client: MaxClient | None = context.bot_data.get(MAX_CLIENT_KEY)
+        resolver = getattr(max_client, "resolver", None) if max_client else None
+        title = resolver.chat_name(max_chat_id) if resolver else str(max_chat_id)
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                "🚪 Да, выйти из MAX",
+                callback_data=f"leave:ok:{thread_id}:{max_chat_id}",
+            ),
+            InlineKeyboardButton("Отмена", callback_data="leave:cancel"),
+        ]])
+        await query.edit_message_text(
+            f"Выйти из <b>{escape(title)}</b> в MAX"
+            + (" и удалить Telegram-топик?" if thread_id > 0 else "?"),
+            parse_mode="HTML",
+            reply_markup=kb,
+        )
+        return
+
+    if parts[1] != "ok":
         return
 
     max_client: MaxClient | None = context.bot_data.get(MAX_CLIENT_KEY)
@@ -940,7 +1125,16 @@ async def _on_leave_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             pass
         return
 
-    err = (resp or {}).get("_max_error")
+    if resp is None:
+        try:
+            await query.edit_message_text(
+                "⚠️ MAX не ответил вовремя. Состояние выхода не подтверждено."
+            )
+        except Exception:
+            pass
+        return
+
+    err = resp.get("_max_error")
     if err:
         desc = (
             err.get("localizedMessage")
@@ -950,15 +1144,6 @@ async def _on_leave_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         try:
             await query.edit_message_text(f"⚠️ MAX: {desc}")
-        except Exception:
-            pass
-        return
-
-    if not resp:
-        try:
-            await query.edit_message_text(
-                "⚠️ MAX не подтвердил выход. Telegram-топик оставлен на месте."
-            )
         except Exception:
             pass
         return
@@ -1178,6 +1363,7 @@ def build_tg_app(token: str, max_client: MaxClient, supergroup_id: str,
     app.bot_data[SUPERGROUP_KEY] = int(supergroup_id)
 
     chat_filter = filters.Chat(chat_id=int(supergroup_id))
+    app.add_handler(CommandHandler("menu", _cmd_menu, filters=chat_filter))
     app.add_handler(CommandHandler("bind", _cmd_bind, filters=chat_filter))
     app.add_handler(CommandHandler("add", _cmd_add, filters=chat_filter))
     app.add_handler(CommandHandler("profile", _cmd_profile, filters=chat_filter))
@@ -1185,6 +1371,7 @@ def build_tg_app(token: str, max_client: MaxClient, supergroup_id: str,
     app.add_handler(CommandHandler("del", _cmd_del, filters=chat_filter))
     app.add_handler(CommandHandler("leave", _cmd_leave, filters=chat_filter))
     app.add_handler(CommandHandler("help", _cmd_help, filters=chat_filter))
+    app.add_handler(CallbackQueryHandler(_on_menu_callback, pattern=r"^menu:"))
     app.add_handler(CallbackQueryHandler(_on_del_callback, pattern=r"^del:"))
     app.add_handler(CallbackQueryHandler(_on_leave_callback, pattern=r"^leave:"))
     app.add_handler(

@@ -6,7 +6,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from logging.handlers import RotatingFileHandler
 
-from telegram import Update
+from telegram import BotCommand, Update
 
 from app.config import load_settings
 from app.max_listener import create_max_client
@@ -91,6 +91,11 @@ async def main():
                               admin_user_id=settings.tg_admin_user_id,
                               proxy_url=settings.tg_proxy)
         await tg_app.initialize()
+        await tg_app.bot.set_my_commands([
+            BotCommand("menu", "Действия с MAX-чатами"),
+            BotCommand("add", "Подключить чат/канал MAX по ссылке"),
+            BotCommand("help", "Справка по bridge"),
+        ])
         await tg_app.start()
         await tg_app.updater.start_polling(
             drop_pending_updates=True,

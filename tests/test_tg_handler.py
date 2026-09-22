@@ -11,7 +11,9 @@ from app.tg_handler import (
     TOPIC_STORE_KEY,
     _cmd_bind,
     _cmd_leave,
+    _cmd_menu,
     _on_leave_callback,
+    _on_menu_callback,
     _on_topic_message,
     build_tg_app,
 )
@@ -270,6 +272,40 @@ class TestLeave:
         markup = update.message.reply_text.call_args.kwargs["reply_markup"]
         assert markup.inline_keyboard[0][0].callback_data == "leave:ok:0:-123"
 
+    async def test_empty_payload_is_successful_leave(self):
+        max_client = MagicMock()
+        max_client.leave_chat = AsyncMock(return_value={})
+        resolver = MagicMock()
+        resolver.chats = {-123: "Test channel"}
+        resolver.chat_types = {-123: "CHANNEL"}
+        resolver.chats_raw = {-123: {"type": "CHANNEL"}}
+        max_client.resolver = resolver
+
+        store = MagicMock()
+        update = MagicMock()
+        update.callback_query = MagicMock()
+        update.callback_query.data = "leave:ok:0:-123"
+        update.callback_query.answer = AsyncMock()
+        update.callback_query.edit_message_text = AsyncMock()
+        update.effective_user = MagicMock()
+        update.effective_user.id = 100
+
+        ctx = _make_context(
+            max_client=max_client,
+            topic_store=store,
+            allowed_user_ids={100},
+            admin_user_id=100,
+        )
+        ctx.bot_data[SUPERGROUP_KEY] = -100999
+        ctx.bot = MagicMock()
+        ctx.bot.delete_forum_topic = AsyncMock()
+
+        await _on_leave_callback(update, ctx)
+
+        max_client.leave_chat.assert_awaited_once_with(-123)
+        store.remove.assert_called_once_with(-123)
+        ctx.bot.delete_forum_topic.assert_not_awaited()
+
     async def test_confirmed_leave_calls_max_then_removes_topic(self):
         max_client = MagicMock()
         max_client.leave_chat = AsyncMock(
@@ -308,6 +344,61 @@ class TestLeave:
             chat_id=-100999,
             message_thread_id=10,
         )
+
+
+# ---------------------------------------------------------------------------
+# button menu
+# ---------------------------------------------------------------------------
+
+class TestMenu:
+    async def test_topic_menu_offers_leave_without_chat_id(self):
+        max_client = MagicMock()
+        resolver = MagicMock()
+        resolver.chat_name.return_value = "Пчёлки"
+        max_client.resolver = resolver
+        store = _make_topic_store({10: -123})
+
+        update = _make_update(thread_id=10, user_id=100)
+        ctx = _make_context(
+            max_client=max_client,
+            topic_store=store,
+            allowed_user_ids={100},
+            admin_user_id=100,
+        )
+
+        await _cmd_menu(update, ctx)
+
+        markup = update.message.reply_text.call_args.kwargs["reply_markup"]
+        assert markup.inline_keyboard[0][0].callback_data == "leave:ask:10:-123"
+
+    async def test_general_menu_lists_max_chats_by_name(self):
+        max_client = MagicMock()
+        resolver = MagicMock()
+        resolver.chats = {-123: "Канал", -456: "Группа", 789: "Личный"}
+        resolver.chat_types = {-123: "CHANNEL", -456: "CHAT", 789: "DIALOG"}
+        resolver.chats_raw = {
+            -123: {"status": "ACTIVE"},
+            -456: {"status": "ACTIVE"},
+            789: {"status": "ACTIVE"},
+        }
+        max_client.resolver = resolver
+        store = _make_topic_store({})
+
+        update = _make_update(thread_id=None, is_topic_message=False, user_id=100)
+        ctx = _make_context(
+            max_client=max_client,
+            topic_store=store,
+            allowed_user_ids={100},
+            admin_user_id=100,
+        )
+
+        await _cmd_menu(update, ctx)
+
+        markup = update.message.reply_text.call_args.kwargs["reply_markup"]
+        labels = [row[0].text for row in markup.inline_keyboard]
+        assert any("Канал" in label for label in labels)
+        assert any("Группа" in label for label in labels)
+        assert all("Личный" not in label for label in labels)
 
 
 # ---------------------------------------------------------------------------

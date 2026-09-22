@@ -1,5 +1,7 @@
 """Tests for app/max_client.py — OpCode enum and _parse_message."""
 
+from unittest.mock import AsyncMock
+
 import pytest
 from app.max_client import MaxClient, MaxMessage, OpCode
 
@@ -278,3 +280,14 @@ class TestMaxClientInit:
 
         result = c.on_disconnect(my_handler)
         assert result is my_handler
+
+    async def test_leave_chat_accepts_empty_success_payload(self):
+        c = MaxClient(token="tok", device_id="dev")
+        c.cmd = AsyncMock(return_value={})
+
+        resp = await c.leave_chat(-123)
+
+        assert resp == {}
+        c.cmd.assert_awaited_once_with(
+            OpCode.CHAT_LEAVE, {"chatId": -123}, none_on_timeout=True,
+        )
