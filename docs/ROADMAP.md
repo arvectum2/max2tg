@@ -5,6 +5,7 @@
 Уже работает личный двусторонний bridge MAX ↔ Telegram: входящие сообщения, темы, ответы, медиа, семейный ACL, reconnect и базовое управление чатами.
 
 Последние изменения:
+- репозитории сведены: единственный source of truth — `arvectum2/max2tg` (`main`), GitVerse `arvectum/max2tg` — автоматическое зеркало, исходный `ircitdev/MAX2TG-Bridge` — read-only upstream;
 - добавлен MAX CHAT_LEAVE;
 - добавлена карта MAX message ↔ Telegram message;
 - MAX reply переводится в настоящий Telegram reply;

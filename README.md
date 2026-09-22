@@ -20,6 +20,14 @@
 
 Архитектура массового режима: [`docs/PRODUCT_ARCHITECTURE.md`](docs/PRODUCT_ARCHITECTURE.md). Дорожная карта: [`docs/ROADMAP.md`](docs/ROADMAP.md).
 
+### Source of truth
+
+Канонический репозиторий проекта — **GitHub `arvectum2/max2tg`**, каноническая ветка — **`main`**.
+
+- **GitVerse `arvectum/max2tg`** — только автоматическое одностороннее зеркало GitHub → GitVerse. Разработка и прямые push в GitVerse не выполняются.
+- **`ircitdev/MAX2TG-Bridge`** — только upstream исходного проекта для истории и выборочного получения обновлений; это не источник релизов MAX2TG.
+- Во всех рабочих клонах `origin` должен указывать на `https://github.com/arvectum2/max2tg.git`. Любые изменения сначала попадают в канонический GitHub, после чего `.github/workflows/mirror-to-gitverse.yml` синхронизирует ветки и теги в GitVerse.
+
 ---
 
 ## Содержание
