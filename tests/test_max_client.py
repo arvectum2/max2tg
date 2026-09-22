@@ -1,5 +1,6 @@
 """Tests for app/max_client.py — OpCode enum and _parse_message."""
 
+import asyncio
 from unittest.mock import AsyncMock
 
 import pytest
@@ -43,8 +44,14 @@ class TestOpCode:
     def test_chat_get(self):
         assert OpCode.CHAT_GET == 48
 
+    def test_chat_open_link(self):
+        assert OpCode.CHAT_OPEN_LINK == 57
+
     def test_chat_leave(self):
         assert OpCode.CHAT_LEAVE == 58
+
+    def test_global_search(self):
+        assert OpCode.GLOBAL_SEARCH == 60
 
     def test_send_message(self):
         assert OpCode.SEND_MESSAGE == 64
@@ -291,3 +298,55 @@ class TestMaxClientInit:
         c.cmd.assert_awaited_once_with(
             OpCode.CHAT_LEAVE, {"chatId": -123}, none_on_timeout=True,
         )
+
+    async def test_search_global_uses_opcode_60(self):
+        c = MaxClient(token="tok", device_id="dev")
+        c.cmd = AsyncMock(return_value={"result": [], "total": 0})
+
+        resp = await c.search_global("  test query  ", count=16)
+
+        assert resp == {"result": [], "total": 0}
+        c.cmd.assert_awaited_once_with(
+            OpCode.GLOBAL_SEARCH,
+            {"query": "test query", "count": 16, "type": "ALL"},
+            none_on_timeout=True,
+        )
+
+    async def test_search_global_skips_empty_query(self):
+        c = MaxClient(token="tok", device_id="dev")
+        c.cmd = AsyncMock()
+
+        resp = await c.search_global("   ")
+
+        assert resp == {"result": [], "total": 0}
+        c.cmd.assert_not_awaited()
+
+    def test_dialog_chat_id_matches_max_web_xor(self):
+        c = MaxClient(token="tok", device_id="dev")
+        c._my_id = 436246481
+
+        assert c.dialog_chat_id(543835) == 436788106
+
+    async def test_auth_ready_callback_does_not_block_receive_loop(self):
+        c = MaxClient(token="tok", device_id="dev")
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        @c.on_ready
+        async def ready_handler(snapshot):
+            started.set()
+            await release.wait()
+
+        await asyncio.wait_for(
+            c._handle({
+                "opcode": OpCode.AUTH_SNAPSHOT,
+                "cmd": 1,
+                "seq": 1,
+                "payload": {"profile": {"id": 123}},
+            }),
+            timeout=0.2,
+        )
+        await asyncio.wait_for(started.wait(), timeout=0.2)
+        assert c._my_id == 123
+        release.set()
+        await asyncio.sleep(0)

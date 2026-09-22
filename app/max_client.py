@@ -68,7 +68,9 @@ class OpCode(IntEnum):
     CONTACT_GET = 32
     CONTACT_PRESENCE = 35
     CHAT_GET = 48
+    CHAT_OPEN_LINK = 57
     CHAT_LEAVE = 58
+    GLOBAL_SEARCH = 60
     SEND_MESSAGE = 64
     ATTACH_TYPING = 65        # "I'm uploading <type> in this chat"
     EDIT_MESSAGE = 67
@@ -295,7 +297,11 @@ class MaxClient:
                     self._dump_json("snapshot.json", payload)
 
                 if self._on_ready_cb:
-                    await self._on_ready_cb(payload)
+                    # Do not await user callbacks inside the WebSocket receive
+                    # loop: ready handlers may issue RPCs (for example CONTACT_GET),
+                    # whose responses can only be consumed by this same loop.
+                    task = asyncio.create_task(self._on_ready_cb(payload))
+                    task.add_done_callback(_log_task_exception)
 
             elif op == OpCode.DISPATCH:
                 self._dispatch_counter += 1
@@ -368,6 +374,29 @@ class MaxClient:
                  chat_id, len(attaches), "OK" if ok else "FAIL")
         return resp
 
+    async def search_global(self, query: str, count: int = 20) -> dict | None:
+        """Search MAX globally for people, groups and channels."""
+        query = query.strip()
+        if not query:
+            return {"result": [], "total": 0}
+        resp = await self.cmd(
+            OpCode.GLOBAL_SEARCH,
+            {"query": query, "count": count, "type": "ALL"},
+            none_on_timeout=True,
+        )
+        log.info(
+            "search_global(%r) → %s results",
+            query,
+            len((resp or {}).get("result") or []) if isinstance(resp, dict) else 0,
+        )
+        return resp
+
+    def dialog_chat_id(self, contact_id: int) -> int:
+        """Return MAX's deterministic DIALOG id: viewer_id XOR contact_id."""
+        if self._my_id is None:
+            raise RuntimeError("MAX viewer id is not available yet")
+        return int(self._my_id) ^ int(contact_id)
+
     async def leave_chat(self, chat_id) -> dict | None:
         """Leave a MAX group/channel via opcode 58.
 
@@ -423,7 +452,7 @@ class MaxClient:
             return None
         return {"_type": "PHOTO", "photoToken": token}
 
-    async def open_by_link(self, link: str) -> dict:
+    async def open_by_link(self, link: str) -> dict | None:
         """Resolve a max.ru invite link via opcode 57.
 
         Works for ``/join/<token>`` (group / channel invite — chat namespace).
@@ -431,7 +460,9 @@ class MaxClient:
         opcode that we haven't reverse-engineered yet — server returns
         ``not.found`` for chat-namespace lookup.
         """
-        resp = await self.cmd(57, {"link": link})
+        resp = await self.cmd(
+            OpCode.CHAT_OPEN_LINK, {"link": link}, none_on_timeout=True,
+        )
         log.info("open_by_link(%s) → %s",
                  link[:60], str(resp)[:300] if resp else resp)
         return resp

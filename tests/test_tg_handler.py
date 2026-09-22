@@ -12,8 +12,12 @@ from app.tg_handler import (
     _cmd_bind,
     _cmd_leave,
     _cmd_menu,
+    _cmd_search,
+    _normalize_global_search_results,
     _on_leave_callback,
     _on_menu_callback,
+    _on_search_callback,
+    _on_search_input,
     _on_topic_message,
     build_tg_app,
 )
@@ -59,6 +63,7 @@ def _make_context(max_client=None, topic_store=None, allowed_user_id=None, allow
     if topic_store is not None:
         bot_data[TOPIC_STORE_KEY] = topic_store
     ctx.bot_data = bot_data
+    ctx.user_data = {}
     return ctx
 
 
@@ -481,6 +486,208 @@ class TestMenu:
         store.set_topic.assert_called_once_with(-456, 77, "Группа")
         text = update.callback_query.edit_message_text.call_args.args[0]
         assert "Telegram-топик создан" in text
+
+
+# ---------------------------------------------------------------------------
+# MAX global search UX
+# ---------------------------------------------------------------------------
+
+class TestSearch:
+    def test_normalizes_public_chat_and_contact(self):
+        max_client = MagicMock()
+        max_client._my_id = 100
+        max_client.dialog_chat_id.side_effect = lambda uid: 100 ^ uid
+
+        records = _normalize_global_search_results({
+            "result": [
+                {
+                    "chat": {
+                        "id": -777,
+                        "type": "CHANNEL",
+                        "title": "Новости",
+                        "link": "https://max.ru/news",
+                    }
+                },
+                {
+                    "contact": {
+                        "contact": {
+                            "id": 55,
+                            "names": [{"firstName": "Иван", "lastName": "Иванов"}],
+                            "link": "https://max.ru/id55",
+                        }
+                    }
+                },
+            ]
+        }, max_client)
+
+        assert records[0]["chat_id"] == -777
+        assert records[0]["type"] == "CHANNEL"
+        assert records[1]["chat_id"] == (100 ^ 55)
+        assert records[1]["type"] == "DIALOG"
+        assert records[1]["title"] == "Иван Иванов"
+
+    async def test_search_input_calls_global_search_and_renders_results(self):
+        max_client = MagicMock()
+        max_client._my_id = 100
+        max_client.search_global = AsyncMock(return_value={
+            "result": [{
+                "chat": {
+                    "id": -777,
+                    "type": "CHANNEL",
+                    "title": "Новости",
+                    "link": "https://max.ru/news",
+                }
+            }],
+            "total": 1,
+        })
+        store = _make_topic_store({})
+        update = _make_update(
+            text="Новости", thread_id=1,
+            is_topic_message=True, user_id=100,
+        )
+        ctx = _make_context(
+            max_client=max_client,
+            topic_store=store,
+            allowed_user_ids={100},
+            admin_user_id=100,
+        )
+        ctx.user_data["awaiting_max_search"] = True
+
+        await _on_search_input(update, ctx)
+
+        max_client.search_global.assert_awaited_once_with("Новости", count=16)
+        assert ctx.user_data["awaiting_max_search"] is False
+        markup = update.message.reply_text.call_args.kwargs["reply_markup"]
+        callbacks = [
+            button.callback_data for row in markup.inline_keyboard for button in row
+        ]
+        assert "search:open:-777" in callbacks
+
+    async def test_search_connect_dialog_creates_topic_without_open_by_link(self):
+        max_client = MagicMock()
+        max_client._my_id = 100
+        max_client.open_by_link = AsyncMock()
+        resolver = MagicMock()
+        resolver.my_id = 100
+        resolver.chats = {}
+        resolver.chat_types = {}
+        resolver.chats_raw = {}
+        resolver.contacts_raw = {}
+        resolver.users = {}
+        resolver.is_dm.side_effect = lambda cid: resolver.chat_types.get(cid) == "DIALOG"
+        resolver.chat_name.side_effect = lambda cid: resolver.chats.get(cid, str(cid))
+        max_client.resolver = resolver
+
+        chat_id = 100 ^ 55
+        record = {
+            "chat_id": chat_id,
+            "contact_id": 55,
+            "type": "DIALOG",
+            "title": "Иван Иванов",
+            "link": "https://max.ru/id55",
+            "raw": {
+                "id": 55,
+                "names": [{"firstName": "Иван", "lastName": "Иванов"}],
+            },
+        }
+        store = _make_topic_store({})
+        update = MagicMock()
+        update.callback_query = MagicMock()
+        update.callback_query.data = f"search:connect:{chat_id}"
+        update.callback_query.answer = AsyncMock()
+        update.callback_query.edit_message_text = AsyncMock()
+        update.effective_user = MagicMock()
+        update.effective_user.id = 100
+
+        ctx = _make_context(
+            max_client=max_client,
+            topic_store=store,
+            allowed_user_ids={100},
+            admin_user_id=100,
+        )
+        ctx.user_data["max_search_results"] = {str(chat_id): record}
+        ctx.bot_data[SUPERGROUP_KEY] = -100999
+        ctx.bot = MagicMock()
+        topic = MagicMock()
+        topic.message_thread_id = 88
+        ctx.bot.create_forum_topic = AsyncMock(return_value=topic)
+        ctx.bot.send_message = AsyncMock()
+        ctx.bot.pin_chat_message = AsyncMock()
+
+        await _on_search_callback(update, ctx)
+
+        max_client.open_by_link.assert_not_awaited()
+        ctx.bot.create_forum_topic.assert_awaited_once_with(
+            chat_id=-100999, name="Иван Иванов",
+        )
+        store.set_topic.assert_called_once_with(chat_id, 88, "Иван Иванов")
+        assert resolver.chat_types[chat_id] == "DIALOG"
+        assert resolver.users[55] == "Иван Иванов"
+
+    async def test_search_connect_public_channel_opens_link_first(self):
+        max_client = MagicMock()
+        resolver = MagicMock()
+        resolver.my_id = 100
+        resolver.chats = {}
+        resolver.chat_types = {}
+        resolver.chats_raw = {}
+        resolver.contacts_raw = {}
+        resolver.users = {}
+        resolver.is_dm.return_value = False
+        resolver.chat_name.side_effect = lambda cid: resolver.chats.get(cid, str(cid))
+        max_client.resolver = resolver
+        max_client.open_by_link = AsyncMock(return_value={
+            "chat": {
+                "id": -777,
+                "type": "CHANNEL",
+                "title": "Новости",
+                "link": "https://max.ru/news",
+                "status": "ACTIVE",
+            }
+        })
+        store = _make_topic_store({})
+        record = {
+            "chat_id": -777,
+            "type": "CHANNEL",
+            "title": "Новости",
+            "link": "https://max.ru/news",
+            "raw": {
+                "id": -777,
+                "type": "CHANNEL",
+                "title": "Новости",
+            },
+        }
+
+        update = MagicMock()
+        update.callback_query = MagicMock()
+        update.callback_query.data = "search:connect:-777"
+        update.callback_query.answer = AsyncMock()
+        update.callback_query.edit_message_text = AsyncMock()
+        update.effective_user = MagicMock()
+        update.effective_user.id = 100
+
+        ctx = _make_context(
+            max_client=max_client,
+            topic_store=store,
+            allowed_user_ids={100},
+            admin_user_id=100,
+        )
+        ctx.user_data["max_search_results"] = {"-777": record}
+        ctx.bot_data[SUPERGROUP_KEY] = -100999
+        ctx.bot = MagicMock()
+        topic = MagicMock()
+        topic.message_thread_id = 89
+        ctx.bot.create_forum_topic = AsyncMock(return_value=topic)
+        ctx.bot.send_message = AsyncMock()
+        ctx.bot.pin_chat_message = AsyncMock()
+
+        await _on_search_callback(update, ctx)
+
+        max_client.open_by_link.assert_awaited_once_with("https://max.ru/news")
+        ctx.bot.create_forum_topic.assert_awaited_once_with(
+            chat_id=-100999, name="Новости",
+        )
+        assert resolver.chat_types[-777] == "CHANNEL"
 
 
 # ---------------------------------------------------------------------------

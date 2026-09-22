@@ -18,9 +18,9 @@ app/
   max_listener.py  # MAX → TG handler (incoming), auto-topic creation
   resolver.py      # кеш контактов / чатов (chats_raw, contacts_raw)
   tg_sender.py     # TelegramSender + ensure_topic (create/rename)
-  tg_handler.py    # TG → MAX + Personal UX: /menu, bind/add/profile/intro/del/leave/help
+  tg_handler.py    # TG → MAX + Personal UX: menu/search/bind/add/profile/intro/del/leave/help
   topics.py        # TopicStore: JSON-карта max_chat_id ↔ thread_id
-tests/             # 211 pytest, asyncio_mode=auto
+tests/             # 221 pytest, asyncio_mode=auto
 docs/cover.jpg     # обложка README
 state/             # runtime (топик-карта), gitignored
 logs/              # логи, gitignored
@@ -40,7 +40,9 @@ WebSocket: `wss://ws-api.oneme.ru/websocket`, `Origin: https://web.max.ru`.
 | 32 | CONTACT_GET — возвращает `{names, baseUrl, photoId}`, **НЕ возвращает phone/about** |
 | 35 | CONTACT_PRESENCE |
 | 48 | CHAT_GET |
-| 57 | open by link — работает только для `/join/<token>` (group/channel); `/u/<token>` падает с `not.found / chat namespace` |
+| 57 | CHAT_OPEN_LINK — открыть/вступить/подписаться по публичной chat/channel ссылке; user share `/u/...` остаётся не chat namespace |
+| 58 | CHAT_LEAVE — выйти из группы/канала |
+| 60 | GLOBAL_SEARCH — `{query, count, type:"ALL"}`; возвращает `contact` и `chat` результаты |
 | 64 | SEND_MESSAGE (text, elements, attaches, link) |
 | 65 | ATTACH_TYPING ("я загружаю PHOTO/AUDIO/...") |
 | 67 | EDIT_MESSAGE |
@@ -79,6 +81,7 @@ WebSocket: `wss://ws-api.oneme.ru/websocket`, `Origin: https://web.max.ru`.
 ### Особенности WS
 
 - `proto.payload` ошибки **закрывают WS** для некоторых опкодов (мост авто-реконнектится через 5 сек). Это мешает массовому пробингу: после первой неудачи остальные опкоды успевают только таймаут схватить.
+- Callback `on_ready` нельзя await'ить внутри receive loop: resolver сам вызывает RPC `CONTACT_GET`, и это создаёт deadlock. Сейчас callback запускается отдельной asyncio task; startup contact resolve проходит сразу.
 - Токен MAX молча ротируется при логине в web.max.ru с другого устройства: handshake проходит, AUTH_SNAPSHOT не приходит → бот висит. Решение — освежить `MAX_TOKEN`.
 
 ## Telegram-side нюансы
@@ -91,7 +94,7 @@ WebSocket: `wss://ws-api.oneme.ru/websocket`, `Origin: https://web.max.ru`.
 
 ## Personal UX v1.0 — текущий gate
 
-До onboarding/multi-user сначала закрываем личную Telegram-first версию. Панель в General показывает DIALOG/CHAT/CHANNEL с пагинацией и отметкой подключённых топиков; из карточки можно создать/восстановить Telegram-топик без chat_id. Для DIALOG кнопка выхода из MAX не показывается. Следующий крупный блок — поиск людей/групп/каналов MAX из Telegram и lifecycle/ошибки.
+До onboarding/multi-user сначала закрываем личную Telegram-first версию. Панель в General показывает DIALOG/CHAT/CHANNEL с пагинацией и отметкой подключённых топиков; из карточки можно создать/восстановить Telegram-топик без chat_id. Для DIALOG кнопка выхода из MAX не показывается. Глобальный поиск MAX (opcode 60) уже встроен: человек → deterministic DIALOG id (`viewer_id ^ contact_id`), группа/канал → открыть/вступить через opcode 57 и создать топик. Следующий блок — живая UX-проверка lifecycle и единообразные ошибки/подтверждения.
 
 ## Команды (в супергруппе)
 

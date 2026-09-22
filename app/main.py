@@ -93,6 +93,7 @@ async def main():
         await tg_app.initialize()
         await tg_app.bot.set_my_commands([
             BotCommand("menu", "Действия с MAX-чатами"),
+            BotCommand("search", "Найти человека, группу или канал MAX"),
             BotCommand("add", "Подключить чат/канал MAX по ссылке"),
             BotCommand("help", "Справка по bridge"),
         ])

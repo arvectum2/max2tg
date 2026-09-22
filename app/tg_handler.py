@@ -31,6 +31,10 @@ SUPERGROUP_KEY = "supergroup_id"
 _MAX_URL_RE = re.compile(r"https?://(?:web\.)?max\.ru/(-?\d+)")
 _MENU_PAGE_SIZE = 8
 _MENU_ACTIVE_TYPES = {"DIALOG", "CHAT", "CHANNEL"}
+_SEARCH_LIMIT = 16
+_SEARCH_WAITING_KEY = "awaiting_max_search"
+_SEARCH_RESULTS_KEY = "max_search_results"
+_SEARCH_QUERY_KEY = "max_search_query"
 
 # Telegram entity type → MAX element type. The MAX names match what the
 # existing codebase used (STRONG) and what MAX renders for the formatting
@@ -764,6 +768,135 @@ def _menu_list_markup(resolver, topic_store: TopicStore, page: int = 0):
     return InlineKeyboardMarkup(rows), page, page_count, len(entries)
 
 
+def _contact_display_name(contact: dict) -> str:
+    names = contact.get("names")
+    if isinstance(names, list) and names:
+        first = names[0].get("firstName", "")
+        last = names[0].get("lastName", "")
+        name = f"{first} {last}".strip() or names[0].get("name", "")
+        if name:
+            return str(name)
+    first = contact.get("firstName") or contact.get("first_name") or ""
+    last = contact.get("lastName") or contact.get("last_name") or ""
+    return (f"{first} {last}".strip()
+            or str(contact.get("friendly") or contact.get("displayName")
+                   or contact.get("name") or contact.get("link") or ""))
+
+
+def _normalize_global_search_results(resp: dict | None,
+                                     max_client: MaxClient) -> list[dict]:
+    if not isinstance(resp, dict):
+        return []
+    records: list[dict] = []
+    seen: set[int] = set()
+    for item in resp.get("result") or []:
+        if not isinstance(item, dict):
+            continue
+
+        chat = item.get("chat")
+        if isinstance(chat, dict):
+            chat_id = chat.get("id")
+            try:
+                chat_id = int(chat_id)
+            except (TypeError, ValueError):
+                continue
+            ctype = chat.get("type")
+            if ctype not in ("CHAT", "CHANNEL"):
+                continue
+            if chat_id in seen:
+                continue
+            title = str(chat.get("title") or chat.get("name") or chat_id)
+            records.append({
+                "chat_id": chat_id,
+                "type": ctype,
+                "title": title,
+                "link": chat.get("link") or "",
+                "raw": chat,
+            })
+            seen.add(chat_id)
+            continue
+
+        wrapper = item.get("contact")
+        if not isinstance(wrapper, dict):
+            continue
+        contact = wrapper.get("contact")
+        if not isinstance(contact, dict):
+            contact = wrapper
+        contact_id = contact.get("id") or contact.get("userId")
+        try:
+            contact_id = int(contact_id)
+        except (TypeError, ValueError):
+            continue
+        if max_client._my_id is not None and contact_id == int(max_client._my_id):
+            continue
+        try:
+            chat_id = max_client.dialog_chat_id(contact_id)
+        except (RuntimeError, TypeError, ValueError):
+            continue
+        if chat_id in seen:
+            continue
+        title = _contact_display_name(contact) or str(contact_id)
+        records.append({
+            "chat_id": chat_id,
+            "contact_id": contact_id,
+            "type": "DIALOG",
+            "title": title,
+            "link": contact.get("link") or "",
+            "raw": contact,
+        })
+        seen.add(chat_id)
+
+    return records
+
+
+def _search_results_markup(records: list[dict], topic_store: TopicStore) -> InlineKeyboardMarkup:
+    rows = []
+    icons = {"DIALOG": "👤", "CHAT": "💬", "CHANNEL": "📢"}
+    for record in records[:_SEARCH_LIMIT]:
+        chat_id = record["chat_id"]
+        linked = "✅ " if topic_store.get_topic(chat_id) else ""
+        label = f"{linked}{icons.get(record['type'], '💬')} {record['title']}"[:55]
+        rows.append([InlineKeyboardButton(
+            label, callback_data=f"search:open:{chat_id}",
+        )])
+    rows.append([
+        InlineKeyboardButton("🔎 Новый поиск", callback_data="search:new"),
+        InlineKeyboardButton("← Мои чаты", callback_data="menu:list:0"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+def _cache_search_record_in_resolver(max_client: MaxClient, record: dict) -> None:
+    resolver = getattr(max_client, "resolver", None)
+    if resolver is None:
+        return
+    chat_id = record["chat_id"]
+    ctype = record["type"]
+    title = record["title"]
+
+    if ctype == "DIALOG":
+        contact_id = record.get("contact_id")
+        contact = record.get("raw") or {}
+        if contact_id is not None:
+            resolver.contacts_raw[contact_id] = contact
+            resolver.users[contact_id] = title
+        participants = {}
+        if resolver.my_id is not None:
+            participants[str(resolver.my_id)] = {}
+        if contact_id is not None:
+            participants[str(contact_id)] = {}
+        resolver.chats_raw[chat_id] = {
+            "id": chat_id,
+            "type": "DIALOG",
+            "status": "ACTIVE",
+            "participants": participants,
+        }
+    else:
+        resolver.chats_raw[chat_id] = dict(record.get("raw") or {})
+    resolver.chat_types[chat_id] = ctype
+    resolver.chats[chat_id] = title
+
+
 def _management_keyboard(max_chat_id, thread_id: int, *, is_dm: bool = False,
                          include_back: bool = False, back_page: int = 0):
     rows = []
@@ -795,9 +928,10 @@ def _management_keyboard(max_chat_id, thread_id: int, *, is_dm: bool = False,
 
 
 def _general_management_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("⚙️ Управление MAX", callback_data="menu:list"),
-    ]])
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💬 Мои чаты", callback_data="menu:list:0")],
+        [InlineKeyboardButton("🔎 Поиск в MAX", callback_data="menu:search")],
+    ])
 
 
 async def ensure_management_panel(bot, supergroup_id, topic_store: TopicStore) -> int | None:
@@ -860,6 +994,7 @@ async def _cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if message is None or not _is_admin_user(update, context):
         return
 
+    context.user_data[_SEARCH_WAITING_KEY] = False
     topic_store: TopicStore = context.bot_data[TOPIC_STORE_KEY]
     max_client: MaxClient | None = context.bot_data.get(MAX_CLIENT_KEY)
     if max_client is None:
@@ -902,12 +1037,320 @@ async def _cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+
+def _search_prompt_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("← Мои чаты", callback_data="menu:list:0"),
+    ]])
+
+
+async def _run_global_search(context: ContextTypes.DEFAULT_TYPE,
+                             query_text: str) -> tuple[list[dict], int, str | None]:
+    max_client: MaxClient | None = context.bot_data.get(MAX_CLIENT_KEY)
+    if max_client is None:
+        return [], 0, "Max клиент не подключён."
+    try:
+        resp = await max_client.search_global(query_text, count=_SEARCH_LIMIT)
+    except Exception as exc:
+        log.exception("MAX global search failed")
+        return [], 0, f"Ошибка поиска MAX: {exc}"
+    if resp is None:
+        return [], 0, "MAX не ответил вовремя."
+    err = resp.get("_max_error") if isinstance(resp, dict) else None
+    if err:
+        desc = (err.get("localizedMessage") or err.get("message")
+                or err.get("error") or "MAX отклонил поиск")
+        return [], 0, str(desc)
+
+    records = _normalize_global_search_results(resp, max_client)
+    total = resp.get("total", len(records)) if isinstance(resp, dict) else len(records)
+    try:
+        total = int(total)
+    except (TypeError, ValueError):
+        total = len(records)
+    context.user_data[_SEARCH_RESULTS_KEY] = {
+        str(record["chat_id"]): record for record in records
+    }
+    context.user_data[_SEARCH_QUERY_KEY] = query_text
+    return records, total, None
+
+
+async def _reply_search_results(message, context: ContextTypes.DEFAULT_TYPE,
+                                query_text: str) -> None:
+    records, total, error = await _run_global_search(context, query_text)
+    if error:
+        await message.reply_text(
+            f"⚠️ {escape(error)}",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔎 Попробовать ещё", callback_data="search:new"),
+            ]]),
+        )
+        return
+    if not records:
+        await message.reply_text(
+            f"По запросу <b>{escape(query_text)}</b> ничего не нашёл.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔎 Новый поиск", callback_data="search:new"),
+                InlineKeyboardButton("← Мои чаты", callback_data="menu:list:0"),
+            ]]),
+        )
+        return
+
+    shown = min(len(records), _SEARCH_LIMIT)
+    total_hint = f" из {total}" if total > shown else ""
+    await message.reply_text(
+        f"<b>Поиск MAX:</b> {escape(query_text)}\n"
+        f"Показано {shown}{total_hint}. Выбери результат:",
+        parse_mode="HTML",
+        reply_markup=_search_results_markup(records, context.bot_data[TOPIC_STORE_KEY]),
+        disable_web_page_preview=True,
+    )
+
+
+async def _cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    if message is None or not _is_admin_user(update, context):
+        return
+    query_text = " ".join(context.args or []).strip()
+    if not query_text:
+        context.user_data[_SEARCH_WAITING_KEY] = True
+        await message.reply_text(
+            "<b>Поиск в MAX</b>\n"
+            "Напиши в General имя человека, название группы/канала "
+            "или @username.",
+            parse_mode="HTML",
+            reply_markup=_search_prompt_markup(),
+        )
+        return
+    context.user_data[_SEARCH_WAITING_KEY] = False
+    await _reply_search_results(message, context, query_text)
+
+
+async def _on_search_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    if message is None or not _is_admin_user(update, context):
+        return
+    if not context.user_data.get(_SEARCH_WAITING_KEY):
+        return
+    # General can itself carry a forum message_thread_id. Only reject text
+    # from a thread that is actually mapped to a MAX chat.
+    topic_store: TopicStore = context.bot_data[TOPIC_STORE_KEY]
+    if (
+        message.is_topic_message
+        and message.message_thread_id is not None
+        and topic_store.chat_for_topic(message.message_thread_id) is not None
+    ):
+        return
+    query_text = (message.text or "").strip()
+    if not query_text:
+        return
+    context.user_data[_SEARCH_WAITING_KEY] = False
+    await _reply_search_results(message, context, query_text)
+
+
+def _search_record_keyboard(record: dict, topic_store: TopicStore,
+                            resolver=None) -> InlineKeyboardMarkup:
+    chat_id = record["chat_id"]
+    thread_id = topic_store.get_topic(chat_id)
+    rows = []
+    if thread_id:
+        rows.append([InlineKeyboardButton(
+            "✅ Telegram-топик подключён", callback_data="menu:noop",
+        )])
+    else:
+        active = bool(
+            resolver
+            and chat_id in resolver.chats_raw
+            and (resolver.chats_raw.get(chat_id) or {}).get("status")
+            not in ("LEFT", "CLOSED")
+        )
+        if record["type"] == "DIALOG" or active:
+            action = "➕ Создать Telegram-топик"
+        elif record["type"] == "CHANNEL":
+            action = "➕ Подписаться и создать топик"
+        else:
+            action = "➕ Вступить и создать топик"
+        rows.append([InlineKeyboardButton(
+            action, callback_data=f"search:connect:{chat_id}",
+        )])
+    rows.append([
+        InlineKeyboardButton("← К результатам", callback_data="search:results"),
+        InlineKeyboardButton("🔎 Новый поиск", callback_data="search:new"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _on_search_callback(update: Update,
+                              context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None or not query.data:
+        return
+    await query.answer()
+    if not _is_admin_user(update, context):
+        return
+
+    topic_store: TopicStore = context.bot_data[TOPIC_STORE_KEY]
+    max_client: MaxClient | None = context.bot_data.get(MAX_CLIENT_KEY)
+    resolver = getattr(max_client, "resolver", None) if max_client else None
+
+    if query.data == "search:new":
+        context.user_data[_SEARCH_WAITING_KEY] = True
+        await query.edit_message_text(
+            "<b>Поиск в MAX</b>\n"
+            "Напиши в General имя человека, название группы/канала "
+            "или @username.",
+            parse_mode="HTML",
+            reply_markup=_search_prompt_markup(),
+        )
+        return
+
+    records_by_id = context.user_data.get(_SEARCH_RESULTS_KEY) or {}
+    if query.data == "search:results":
+        records = list(records_by_id.values())
+        query_text = context.user_data.get(_SEARCH_QUERY_KEY) or ""
+        if not records:
+            await query.edit_message_text(
+                "Результаты поиска устарели. Запусти новый поиск.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔎 Новый поиск", callback_data="search:new"),
+                ]]),
+            )
+            return
+        await query.edit_message_text(
+            f"<b>Поиск MAX:</b> {escape(str(query_text))}\n"
+            f"Найдено: {len(records)}. Выбери результат:",
+            parse_mode="HTML",
+            reply_markup=_search_results_markup(records, topic_store),
+        )
+        return
+
+    parts = query.data.split(":")
+    if len(parts) != 3 or parts[0] != "search" or parts[1] not in ("open", "connect"):
+        return
+    record = records_by_id.get(parts[2])
+    if not record:
+        await query.edit_message_text(
+            "Результат поиска устарел. Запусти поиск ещё раз.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔎 Новый поиск", callback_data="search:new"),
+            ]]),
+        )
+        return
+
+    chat_id = record["chat_id"]
+    if parts[1] == "open":
+        type_label = {
+            "DIALOG": "Человек",
+            "CHAT": "Группа",
+            "CHANNEL": "Канал",
+        }.get(record["type"], record["type"])
+        lines = [
+            f"<b>{escape(str(record['title']))}</b>",
+            escape(str(type_label)),
+        ]
+        if record.get("link"):
+            lines.append(f"🔗 {escape(str(record['link']))}")
+        if topic_store.get_topic(chat_id):
+            lines.append("✅ Telegram-топик уже подключён")
+        await query.edit_message_text(
+            "\n".join(lines),
+            parse_mode="HTML",
+            reply_markup=_search_record_keyboard(record, topic_store, resolver),
+            disable_web_page_preview=True,
+        )
+        return
+
+    if max_client is None:
+        await query.edit_message_text("⚠️ Max клиент не подключён.")
+        return
+
+    # Public groups/channels found outside the current snapshot first need to
+    # be opened/joined in MAX. For DIALOG the chat id is deterministic and
+    # sending the first message will create/use the conversation directly.
+    active = bool(
+        resolver
+        and chat_id in resolver.chats_raw
+        and (resolver.chats_raw.get(chat_id) or {}).get("status")
+        not in ("LEFT", "CLOSED")
+    )
+    if record["type"] != "DIALOG" and not active:
+        link = record.get("link")
+        if not link:
+            await query.edit_message_text(
+                "⚠️ У этого результата MAX не отдал публичную ссылку, "
+                "поэтому автоматически вступить не могу.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("← К результатам", callback_data="search:results"),
+                ]]),
+            )
+            return
+        try:
+            resp = await max_client.open_by_link(link)
+        except Exception as exc:
+            log.exception("search connect: open_by_link failed")
+            await query.edit_message_text(
+                f"⚠️ Не удалось открыть в MAX: {escape(str(exc))}",
+                parse_mode="HTML",
+            )
+            return
+        err = (resp or {}).get("_max_error")
+        if err:
+            desc = (err.get("localizedMessage") or err.get("message")
+                    or err.get("error") or "MAX отказал")
+            await query.edit_message_text(f"⚠️ MAX: {escape(str(desc))}",
+                                          parse_mode="HTML")
+            return
+        if not resp:
+            await query.edit_message_text(
+                "⚠️ MAX не подтвердил подключение. Попробуй ещё раз."
+            )
+            return
+        if isinstance(resp.get("chat"), dict):
+            returned_chat = resp["chat"]
+            record["raw"] = returned_chat
+            record["title"] = str(
+                returned_chat.get("title") or record["title"]
+            )
+            record["link"] = returned_chat.get("link") or record.get("link") or ""
+
+    _cache_search_record_in_resolver(max_client, record)
+    try:
+        thread_id, title, created = await _create_topic_from_menu(
+            context, max_client, topic_store, chat_id,
+            title_override=record["title"],
+        )
+    except Exception as exc:
+        log.exception("search connect: create_forum_topic failed")
+        await query.edit_message_text(
+            f"⚠️ Не удалось создать Telegram-топик: {escape(str(exc))}",
+            parse_mode="HTML",
+        )
+        return
+
+    prefix = ("✅ Подключено. Telegram-топик создан."
+              if created else "✅ Этот Telegram-топик уже подключён.")
+    await query.edit_message_text(
+        f"{prefix}\n\n<b>{escape(title)}</b>\n"
+        f"Теперь MAX-чат связан с Telegram thread <code>{thread_id}</code>.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("← К результатам", callback_data="search:results"),
+            InlineKeyboardButton("💬 Мои чаты", callback_data="menu:list:0"),
+        ]]),
+    )
+
+
 async def _create_topic_from_menu(context: ContextTypes.DEFAULT_TYPE,
                                   max_client: MaxClient,
                                   topic_store: TopicStore,
-                                  max_chat_id) -> tuple[int, str, bool]:
+                                  max_chat_id,
+                                  title_override: str | None = None) -> tuple[int, str, bool]:
     resolver = getattr(max_client, "resolver", None)
-    title = _menu_chat_title(resolver, max_chat_id) if resolver else str(max_chat_id)
+    title = title_override
+    if not title:
+        title = _menu_chat_title(resolver, max_chat_id) if resolver else str(max_chat_id)
     title = (title or str(max_chat_id))[:128]
     supergroup_id = int(context.bot_data[SUPERGROUP_KEY])
 
@@ -956,7 +1399,19 @@ async def _on_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if query.data == "menu:noop":
         return
 
+    if query.data == "menu:search":
+        context.user_data[_SEARCH_WAITING_KEY] = True
+        await query.edit_message_text(
+            "<b>Поиск в MAX</b>\n"
+            "Напиши в General имя человека, название группы/канала "
+            "или @username.",
+            parse_mode="HTML",
+            reply_markup=_search_prompt_markup(),
+        )
+        return
+
     if query.data == "menu:list" or query.data.startswith("menu:list:"):
+        context.user_data[_SEARCH_WAITING_KEY] = False
         if resolver is None:
             await query.edit_message_text("⚠️ Список MAX-чатов пока недоступен.")
             return
@@ -1040,6 +1495,8 @@ HELP_TEXT = (
     "Команды в супергруппе:\n"
     "• <code>/menu</code> — открыть кнопочное меню управления текущим "
     "MAX-чатом или выбрать чат по названию из General.\n"
+    "• <code>/search [запрос]</code> — найти в MAX человека, группу или "
+    "канал; без запроса включит режим поиска через General.\n"
     "• <code>/bind &lt;chat_id или URL&gt; [название]</code> — привязать "
     "новый топик к чату MAX.\n"
     "• <code>/add &lt;https://max.ru/join/...&gt;</code> — открыть "
@@ -1549,6 +2006,7 @@ def build_tg_app(token: str, max_client: MaxClient, supergroup_id: str,
 
     chat_filter = filters.Chat(chat_id=int(supergroup_id))
     app.add_handler(CommandHandler("menu", _cmd_menu, filters=chat_filter))
+    app.add_handler(CommandHandler("search", _cmd_search, filters=chat_filter))
     app.add_handler(CommandHandler("bind", _cmd_bind, filters=chat_filter))
     app.add_handler(CommandHandler("add", _cmd_add, filters=chat_filter))
     app.add_handler(CommandHandler("profile", _cmd_profile, filters=chat_filter))
@@ -1557,8 +2015,15 @@ def build_tg_app(token: str, max_client: MaxClient, supergroup_id: str,
     app.add_handler(CommandHandler("leave", _cmd_leave, filters=chat_filter))
     app.add_handler(CommandHandler("help", _cmd_help, filters=chat_filter))
     app.add_handler(CallbackQueryHandler(_on_menu_callback, pattern=r"^menu:"))
+    app.add_handler(CallbackQueryHandler(_on_search_callback, pattern=r"^search:"))
     app.add_handler(CallbackQueryHandler(_on_del_callback, pattern=r"^del:"))
     app.add_handler(CallbackQueryHandler(_on_leave_callback, pattern=r"^leave:"))
+    # Search capture runs in a separate earlier handler group so ordinary
+    # topic messages still continue to the MAX forwarding handler in group 0.
+    app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND & chat_filter, _on_search_input),
+        group=-1,
+    )
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND & chat_filter, _on_topic_message)
     )
