@@ -92,9 +92,9 @@ WebSocket: `wss://ws-api.oneme.ru/websocket`, `Origin: https://web.max.ru`.
 - Bot API лимит загрузки файла — 20 МБ.
 - Bot **не может** ставить custom-emoji реакции (нужен Premium).
 
-## Personal UX v1.0 — текущий gate
+## Personal UX v1.0 — закрыт
 
-До onboarding/multi-user сначала закрываем личную Telegram-first версию. Панель в General показывает DIALOG/CHAT/CHANNEL с пагинацией и отметкой подключённых топиков; из карточки можно создать/восстановить Telegram-топик без chat_id. Для DIALOG кнопка выхода из MAX не показывается. Глобальный поиск MAX (opcode 60) уже встроен: человек → deterministic DIALOG id (`viewer_id ^ contact_id`), группа/канал → открыть/вступить через opcode 57 и создать топик. Следующий блок — живая UX-проверка lifecycle и единообразные ошибки/подтверждения.
+Личная Telegram-first версия закрыта 22.09.2026. Панель в General показывает DIALOG/CHAT/CHANNEL с пагинацией и отметкой подключённых топиков; из карточки можно создать/восстановить Telegram-топик без chat_id. Для DIALOG кнопка выхода из MAX не показывается. Глобальный поиск MAX (opcode 60) встроен: человек → deterministic DIALOG id (`viewer_id ^ contact_id`), группа/канал → открыть/вступить через opcode 57 и создать топик. Lifecycle leave/delete поддерживает как текстовые карточки, так и фото-карточки через caption fallback; успешное удаление/выход подтверждается в General. Reconnect сообщает об обрыве и восстановлении.
 
 ## Команды (в супергруппе)
 
@@ -114,7 +114,7 @@ WebSocket: `wss://ws-api.oneme.ru/websocket`, `Origin: https://web.max.ru`.
 
 ## Тесты
 
-`pytest -q` → 211 passed. asyncio_mode=auto. Покрытие: TopicStore, config, listener helpers (форматирование размеров, throttle), tg_handler (роутинг команд, маршрутизация медиа), max_client опкоды.
+`pytest -q` → 224 passed. asyncio_mode=auto. Покрытие: TopicStore, config, listener helpers (форматирование размеров, throttle), tg_handler (роутинг команд, маршрутизация медиа), max_client опкоды.
 
 ## Деплой
 

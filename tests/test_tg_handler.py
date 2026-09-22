@@ -16,6 +16,7 @@ from app.tg_handler import (
     _cmd_menu,
     _cmd_search,
     _normalize_global_search_results,
+    _on_del_callback,
     _on_leave_callback,
     _on_menu_callback,
     _on_search_callback,
@@ -317,6 +318,42 @@ class TestLeave:
         success_text = update.callback_query.edit_message_text.call_args.args[0]
         assert "Вышли из" in success_text
 
+    async def test_leave_button_on_photo_card_edits_caption(self):
+        max_client = MagicMock()
+        resolver = MagicMock()
+        resolver.chat_name.return_value = "Photo channel"
+        max_client.resolver = resolver
+
+        update = MagicMock()
+        update.callback_query = MagicMock()
+        update.callback_query.data = "leave:ask:10:-123"
+        update.callback_query.answer = AsyncMock()
+        update.callback_query.edit_message_text = AsyncMock(
+            side_effect=BadRequest("There is no text in the message to edit")
+        )
+        update.callback_query.edit_message_caption = AsyncMock()
+        update.effective_user = MagicMock()
+        update.effective_user.id = 100
+
+        ctx = _make_context(
+            max_client=max_client,
+            topic_store=MagicMock(),
+            allowed_user_ids={100},
+            admin_user_id=100,
+        )
+
+        await _on_leave_callback(update, ctx)
+
+        update.callback_query.edit_message_caption.assert_awaited_once()
+        kwargs = update.callback_query.edit_message_caption.call_args.kwargs
+        assert "Выйти из" in kwargs["caption"]
+        callbacks = [
+            button.callback_data
+            for row in kwargs["reply_markup"].inline_keyboard
+            for button in row
+        ]
+        assert "leave:ok:10:-123" in callbacks
+
     async def test_confirmed_leave_calls_max_then_removes_topic(self):
         max_client = MagicMock()
         max_client.leave_chat = AsyncMock(
@@ -346,6 +383,7 @@ class TestLeave:
         ctx.bot_data[SUPERGROUP_KEY] = -100999
         ctx.bot = MagicMock()
         ctx.bot.delete_forum_topic = AsyncMock()
+        ctx.bot.send_message = AsyncMock()
 
         await _on_leave_callback(update, ctx)
 
@@ -355,6 +393,44 @@ class TestLeave:
             chat_id=-100999,
             message_thread_id=10,
         )
+        ctx.bot.send_message.assert_awaited_once()
+        assert "Telegram-топик удалён" in ctx.bot.send_message.call_args.kwargs["text"]
+
+
+# ---------------------------------------------------------------------------
+# delete topic
+# ---------------------------------------------------------------------------
+
+class TestDeleteTopic:
+    async def test_delete_button_on_photo_card_edits_caption(self):
+        update = MagicMock()
+        update.callback_query = MagicMock()
+        update.callback_query.data = "del:ask:10:-123"
+        update.callback_query.answer = AsyncMock()
+        update.callback_query.edit_message_text = AsyncMock(
+            side_effect=BadRequest("There is no text in the message to edit")
+        )
+        update.callback_query.edit_message_caption = AsyncMock()
+        update.effective_user = MagicMock()
+        update.effective_user.id = 100
+
+        ctx = _make_context(
+            topic_store=MagicMock(),
+            allowed_user_ids={100},
+            admin_user_id=100,
+        )
+
+        await _on_del_callback(update, ctx)
+
+        update.callback_query.edit_message_caption.assert_awaited_once()
+        kwargs = update.callback_query.edit_message_caption.call_args.kwargs
+        assert "Удалить Telegram-топик" in kwargs["caption"]
+        callbacks = [
+            button.callback_data
+            for row in kwargs["reply_markup"].inline_keyboard
+            for button in row
+        ]
+        assert "del:ok:10:-123" in callbacks
 
 
 # ---------------------------------------------------------------------------

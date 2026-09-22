@@ -210,7 +210,7 @@ async def _on_topic_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     if not max_client:
-        await message.reply_text("⚠️ Max клиент не подключён.")
+        await message.reply_text("⚠️ MAX не подключён.")
         return
 
     topic_store: TopicStore = context.bot_data[TOPIC_STORE_KEY]
@@ -254,7 +254,7 @@ async def _on_topic_media(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     message, max_chat_id, max_client = target
 
     if not max_client:
-        await message.reply_text("⚠️ Max клиент не подключён.")
+        await message.reply_text("⚠️ MAX не подключён.")
         return
 
     caption = message.caption or ""
@@ -937,17 +937,53 @@ def _general_management_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+async def _edit_callback_content(query, text: str, **kwargs) -> None:
+    """Edit callback message whether the button lives on text or media.
+
+    Topic intro cards are often photos with captions. Telegram rejects
+    edit_message_text for those with "There is no text in the message to edit".
+    Fall back to editing the caption so the same management buttons work on
+    text-only and photo cards.
+    """
+    try:
+        await query.edit_message_text(text, **kwargs)
+        return
+    except BadRequest as exc:
+        if "there is no text in the message to edit" not in str(exc).lower():
+            raise
+    await query.edit_message_caption(caption=text, **kwargs)
+
+
+async def _send_general_notice(context, text: str, *, reply_markup=None) -> None:
+    """Send an administrative lifecycle confirmation to General."""
+    supergroup_id = context.bot_data[SUPERGROUP_KEY]
+    await context.bot.send_message(
+        chat_id=int(supergroup_id),
+        text=text,
+        parse_mode="HTML",
+        reply_markup=reply_markup,
+    )
+
+
 async def ensure_management_panel(bot, supergroup_id, topic_store: TopicStore) -> int | None:
     """Ensure a visible, pinned management panel exists in General."""
     chat_id = int(supergroup_id)
     message_id = topic_store.get_ui("management_panel_message_id")
     markup = _general_management_keyboard()
 
+    panel_text = (
+        "<b>MAX ↔ Telegram</b>\n"
+        "Здесь можно открыть свои чаты, найти человека/группу/канал "
+        "и управлять Telegram-топиками без команд и chat_id."
+    )
+
     if message_id:
         try:
-            await bot.edit_message_reply_markup(
+            await bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=int(message_id),
+                text=panel_text,
+                parse_mode="HTML",
                 reply_markup=markup,
             )
             return int(message_id)
@@ -962,10 +998,7 @@ async def ensure_management_panel(bot, supergroup_id, topic_store: TopicStore) -
     try:
         sent = await bot.send_message(
             chat_id=chat_id,
-            text=(
-                "<b>MAX ↔ Telegram</b>\n"
-                "Управление чатами и каналами — без команд и chat_id."
-            ),
+            text=panel_text,
             parse_mode="HTML",
             reply_markup=markup,
         )
@@ -1001,7 +1034,7 @@ async def _cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     topic_store: TopicStore = context.bot_data[TOPIC_STORE_KEY]
     max_client: MaxClient | None = context.bot_data.get(MAX_CLIENT_KEY)
     if max_client is None:
-        await message.reply_text("⚠️ Max клиент не подключён.")
+        await message.reply_text("⚠️ MAX не подключён.")
         return
 
     thread_id = message.message_thread_id
@@ -1051,12 +1084,12 @@ async def _run_global_search(context: ContextTypes.DEFAULT_TYPE,
                              query_text: str) -> tuple[list[dict], int, str | None]:
     max_client: MaxClient | None = context.bot_data.get(MAX_CLIENT_KEY)
     if max_client is None:
-        return [], 0, "Max клиент не подключён."
+        return [], 0, "MAX не подключён."
     try:
         resp = await max_client.search_global(query_text, count=_SEARCH_LIMIT)
-    except Exception as exc:
+    except Exception:
         log.exception("MAX global search failed")
-        return [], 0, f"Ошибка поиска MAX: {exc}"
+        return [], 0, "Не удалось выполнить поиск в MAX. Попробуй ещё раз."
     if resp is None:
         return [], 0, "MAX не ответил вовремя."
     err = resp.get("_max_error") if isinstance(resp, dict) else None
@@ -1266,7 +1299,7 @@ async def _on_search_callback(update: Update,
         return
 
     if max_client is None:
-        await query.edit_message_text("⚠️ Max клиент не подключён.")
+        await _edit_callback_content(query, "⚠️ MAX не подключён.")
         return
 
     # Public groups/channels found outside the current snapshot first need to
@@ -1291,11 +1324,10 @@ async def _on_search_callback(update: Update,
             return
         try:
             resp = await max_client.open_by_link(link)
-        except Exception as exc:
+        except Exception:
             log.exception("search connect: open_by_link failed")
             await query.edit_message_text(
-                f"⚠️ Не удалось открыть в MAX: {escape(str(exc))}",
-                parse_mode="HTML",
+                "⚠️ Не удалось подключить этот чат/канал в MAX. Попробуй ещё раз."
             )
             return
         err = (resp or {}).get("_max_error")
@@ -1324,11 +1356,10 @@ async def _on_search_callback(update: Update,
             context, max_client, topic_store, chat_id,
             title_override=record["title"],
         )
-    except Exception as exc:
+    except Exception:
         log.exception("search connect: create_forum_topic failed")
         await query.edit_message_text(
-            f"⚠️ Не удалось создать Telegram-топик: {escape(str(exc))}",
-            parse_mode="HTML",
+            "⚠️ Не удалось создать Telegram-топик. Попробуй ещё раз."
         )
         return
 
@@ -1455,13 +1486,13 @@ async def _on_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     if parts[1] == "bind":
         if max_client is None:
-            await query.edit_message_text("⚠️ Max клиент не подключён.")
+            await _edit_callback_content(query, "⚠️ MAX не подключён.")
             return
         try:
             thread_id, title, created = await _create_topic_from_menu(
                 context, max_client, topic_store, max_chat_id,
             )
-        except Exception as exc:
+        except Exception:
             log.exception("menu bind: create_forum_topic failed")
             await query.edit_message_text(
                 f"⚠️ Не удалось создать Telegram-топик: {escape(str(exc))}",
@@ -1584,7 +1615,7 @@ async def _on_del_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     parts = query.data.split(":")
     if parts[:2] == ["del", "cancel"]:
         try:
-            await query.edit_message_text("Отменено.")
+            await _edit_callback_content(query, "Отменено.")
         except Exception:
             pass
         return
@@ -1608,7 +1639,8 @@ async def _on_del_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             ),
             InlineKeyboardButton("Отмена", callback_data="del:cancel"),
         ]])
-        await query.edit_message_text(
+        await _edit_callback_content(
+            query,
             "Удалить Telegram-топик и локальную связь?\n\n"
             "Из MAX-чата/канала ты при этом не выйдешь.",
             reply_markup=kb,
@@ -1629,11 +1661,13 @@ async def _on_del_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await context.bot.delete_forum_topic(
             chat_id=int(supergroup_id), message_thread_id=thread_id,
         )
-    except Exception as exc:
+    except Exception:
         log.exception("/del: delete_forum_topic failed")
         try:
-            await query.edit_message_text(
-                f"⚠️ Связь снята, но удалить топик не получилось: {exc}"
+            await _edit_callback_content(
+                query,
+                "⚠️ Связь с MAX снята, но Telegram не удалил топик. "
+                "Можно создать новый топик через «Мои чаты»."
             )
         except Exception:
             pass
@@ -1641,8 +1675,16 @@ async def _on_del_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     log.info("/del: removed topic thread=%s for max_chat_id=%s",
              thread_id, max_chat_id)
-    # The edit_message_text below will fail if the topic is already gone;
-    # that's fine — the chat-level confirmation isn't critical.
+    try:
+        await _send_general_notice(
+            context,
+            "✅ Telegram-топик удалён. В MAX чат/канал остался подключён.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("💬 Мои чаты", callback_data="menu:list:0"),
+            ]]),
+        )
+    except Exception:
+        log.exception("/del: topic deleted, but General confirmation failed")
 
 
 async def _cmd_leave(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1658,7 +1700,7 @@ async def _cmd_leave(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     max_client: MaxClient | None = context.bot_data.get(MAX_CLIENT_KEY)
     if not max_client:
-        await message.reply_text("⚠️ Max клиент не подключён.")
+        await message.reply_text("⚠️ MAX не подключён.")
         return
 
     topic_store: TopicStore = context.bot_data[TOPIC_STORE_KEY]
@@ -1720,7 +1762,7 @@ async def _on_leave_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     parts = query.data.split(":")
     if parts[:2] == ["leave", "cancel"]:
         try:
-            await query.edit_message_text("Отменено.")
+            await _edit_callback_content(query, "Отменено.")
         except Exception:
             pass
         return
@@ -1745,7 +1787,8 @@ async def _on_leave_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             ),
             InlineKeyboardButton("Отмена", callback_data="leave:cancel"),
         ]])
-        await query.edit_message_text(
+        await _edit_callback_content(
+            query,
             f"Выйти из <b>{escape(title)}</b> в MAX"
             + (" и удалить Telegram-топик?" if thread_id > 0 else "?"),
             parse_mode="HTML",
@@ -1759,7 +1802,7 @@ async def _on_leave_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     max_client: MaxClient | None = context.bot_data.get(MAX_CLIENT_KEY)
     if max_client is None:
         try:
-            await query.edit_message_text("⚠️ Max клиент не подключён.")
+            await _edit_callback_content(query, "⚠️ MAX не подключён.")
         except Exception:
             pass
         return
@@ -1769,15 +1812,16 @@ async def _on_leave_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except Exception:
         log.exception("/leave: MAX leave failed")
         try:
-            await query.edit_message_text("⚠️ Ошибка при выходе из MAX.")
+            await _edit_callback_content(query, "⚠️ Не удалось выйти из MAX. Попробуй ещё раз.")
         except Exception:
             pass
         return
 
     if resp is None:
         try:
-            await query.edit_message_text(
-                "⚠️ MAX не ответил вовремя. Состояние выхода не подтверждено."
+            await _edit_callback_content(
+                query,
+                "⚠️ MAX не ответил вовремя. Выход не подтверждён — обнови «Мои чаты» перед повторной попыткой."
             )
         except Exception:
             pass
@@ -1792,7 +1836,7 @@ async def _on_leave_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             or "MAX отклонил выход"
         )
         try:
-            await query.edit_message_text(f"⚠️ MAX: {desc}")
+            await _edit_callback_content(query, f"⚠️ MAX: {escape(str(desc))}", parse_mode="HTML")
         except Exception:
             pass
         return
@@ -1822,18 +1866,25 @@ async def _on_leave_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     log.info("/leave: left MAX chat=%s and removed topic thread=%s",
              max_chat_id, thread_id or None)
+    success_markup = InlineKeyboardMarkup([[
+        InlineKeyboardButton("💬 Мои чаты", callback_data="menu:list:0"),
+    ]])
     try:
-        await query.edit_message_text(
-            f"✅ Вышли из <b>{escape(str(title))}</b> в MAX.",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("💬 Мои чаты", callback_data="menu:list:0"),
-            ]]),
-        )
+        if thread_id > 0:
+            await _send_general_notice(
+                context,
+                f"✅ Вышли из <b>{escape(str(title))}</b> в MAX. Telegram-топик удалён.",
+                reply_markup=success_markup,
+            )
+        else:
+            await _edit_callback_content(
+                query,
+                f"✅ Вышли из <b>{escape(str(title))}</b> в MAX.",
+                parse_mode="HTML",
+                reply_markup=success_markup,
+            )
     except Exception:
-        # If the confirmation lived inside the deleted topic, there is
-        # nothing left to edit. General-menu callbacks remain visible.
-        pass
+        log.exception("/leave: left successfully, but confirmation failed")
 
 
 async def _cmd_intro(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1853,7 +1904,7 @@ async def _cmd_intro(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     _, max_chat_id, max_client = target
     if not max_client:
-        await message.reply_text("⚠️ Max клиент не подключён.")
+        await message.reply_text("⚠️ MAX не подключён.")
         return
     supergroup_id = context.bot_data[SUPERGROUP_KEY]
     await post_topic_intro(
@@ -1875,7 +1926,7 @@ async def _cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     _, max_chat_id, max_client = target
     if not max_client:
-        await message.reply_text("⚠️ Max клиент не подключён.")
+        await message.reply_text("⚠️ MAX не подключён.")
         return
 
     resolver = getattr(max_client, "resolver", None)
