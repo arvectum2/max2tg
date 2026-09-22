@@ -1,0 +1,54 @@
+name: Mirror to GitVerse
+
+on:
+  push:
+    branches:
+      - '**'
+    tags:
+      - '**'
+  workflow_dispatch:
+  schedule:
+    - cron: '17 3 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mirror-to-gitverse
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Validate token
+        env:
+          GITVERSE_TOKEN: ${{ secrets.GITVERSE_TOKEN }}
+        run: test -n "$GITVERSE_TOKEN" || { echo "::error::GITVERSE_TOKEN is missing"; exit 1; }
+
+      - name: Clone GitHub repository as mirror
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPOSITORY: ${{ github.repository }}
+        run: git clone --mirror "https://x-access-token:${GH_TOKEN}@github.com/${GH_REPOSITORY}.git" repository.git
+
+      - name: Push branches and tags to GitVerse
+        env:
+          GITVERSE_TOKEN: ${{ secrets.GITVERSE_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd repository.git
+          git remote add gitverse "https://arvectum:${GITVERSE_TOKEN}@gitverse.ru/arvectum/max2tg.git"
+          git push --force --prune gitverse \
+            'refs/heads/*:refs/heads/*' \
+            'refs/tags/*:refs/tags/*'
+
+      - name: Summary
+        if: success()
+        run: |
+          echo "### GitVerse mirror updated" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Source: ${GITHUB_REPOSITORY}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Target: arvectum/max2tg" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Trigger: ${GITHUB_EVENT_NAME}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- SHA: ${GITHUB_SHA}" >> "$GITHUB_STEP_SUMMARY"

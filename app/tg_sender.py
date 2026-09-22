@@ -110,6 +110,15 @@ class TelegramSender:
             return text[: TG_CAPTION_MAX - 20] + "\n\n[...усечено]"
         return text
 
+    @staticmethod
+    def _reply_kwargs(reply_to_message_id: int | None) -> dict:
+        if reply_to_message_id is None:
+            return {}
+        return {
+            "reply_to_message_id": int(reply_to_message_id),
+            "allow_sending_without_reply": True,
+        }
+
     async def _retry(self, coro_factory):
         for attempt in range(1, MAX_RETRIES + 1):
             try:
@@ -129,63 +138,72 @@ class TelegramSender:
 
     # ── send methods ───────────────────────────────────────────────
 
-    async def send(self, text: str, message_thread_id: int | None = None) -> None:
+    async def send(self, text: str, message_thread_id: int | None = None,
+                   reply_to_message_id: int | None = None):
         if not text:
-            return
+            return None
 
         if len(text) > TG_MAX_LENGTH:
             text = text[: TG_MAX_LENGTH - 20] + "\n\n[...усечено]"
 
-        await self._retry(
+        return await self._retry(
             lambda: self._bot.send_message(
                 chat_id=self._chat_id,
                 text=text,
                 parse_mode=ParseMode.HTML,
                 message_thread_id=message_thread_id,
+                **self._reply_kwargs(reply_to_message_id),
             )
         )
 
     async def send_photo(self, data: bytes, caption: str = "", filename: str = "photo.jpg",
-                         message_thread_id: int | None = None) -> None:
+                         message_thread_id: int | None = None,
+                         reply_to_message_id: int | None = None):
         caption = self._truncate_caption(caption)
-        await self._retry(
+        return await self._retry(
             lambda: self._bot.send_photo(
                 chat_id=self._chat_id,
                 photo=InputFile(io.BytesIO(data), filename=filename),
                 caption=caption or None,
                 parse_mode=ParseMode.HTML,
                 message_thread_id=message_thread_id,
+                **self._reply_kwargs(reply_to_message_id),
             )
         )
 
     async def send_document(self, data: bytes, caption: str = "", filename: str = "file",
-                            message_thread_id: int | None = None) -> None:
+                            message_thread_id: int | None = None,
+                            reply_to_message_id: int | None = None):
         caption = self._truncate_caption(caption)
-        await self._retry(
+        return await self._retry(
             lambda: self._bot.send_document(
                 chat_id=self._chat_id,
                 document=InputFile(io.BytesIO(data), filename=filename),
                 caption=caption or None,
                 parse_mode=ParseMode.HTML,
                 message_thread_id=message_thread_id,
+                **self._reply_kwargs(reply_to_message_id),
             )
         )
 
     async def send_video(self, data: bytes, caption: str = "", filename: str = "video.mp4",
-                         message_thread_id: int | None = None) -> None:
+                         message_thread_id: int | None = None,
+                         reply_to_message_id: int | None = None):
         caption = self._truncate_caption(caption)
-        await self._retry(
+        return await self._retry(
             lambda: self._bot.send_video(
                 chat_id=self._chat_id,
                 video=InputFile(io.BytesIO(data), filename=filename),
                 caption=caption or None,
                 parse_mode=ParseMode.HTML,
                 message_thread_id=message_thread_id,
+                **self._reply_kwargs(reply_to_message_id),
             )
         )
 
     async def send_voice(self, data: bytes, caption: str = "",
-                         message_thread_id: int | None = None) -> None:
+                         message_thread_id: int | None = None,
+                         reply_to_message_id: int | None = None):
         caption = self._truncate_caption(caption)
         result = await self._retry(
             lambda: self._bot.send_voice(
@@ -194,25 +212,30 @@ class TelegramSender:
                 caption=caption or None,
                 parse_mode=ParseMode.HTML,
                 message_thread_id=message_thread_id,
+                **self._reply_kwargs(reply_to_message_id),
             )
         )
         if result is None:
             log.info("send_voice failed, falling back to send_audio")
-            await self._retry(
+            result = await self._retry(
                 lambda: self._bot.send_audio(
                     chat_id=self._chat_id,
                     audio=InputFile(io.BytesIO(data), filename="audio.m4a"),
                     caption=caption or None,
                     parse_mode=ParseMode.HTML,
                     message_thread_id=message_thread_id,
+                    **self._reply_kwargs(reply_to_message_id),
                 )
             )
+        return result
 
-    async def send_sticker(self, data: bytes, message_thread_id: int | None = None) -> None:
-        await self._retry(
+    async def send_sticker(self, data: bytes, message_thread_id: int | None = None,
+                           reply_to_message_id: int | None = None):
+        return await self._retry(
             lambda: self._bot.send_sticker(
                 chat_id=self._chat_id,
                 sticker=InputFile(io.BytesIO(data), filename="sticker.webp"),
                 message_thread_id=message_thread_id,
+                **self._reply_kwargs(reply_to_message_id),
             )
         )

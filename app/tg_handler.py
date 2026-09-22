@@ -169,6 +169,30 @@ async def _surface_send_result(message, resp) -> None:
         log.debug("Could not set reaction on confirmed message", exc_info=True)
 
 
+def _max_reply_link(message, topic_store: TopicStore, max_chat_id) -> dict | None:
+    """Translate a Telegram reply into a MAX REPLY link when possible."""
+    replied = getattr(message, "reply_to_message", None)
+    if replied is None:
+        return None
+    max_message_id = topic_store.max_for_tg_message(
+        max_chat_id, replied.message_id,
+    )
+    if not max_message_id:
+        return None
+    return {"type": "REPLY", "messageId": str(max_message_id)}
+
+
+def _remember_outbound_message(
+    topic_store: TopicStore, max_chat_id, tg_message_id: int, resp: dict | None,
+) -> None:
+    if not resp or resp.get("_max_error"):
+        return
+    max_message = resp.get("message") or {}
+    max_message_id = max_message.get("id")
+    if max_message_id:
+        topic_store.set_message(max_chat_id, max_message_id, tg_message_id)
+
+
 async def _on_topic_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Route a text message typed in a forum topic back to the matching Max chat."""
     target = _resolve_topic_target(update, context)
@@ -182,15 +206,24 @@ async def _on_topic_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await message.reply_text("⚠️ Max клиент не подключён.")
         return
 
+    topic_store: TopicStore = context.bot_data[TOPIC_STORE_KEY]
     elements = _entities_to_max_elements(message.text, message.entities)
+    link = _max_reply_link(message, topic_store, max_chat_id)
+    send_kwargs = {"elements": elements}
+    if link:
+        send_kwargs["link"] = link
     try:
-        resp = await max_client.send_message(max_chat_id, message.text,
-                                              elements=elements)
+        resp = await max_client.send_message(
+            max_chat_id, message.text, **send_kwargs,
+        )
     except Exception:
         log.exception("Failed to send reply to Max chat %s", max_chat_id)
         await message.reply_text("⚠️ Ошибка при отправке в Max.")
         return
 
+    _remember_outbound_message(
+        topic_store, max_chat_id, message.message_id, resp,
+    )
     await _surface_send_result(message, resp)
 
 
@@ -282,16 +315,26 @@ async def _on_topic_media(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await message.reply_text("⚠️ Не удалось загрузить файл в MAX.")
         return
 
+    topic_store: TopicStore = context.bot_data[TOPIC_STORE_KEY]
     elements = _entities_to_max_elements(caption, message.caption_entities)
+    link = _max_reply_link(message, topic_store, max_chat_id)
+    send_kwargs = {
+        "text": caption,
+        "elements": elements,
+        "attaches": [attach],
+    }
+    if link:
+        send_kwargs["link"] = link
     try:
-        resp = await max_client.send_message(max_chat_id, text=caption,
-                                              elements=elements,
-                                              attaches=[attach])
+        resp = await max_client.send_message(max_chat_id, **send_kwargs)
     except Exception:
         log.exception("Failed to send media reply to Max chat %s", max_chat_id)
         await message.reply_text("⚠️ Ошибка при отправке в Max.")
         return
 
+    _remember_outbound_message(
+        topic_store, max_chat_id, message.message_id, resp,
+    )
     await _surface_send_result(message, resp)
 
 
@@ -636,8 +679,10 @@ HELP_TEXT = (
     "из MAX (имя, id, аватар).\n"
     "• <code>/intro</code> — перепостить и закрепить карточку профиля "
     "в текущем топике (полезно после смены аватара).\n"
-    "• <code>/del</code> — удалить текущий топик и связь с MAX-чатом "
-    "(спросит подтверждение).\n"
+    "• <code>/del</code> — удалить только Telegram-топик и локальную связь "
+    "(в MAX останешься).\n"
+    "• <code>/leave</code> — выйти из группы/канала MAX и удалить его Telegram-топик "
+    "(спросит отдельное подтверждение).\n"
     "• <code>/help</code> — эта справка.\n\n"
     "Просто пиши в любом привязанном топике — сообщение уйдёт в "
     "соответствующий чат MAX. Поддерживается жирный/курсив/зачёркнутый/"
@@ -747,6 +792,137 @@ async def _on_del_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
              thread_id, max_chat_id)
     # The edit_message_text below will fail if the topic is already gone;
     # that's fine — the chat-level confirmation isn't critical.
+
+
+async def _cmd_leave(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ask for confirmation before leaving a MAX group/channel."""
+    message = update.message
+    if message is None or not _is_admin_user(update, context):
+        return
+
+    target = _resolve_topic_target(update, context)
+    if not target:
+        await message.reply_text(
+            "Команда работает только внутри топика, связанного с группой/каналом MAX."
+        )
+        return
+
+    _, max_chat_id, max_client = target
+    if not max_client:
+        await message.reply_text("⚠️ Max клиент не подключён.")
+        return
+
+    resolver = getattr(max_client, "resolver", None)
+    if resolver is not None and resolver.is_dm(max_chat_id):
+        await message.reply_text("Из личного диалога выйти нельзя — используй /del.")
+        return
+
+    title = resolver.chat_name(max_chat_id) if resolver is not None else str(max_chat_id)
+    thread_id = message.message_thread_id
+    kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "🚪 Выйти из MAX",
+                callback_data=f"leave:ok:{thread_id}:{max_chat_id}",
+            ),
+            InlineKeyboardButton("Отмена", callback_data="leave:cancel"),
+        ]
+    ])
+    await message.reply_text(
+        f"Выйти из <b>{escape(title)}</b> в MAX и удалить этот Telegram-топик?\n\n"
+        "Это уже реальный выход из группы/канала MAX.",
+        parse_mode="HTML",
+        reply_markup=kb,
+    )
+
+
+async def _on_leave_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None or not query.data:
+        return
+    await query.answer()
+
+    if not _is_admin_user(update, context):
+        return
+
+    parts = query.data.split(":")
+    if parts[:2] == ["leave", "cancel"]:
+        try:
+            await query.edit_message_text("Отменено.")
+        except Exception:
+            pass
+        return
+
+    if len(parts) != 4 or parts[0] != "leave" or parts[1] != "ok":
+        return
+
+    try:
+        thread_id = int(parts[2])
+        max_chat_id: int | str = int(parts[3])
+    except ValueError:
+        return
+
+    max_client: MaxClient | None = context.bot_data.get(MAX_CLIENT_KEY)
+    if max_client is None:
+        try:
+            await query.edit_message_text("⚠️ Max клиент не подключён.")
+        except Exception:
+            pass
+        return
+
+    try:
+        resp = await max_client.leave_chat(max_chat_id)
+    except Exception:
+        log.exception("/leave: MAX leave failed")
+        try:
+            await query.edit_message_text("⚠️ Ошибка при выходе из MAX.")
+        except Exception:
+            pass
+        return
+
+    err = (resp or {}).get("_max_error")
+    if err:
+        desc = (
+            err.get("localizedMessage")
+            or err.get("message")
+            or err.get("error")
+            or "MAX отклонил выход"
+        )
+        try:
+            await query.edit_message_text(f"⚠️ MAX: {desc}")
+        except Exception:
+            pass
+        return
+
+    if not resp:
+        try:
+            await query.edit_message_text(
+                "⚠️ MAX не подтвердил выход. Telegram-топик оставлен на месте."
+            )
+        except Exception:
+            pass
+        return
+
+    topic_store: TopicStore = context.bot_data[TOPIC_STORE_KEY]
+    topic_store.remove(max_chat_id)
+
+    resolver = getattr(max_client, "resolver", None)
+    if resolver is not None:
+        resolver.chats.pop(max_chat_id, None)
+        resolver.chat_types.pop(max_chat_id, None)
+        resolver.chats_raw.pop(max_chat_id, None)
+
+    supergroup_id = context.bot_data[SUPERGROUP_KEY]
+    try:
+        await context.bot.delete_forum_topic(
+            chat_id=int(supergroup_id),
+            message_thread_id=thread_id,
+        )
+    except Exception:
+        log.exception("/leave: MAX left, but Telegram topic deletion failed")
+
+    log.info("/leave: left MAX chat=%s and removed topic thread=%s",
+             max_chat_id, thread_id)
 
 
 async def _cmd_intro(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -943,8 +1119,10 @@ def build_tg_app(token: str, max_client: MaxClient, supergroup_id: str,
     app.add_handler(CommandHandler("profile", _cmd_profile, filters=chat_filter))
     app.add_handler(CommandHandler("intro", _cmd_intro, filters=chat_filter))
     app.add_handler(CommandHandler("del", _cmd_del, filters=chat_filter))
+    app.add_handler(CommandHandler("leave", _cmd_leave, filters=chat_filter))
     app.add_handler(CommandHandler("help", _cmd_help, filters=chat_filter))
     app.add_handler(CallbackQueryHandler(_on_del_callback, pattern=r"^del:"))
+    app.add_handler(CallbackQueryHandler(_on_leave_callback, pattern=r"^leave:"))
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND & chat_filter, _on_topic_message)
     )

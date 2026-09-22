@@ -68,6 +68,7 @@ class OpCode(IntEnum):
     CONTACT_GET = 32
     CONTACT_PRESENCE = 35
     CHAT_GET = 48
+    CHAT_LEAVE = 58
     SEND_MESSAGE = 64
     ATTACH_TYPING = 65        # "I'm uploading <type> in this chat"
     EDIT_MESSAGE = 67
@@ -329,7 +330,7 @@ class MaxClient:
         return resp
 
     async def send_message(self, chat_id, text: str = "", elements=None,
-                            attaches=None) -> dict:
+                            attaches=None, link: dict | None = None) -> dict:
         """Send a message to a Max chat. Returns the server response.
 
         Both ``elements`` (text formatting) and ``attaches`` (photos, files,
@@ -344,6 +345,8 @@ class MaxClient:
         message = {"text": text, "cid": cid, "elements": elements}
         if attaches:
             message["attaches"] = attaches
+        if link:
+            message["link"] = link
         resp = await self.cmd(
             OpCode.SEND_MESSAGE,
             {
@@ -355,6 +358,13 @@ class MaxClient:
         ok = bool(resp) and "_max_error" not in resp
         log.info("send_message(chat=%s, attaches=%d) → %s",
                  chat_id, len(attaches), "OK" if ok else "FAIL")
+        return resp
+
+    async def leave_chat(self, chat_id) -> dict:
+        """Leave a MAX group/channel via opcode 58."""
+        resp = await self.cmd(OpCode.CHAT_LEAVE, {"chatId": chat_id})
+        ok = bool(resp) and "_max_error" not in resp
+        log.info("leave_chat(chat=%s) → %s", chat_id, "OK" if ok else "FAIL")
         return resp
 
     # ── media upload ───────────────────────────────────────────────

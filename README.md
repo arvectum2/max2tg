@@ -14,6 +14,12 @@
   <img src="docs/infographic.png" alt="Как работает MAX2TG-Bridge" width="720"/>
 </p>
 
+## Текущий статус и направление
+
+Личный bridge уже выполняет основную задачу. Текущий продуктовый курс — **bot-first multi-user MAX2TG**: пользователь запускает Telegram-бота, один раз авторизует серверную web.max.ru-сессию по SMS и дальше работает с MAX из Telegram. Отдельное клиентское приложение не планируется как обязательная сущность.
+
+Архитектура массового режима: [`docs/PRODUCT_ARCHITECTURE.md`](docs/PRODUCT_ARCHITECTURE.md). Дорожная карта: [`docs/ROADMAP.md`](docs/ROADMAP.md).
+
 ---
 
 ## Содержание
@@ -121,7 +127,7 @@
 ### 3. Деплой (Docker, рекомендованный)
 
 ```bash
-git clone https://github.com/ircitdev/MAX2TG-Bridge.git max2tg
+git clone https://github.com/arvectum2/max2tg.git max2tg
 cd max2tg
 cp .env.example .env
 # отредактируйте .env
@@ -224,7 +230,7 @@ pip install pytest pytest-asyncio
 pytest -q
 ```
 
-Покрытие: `app/topics.py` (TopicStore), `app/config.py` (загрузка env), `app/max_listener.py` (форматирование, throttle), `app/tg_handler.py` (роутинг команд и медиа), `app/max_client.py` (опкоды). 191 тест.
+Покрытие: `app/topics.py` (TopicStore), `app/config.py` (загрузка env), `app/max_listener.py` (форматирование, throttle), `app/tg_handler.py` (роутинг команд и медиа), `app/max_client.py` (опкоды). 196 тестов.
 
 ### Структура проекта
 
@@ -239,7 +245,7 @@ max2tg/
 │   ├── tg_sender.py        # TG отправка + ensure_topic
 │   ├── tg_handler.py       # TG → MAX роутинг и команды
 │   └── topics.py           # TopicStore (JSON-карта)
-├── tests/                  # 191 pytest
+├── tests/                  # 196 pytest
 ├── docs/cover.jpg          # обложка README
 ├── state/                  # рантайм-данные (gitignored)
 ├── logs/                   # логи (gitignored)

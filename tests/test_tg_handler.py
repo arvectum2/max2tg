@@ -7,8 +7,11 @@ from app.tg_handler import (
     ALLOWED_USER_KEY,
     ALLOWED_USERS_KEY,
     MAX_CLIENT_KEY,
+    SUPERGROUP_KEY,
     TOPIC_STORE_KEY,
     _cmd_bind,
+    _cmd_leave,
+    _on_leave_callback,
     _on_topic_message,
     build_tg_app,
 )
@@ -23,6 +26,7 @@ def _make_topic_store(mapping: dict | None = None):
     mapping = mapping or {10: 42}
     store = MagicMock()
     store.chat_for_topic = MagicMock(side_effect=lambda tid: mapping.get(tid))
+    store.max_for_tg_message = MagicMock(return_value=None)
     return store
 
 
@@ -30,8 +34,11 @@ def _make_update(text="Hello", thread_id=10, is_topic_message=True, user_id=100)
     update = MagicMock()
     update.message = MagicMock()
     update.message.text = text
+    update.message.message_id = 500
+    update.message.entities = []
     update.message.message_thread_id = thread_id
     update.message.is_topic_message = is_topic_message
+    update.message.reply_to_message = None
     update.message.reply_text = AsyncMock()
     update.message.set_reaction = AsyncMock()
     update.effective_user = MagicMock()
