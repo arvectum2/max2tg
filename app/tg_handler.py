@@ -4,7 +4,7 @@ import logging
 import re
 from html import escape
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, ReplyKeyboardMarkup, Update
 from telegram.constants import MessageEntityType
 from telegram.error import BadRequest
 from telegram.ext import (
@@ -35,6 +35,8 @@ _SEARCH_LIMIT = 16
 _SEARCH_WAITING_KEY = "awaiting_max_search"
 _SEARCH_RESULTS_KEY = "max_search_results"
 _SEARCH_QUERY_KEY = "max_search_query"
+_QUICK_MENU_TEXT = "☰ Меню"
+_QUICK_MENU_MESSAGE_KEY = "quick_menu_message_id"
 
 # Telegram entity type → MAX element type. The MAX names match what the
 # existing codebase used (STRONG) and what MAX renders for the formatting
@@ -937,6 +939,38 @@ def _general_management_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+def _quick_menu_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [[_QUICK_MENU_TEXT]],
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder="MAX ↔ Telegram",
+    )
+
+
+async def ensure_quick_menu(bot, supergroup_id, topic_store: TopicStore) -> int | None:
+    """Install the persistent bottom menu button once for this chat."""
+    existing = topic_store.get_ui(_QUICK_MENU_MESSAGE_KEY)
+    if existing:
+        return int(existing)
+    try:
+        sent = await bot.send_message(
+            chat_id=int(supergroup_id),
+            text=(
+                "☰ Быстрое меню включено. Кнопка «Меню» теперь всегда доступна "
+                "у поля ввода."
+            ),
+            reply_markup=_quick_menu_keyboard(),
+            disable_notification=True,
+        )
+    except Exception:
+        log.exception("Failed to install persistent quick menu")
+        return None
+    topic_store.set_ui(_QUICK_MENU_MESSAGE_KEY, sent.message_id)
+    log.info("Persistent quick menu installed: message_id=%s", sent.message_id)
+    return sent.message_id
+
+
 async def _edit_callback_content(query, text: str, **kwargs) -> None:
     """Edit callback message whether the button lives on text or media.
 
@@ -1034,7 +1068,7 @@ async def _cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     topic_store: TopicStore = context.bot_data[TOPIC_STORE_KEY]
     max_client: MaxClient | None = context.bot_data.get(MAX_CLIENT_KEY)
     if max_client is None:
-        await message.reply_text("⚠️ MAX не подключён.")
+        await message.reply_text("⚠️ MAX не подключён.", do_quote=False)
         return
 
     thread_id = message.message_thread_id
@@ -1050,19 +1084,20 @@ async def _cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     max_chat_id, thread_id,
                     is_dm=bool(resolver and resolver.is_dm(max_chat_id)),
                 ),
+                do_quote=False,
             )
             return
 
     resolver = getattr(max_client, "resolver", None)
     if resolver is None:
-        await message.reply_text("⚠️ Список MAX-чатов пока недоступен.")
+        await message.reply_text("⚠️ Список MAX-чатов пока недоступен.", do_quote=False)
         return
 
     markup, page, page_count, total = _menu_list_markup(
         resolver, topic_store, page=0,
     )
     if total == 0:
-        await message.reply_text("Не вижу активных чатов MAX.")
+        await message.reply_text("Не вижу активных чатов MAX.", do_quote=False)
         return
 
     await message.reply_text(
@@ -1070,8 +1105,21 @@ async def _cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Страница {page + 1}/{page_count}. ✅ — Telegram-топик уже создан.",
         parse_mode="HTML",
         reply_markup=markup,
+        do_quote=False,
     )
 
+
+
+async def _on_quick_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Open context-aware management from the persistent reply-keyboard button."""
+    message = update.message
+    if message is None or not _is_admin_user(update, context):
+        return
+    await _cmd_menu(update, context)
+    try:
+        await message.delete()
+    except Exception:
+        log.debug("Could not delete quick-menu trigger message", exc_info=True)
 
 
 def _search_prompt_markup() -> InlineKeyboardMarkup:
@@ -2076,6 +2124,7 @@ def build_tg_app(token: str, max_client: MaxClient, supergroup_id: str,
     app.bot_data[SUPERGROUP_KEY] = int(supergroup_id)
 
     chat_filter = filters.Chat(chat_id=int(supergroup_id))
+    quick_menu_filter = filters.Regex(r"^☰ Меню$")
     app.add_handler(CommandHandler("menu", _cmd_menu, filters=chat_filter))
     app.add_handler(CommandHandler("search", _cmd_search, filters=chat_filter))
     app.add_handler(CommandHandler("bind", _cmd_bind, filters=chat_filter))
@@ -2089,14 +2138,26 @@ def build_tg_app(token: str, max_client: MaxClient, supergroup_id: str,
     app.add_handler(CallbackQueryHandler(_on_search_callback, pattern=r"^search:"))
     app.add_handler(CallbackQueryHandler(_on_del_callback, pattern=r"^del:"))
     app.add_handler(CallbackQueryHandler(_on_leave_callback, pattern=r"^leave:"))
+    # The persistent menu button sends its label as a normal Telegram message.
+    # Consume it before search/forwarding, then delete the trigger message.
+    app.add_handler(
+        MessageHandler(quick_menu_filter & chat_filter, _on_quick_menu_button),
+        group=-1,
+    )
     # Search capture runs in a separate earlier handler group so ordinary
     # topic messages still continue to the MAX forwarding handler in group 0.
     app.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND & chat_filter, _on_search_input),
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND & ~quick_menu_filter & chat_filter,
+            _on_search_input,
+        ),
         group=-1,
     )
     app.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND & chat_filter, _on_topic_message)
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND & ~quick_menu_filter & chat_filter,
+            _on_topic_message,
+        )
     )
     media_filter = (
         filters.PHOTO | filters.VOICE | filters.AUDIO

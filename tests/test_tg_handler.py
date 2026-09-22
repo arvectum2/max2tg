@@ -16,6 +16,7 @@ from app.tg_handler import (
     _cmd_menu,
     _cmd_search,
     _normalize_global_search_results,
+    _on_quick_menu_button,
     _on_del_callback,
     _on_leave_callback,
     _on_menu_callback,
@@ -23,6 +24,7 @@ from app.tg_handler import (
     _on_search_input,
     _on_topic_message,
     build_tg_app,
+    ensure_quick_menu,
 )
 
 
@@ -431,6 +433,65 @@ class TestDeleteTopic:
             for button in row
         ]
         assert "del:ok:10:-123" in callbacks
+
+
+# ---------------------------------------------------------------------------
+# persistent quick menu
+# ---------------------------------------------------------------------------
+
+class TestQuickMenu:
+    async def test_installs_persistent_keyboard_once(self):
+        bot = MagicMock()
+        sent = MagicMock()
+        sent.message_id = 91
+        bot.send_message = AsyncMock(return_value=sent)
+        store = MagicMock()
+        store.get_ui.return_value = None
+
+        result = await ensure_quick_menu(bot, -100999, store)
+
+        assert result == 91
+        kwargs = bot.send_message.call_args.kwargs
+        markup = kwargs["reply_markup"]
+        assert markup.is_persistent is True
+        assert markup.resize_keyboard is True
+        assert markup.keyboard[0][0].text == "☰ Меню"
+        store.set_ui.assert_called_once_with("quick_menu_message_id", 91)
+
+    async def test_does_not_post_duplicate_installer(self):
+        bot = MagicMock()
+        bot.send_message = AsyncMock()
+        store = MagicMock()
+        store.get_ui.return_value = 91
+
+        result = await ensure_quick_menu(bot, -100999, store)
+
+        assert result == 91
+        bot.send_message.assert_not_awaited()
+
+    async def test_button_opens_topic_menu_and_deletes_trigger(self):
+        max_client = MagicMock()
+        resolver = MagicMock()
+        resolver.chat_name.return_value = "Новости"
+        resolver.is_dm.return_value = False
+        max_client.resolver = resolver
+        store = _make_topic_store({10: -123})
+        update = _make_update(text="☰ Меню", thread_id=10, user_id=100)
+        update.message.delete = AsyncMock()
+        ctx = _make_context(
+            max_client=max_client,
+            topic_store=store,
+            allowed_user_ids={100},
+            admin_user_id=100,
+        )
+
+        await _on_quick_menu_button(update, ctx)
+
+        update.message.reply_text.assert_awaited_once()
+        markup = update.message.reply_text.call_args.kwargs["reply_markup"]
+        callbacks = [button.callback_data for row in markup.inline_keyboard for button in row]
+        assert "leave:ask:10:-123" in callbacks
+        update.message.delete.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------
