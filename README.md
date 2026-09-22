@@ -230,7 +230,7 @@ pip install pytest pytest-asyncio
 pytest -q
 ```
 
-Покрытие: `app/topics.py` (TopicStore), `app/config.py` (загрузка env), `app/max_listener.py` (форматирование, throttle), `app/tg_handler.py` (роутинг команд и медиа), `app/max_client.py` (опкоды). 196 тестов.
+Покрытие: `app/topics.py` (TopicStore), `app/config.py` (загрузка env), `app/max_listener.py` (форматирование, throttle), `app/tg_handler.py` (роутинг команд и медиа), `app/max_client.py` (опкоды). 202 теста.
 
 ### Структура проекта
 
@@ -245,7 +245,7 @@ max2tg/
 │   ├── tg_sender.py        # TG отправка + ensure_topic
 │   ├── tg_handler.py       # TG → MAX роутинг и команды
 │   └── topics.py           # TopicStore (JSON-карта)
-├── tests/                  # 196 pytest
+├── tests/                  # 202 pytest
 ├── docs/cover.jpg          # обложка README
 ├── state/                  # рантайм-данные (gitignored)
 ├── logs/                   # логи (gitignored)
