@@ -16,6 +16,8 @@ VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 def _header(msg: MaxMessage, sender_label: str, chat_label: str, is_dm: bool) -> str:
     if is_dm:
         return f"✉ <b>{sender_label}</b>"
+    if not sender_label:
+        return f"📢 <b>{chat_label}</b>"
     return f"💬 <b>{chat_label}</b> | {sender_label}"
 
 
@@ -312,21 +314,27 @@ def create_max_client(
         if msg.is_self:
             return
 
-        raw_sender = await resolver.resolve_user(msg.sender_id)
+        raw_sender = ""
+        if msg.sender_id is not None:
+            raw_sender = await resolver.resolve_user(msg.sender_id)
         is_dm = resolver.is_dm(msg.chat_id)
         raw_chat = resolver.chat_name(msg.chat_id)
 
         # One forum topic per Max chat. Prefer a human title:
         # - DMs → the peer's name
-        # - Groups with a known title → the chat title
-        # - Chats discovered at runtime (no known title yet) → the sender's name
-        #   (better than the numeric chat ID; ensure_topic will rename later if a
-        #   real chat title appears).
+        # - Groups/channels with a known title → the chat title
+        # - Runtime-discovered chats with a sender → the sender's name
+        # - Channel posts may have sender=None; use numeric chat ID temporarily
+        #   so ensure_topic can rename it when channel metadata arrives.
         chat_title_known = raw_chat != str(msg.chat_id) and not raw_chat.startswith("DM:")
-        if is_dm or not chat_title_known:
+        if is_dm:
+            topic_title = raw_sender or raw_chat
+        elif chat_title_known:
+            topic_title = raw_chat
+        elif raw_sender:
             topic_title = raw_sender
         else:
-            topic_title = raw_chat
+            topic_title = str(msg.chat_id)
 
         existing_thread = sender.topic_store.get_topic(msg.chat_id)
         thread_id = await sender.ensure_topic(msg.chat_id, topic_title)

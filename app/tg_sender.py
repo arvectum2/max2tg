@@ -70,7 +70,8 @@ class TelegramSender:
         existing = self._topics.get_topic(max_chat_id)
         if existing is not None:
             stored = self._topics.get_title(max_chat_id) or ""
-            if title and title != stored and _looks_numeric(stored) and not _looks_numeric(title):
+            stored_is_placeholder = _looks_numeric(stored) or stored.strip().lower() in {"none", "unknown"}
+            if title and title != stored and stored_is_placeholder and not _looks_numeric(title):
                 try:
                     await self._bot.edit_forum_topic(
                         chat_id=self._chat_id, message_thread_id=existing, name=title
