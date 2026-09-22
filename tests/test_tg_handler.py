@@ -25,9 +25,11 @@ from app.tg_handler import (
 
 def _make_topic_store(mapping: dict | None = None):
     """A TopicStore stand-in: chat_for_topic(thread_id) → max_chat_id."""
-    mapping = mapping or {10: 42}
+    mapping = {10: 42} if mapping is None else mapping
     store = MagicMock()
+    reverse = {chat_id: thread_id for thread_id, chat_id in mapping.items()}
     store.chat_for_topic = MagicMock(side_effect=lambda tid: mapping.get(tid))
+    store.get_topic = MagicMock(side_effect=lambda chat_id: reverse.get(chat_id))
     store.max_for_tg_message = MagicMock(return_value=None)
     return store
 
@@ -355,6 +357,7 @@ class TestMenu:
         max_client = MagicMock()
         resolver = MagicMock()
         resolver.chat_name.return_value = "Пчёлки"
+        resolver.is_dm.return_value = False
         max_client.resolver = resolver
         store = _make_topic_store({10: -123})
 
@@ -369,7 +372,8 @@ class TestMenu:
         await _cmd_menu(update, ctx)
 
         markup = update.message.reply_text.call_args.kwargs["reply_markup"]
-        assert markup.inline_keyboard[0][0].callback_data == "leave:ask:10:-123"
+        callbacks = [button.callback_data for row in markup.inline_keyboard for button in row]
+        assert "leave:ask:10:-123" in callbacks
 
     async def test_general_menu_lists_max_chats_by_name(self):
         max_client = MagicMock()
@@ -381,6 +385,9 @@ class TestMenu:
             -456: {"status": "ACTIVE"},
             789: {"status": "ACTIVE"},
         }
+        resolver.chat_name.side_effect = lambda cid: resolver.chats.get(cid, str(cid))
+        resolver.is_dm.side_effect = lambda cid: resolver.chat_types.get(cid) == "DIALOG"
+        resolver.user_name.side_effect = lambda uid: str(uid)
         max_client.resolver = resolver
         store = _make_topic_store({})
 
@@ -398,7 +405,82 @@ class TestMenu:
         labels = [row[0].text for row in markup.inline_keyboard]
         assert any("Канал" in label for label in labels)
         assert any("Группа" in label for label in labels)
-        assert all("Личный" not in label for label in labels)
+        assert any("Личный" in label for label in labels)
+
+    async def test_dm_card_has_create_topic_but_no_leave(self):
+        max_client = MagicMock()
+        resolver = MagicMock()
+        resolver.chats = {789: "Личный"}
+        resolver.chat_types = {789: "DIALOG"}
+        resolver.chats_raw = {789: {"status": "ACTIVE", "type": "DIALOG"}}
+        resolver.chat_name.return_value = "Личный"
+        resolver.is_dm.return_value = True
+        max_client.resolver = resolver
+        store = _make_topic_store({})
+
+        update = MagicMock()
+        update.callback_query = MagicMock()
+        update.callback_query.data = "menu:chat:789:0"
+        update.callback_query.answer = AsyncMock()
+        update.callback_query.edit_message_text = AsyncMock()
+        update.effective_user = MagicMock()
+        update.effective_user.id = 100
+
+        ctx = _make_context(
+            max_client=max_client,
+            topic_store=store,
+            allowed_user_ids={100},
+            admin_user_id=100,
+        )
+
+        await _on_menu_callback(update, ctx)
+
+        markup = update.callback_query.edit_message_text.call_args.kwargs["reply_markup"]
+        callbacks = [button.callback_data for row in markup.inline_keyboard for button in row]
+        assert "menu:bind:789:0" in callbacks
+        assert not any(callback.startswith("leave:") for callback in callbacks)
+
+    async def test_menu_can_create_topic_for_unbound_chat(self):
+        max_client = MagicMock()
+        resolver = MagicMock()
+        resolver.chats = {-456: "Группа"}
+        resolver.chat_types = {-456: "CHAT"}
+        resolver.chats_raw = {-456: {"status": "ACTIVE", "type": "CHAT", "title": "Группа"}}
+        resolver.chat_name.return_value = "Группа"
+        resolver.is_dm.return_value = False
+        max_client.resolver = resolver
+        store = _make_topic_store({})
+
+        update = MagicMock()
+        update.callback_query = MagicMock()
+        update.callback_query.data = "menu:bind:-456:0"
+        update.callback_query.answer = AsyncMock()
+        update.callback_query.edit_message_text = AsyncMock()
+        update.effective_user = MagicMock()
+        update.effective_user.id = 100
+
+        ctx = _make_context(
+            max_client=max_client,
+            topic_store=store,
+            allowed_user_ids={100},
+            admin_user_id=100,
+        )
+        ctx.bot_data[SUPERGROUP_KEY] = -100999
+        ctx.bot = MagicMock()
+        topic = MagicMock()
+        topic.message_thread_id = 77
+        ctx.bot.create_forum_topic = AsyncMock(return_value=topic)
+        ctx.bot.send_message = AsyncMock()
+        ctx.bot.pin_chat_message = AsyncMock()
+
+        await _on_menu_callback(update, ctx)
+
+        ctx.bot.create_forum_topic.assert_awaited_once_with(
+            chat_id=-100999, name="Группа",
+        )
+        store.set_topic.assert_called_once_with(-456, 77, "Группа")
+        text = update.callback_query.edit_message_text.call_args.args[0]
+        assert "Telegram-топик создан" in text
 
 
 # ---------------------------------------------------------------------------

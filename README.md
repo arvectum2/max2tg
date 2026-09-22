@@ -68,7 +68,9 @@
 ### Управление
 - Авто-создание форум-топика на каждый новый чат MAX
 - Закреплённая карточка профиля при создании топика
-- Команды: `/bind`, `/add`, `/profile`, `/intro`, `/del`, `/help`
+- Закреплённая панель в General: личные диалоги, группы и каналы MAX, пагинация и отметка уже подключённых топиков
+- Создание/восстановление Telegram-топика и выход из MAX кнопками — без ручного chat_id
+- Команды: `/menu`, `/bind`, `/add`, `/profile`, `/intro`, `/del`, `/leave`, `/help`
 - Опциональное ограничение «отвечать может только владелец» (`TG_ALLOWED_USER_ID`)
 - SOCKS5-прокси для Telegram (`TG_PROXY`)
 - Карта связок переживает рестарт (`state/topics.json`)
@@ -208,11 +210,13 @@ sudo journalctl -u max2tg -f
 
 | Команда | Что делает |
 |---|---|
+| `/menu` | Открыть кнопочный центр управления MAX-чатами; из General доступны личные диалоги, группы и каналы. |
 | `/bind <chat_id или URL> [название]` | Создать топик под конкретный чат MAX. URL вида `https://web.max.ru/<chat_id>` тоже принимается. |
 | `/add <https://max.ru/join/...>` | Открыть групповую/канальную ссылку MAX, создать топик и поставить карточку. |
 | `/profile` | (в топике) Показать профиль собеседника MAX: имя, id, аватар. |
 | `/intro` | (в топике) Перепостить и закрепить карточку профиля. |
 | `/del` | (в топике) Удалить топик и снять связь с MAX-чатом (с подтверждением). |
+| `/leave [chat_id]` | Выйти из группы/канала MAX с подтверждением; обычно удобнее кнопка в `/menu`. |
 | `/help` | Список всех команд. |
 
 ---
@@ -238,7 +242,7 @@ pip install pytest pytest-asyncio
 pytest -q
 ```
 
-Покрытие: `app/topics.py` (TopicStore), `app/config.py` (загрузка env), `app/max_listener.py` (форматирование, throttle), `app/tg_handler.py` (роутинг команд и медиа), `app/max_client.py` (опкоды). 202 теста.
+Покрытие: `app/topics.py` (TopicStore), `app/config.py` (загрузка env), `app/max_listener.py` (форматирование, throttle), `app/tg_handler.py` (роутинг команд и медиа), `app/max_client.py` (опкоды). 211 тестов.
 
 ### Структура проекта
 
@@ -253,7 +257,7 @@ max2tg/
 │   ├── tg_sender.py        # TG отправка + ensure_topic
 │   ├── tg_handler.py       # TG → MAX роутинг и команды
 │   └── topics.py           # TopicStore (JSON-карта)
-├── tests/                  # 202 pytest
+├── tests/                  # 211 pytest
 ├── docs/cover.jpg          # обложка README
 ├── state/                  # рантайм-данные (gitignored)
 ├── logs/                   # логи (gitignored)

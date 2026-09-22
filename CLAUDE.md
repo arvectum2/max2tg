@@ -18,9 +18,9 @@ app/
   max_listener.py  # MAX → TG handler (incoming), auto-topic creation
   resolver.py      # кеш контактов / чатов (chats_raw, contacts_raw)
   tg_sender.py     # TelegramSender + ensure_topic (create/rename)
-  tg_handler.py    # TG → MAX handler + команды /bind, /add, /profile, /intro, /del, /help
+  tg_handler.py    # TG → MAX + Personal UX: /menu, bind/add/profile/intro/del/leave/help
   topics.py        # TopicStore: JSON-карта max_chat_id ↔ thread_id
-tests/             # 191 pytest, asyncio_mode=auto
+tests/             # 211 pytest, asyncio_mode=auto
 docs/cover.jpg     # обложка README
 state/             # runtime (топик-карта), gitignored
 logs/              # логи, gitignored
@@ -89,13 +89,19 @@ WebSocket: `wss://ws-api.oneme.ru/websocket`, `Origin: https://web.max.ru`.
 - Bot API лимит загрузки файла — 20 МБ.
 - Bot **не может** ставить custom-emoji реакции (нужен Premium).
 
+## Personal UX v1.0 — текущий gate
+
+До onboarding/multi-user сначала закрываем личную Telegram-first версию. Панель в General показывает DIALOG/CHAT/CHANNEL с пагинацией и отметкой подключённых топиков; из карточки можно создать/восстановить Telegram-топик без chat_id. Для DIALOG кнопка выхода из MAX не показывается. Следующий крупный блок — поиск людей/групп/каналов MAX из Telegram и lifecycle/ошибки.
+
 ## Команды (в супергруппе)
 
+- `/menu` — кнопочный центр управления MAX-чатами.
 - `/bind <chat_id|URL> [title]` — ручная привязка топика к MAX-чату.
 - `/add <https://max.ru/join/...>` — резолв инвайт-ссылки + создание топика. `/u/<token>` пока не поддерживается.
 - `/profile` — в топике, профиль собеседника (имя/id/аватар).
 - `/intro` — перепост закреплённой карточки.
 - `/del` — удалить топик с подтверждением (inline-кнопки).
+- `/leave [chat_id]` — выйти из группы/канала MAX с подтверждением.
 - `/help` — справка.
 
 ## Состояние / runtime
@@ -105,7 +111,7 @@ WebSocket: `wss://ws-api.oneme.ru/websocket`, `Origin: https://web.max.ru`.
 
 ## Тесты
 
-`pytest -q` → 191 passed. asyncio_mode=auto. Покрытие: TopicStore, config, listener helpers (форматирование размеров, throttle), tg_handler (роутинг команд, маршрутизация медиа), max_client опкоды.
+`pytest -q` → 211 passed. asyncio_mode=auto. Покрытие: TopicStore, config, listener helpers (форматирование размеров, throttle), tg_handler (роутинг команд, маршрутизация медиа), max_client опкоды.
 
 ## Деплой
 

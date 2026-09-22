@@ -29,6 +29,8 @@ ADMIN_USER_KEY = "admin_user_id"
 SUPERGROUP_KEY = "supergroup_id"
 
 _MAX_URL_RE = re.compile(r"https?://(?:web\.)?max\.ru/(-?\d+)")
+_MENU_PAGE_SIZE = 8
+_MENU_ACTIVE_TYPES = {"DIALOG", "CHAT", "CHANNEL"}
 
 # Telegram entity type → MAX element type. The MAX names match what the
 # existing codebase used (STRONG) and what MAX renders for the formatting
@@ -709,22 +711,86 @@ async def _cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-def _management_keyboard(max_chat_id, thread_id: int, *, include_back: bool = False):
-    rows = [[
-        InlineKeyboardButton(
+def _menu_chat_title(resolver, chat_id) -> str:
+    title = resolver.chat_name(chat_id)
+    if resolver.is_dm(chat_id) and str(title).startswith("DM:"):
+        peer_id = _peer_id_in_dm(resolver, chat_id)
+        if peer_id is not None:
+            resolved = resolver.user_name(peer_id)
+            if resolved and resolved != str(peer_id):
+                title = resolved
+    return str(title)
+
+
+def _menu_entries(resolver, topic_store: TopicStore) -> list[tuple]:
+    entries = []
+    chat_ids = set(resolver.chats) | set(resolver.chats_raw)
+    for chat_id in chat_ids:
+        ctype = resolver.chat_types.get(chat_id)
+        raw = resolver.chats_raw.get(chat_id) or {}
+        if ctype not in _MENU_ACTIVE_TYPES:
+            continue
+        if raw.get("status") in ("LEFT", "CLOSED"):
+            continue
+        title = _menu_chat_title(resolver, chat_id)
+        entries.append((title.casefold(), chat_id, title, ctype,
+                        topic_store.get_topic(chat_id)))
+    entries.sort(key=lambda item: (item[0], str(item[1])))
+    return entries
+
+
+def _menu_list_markup(resolver, topic_store: TopicStore, page: int = 0):
+    entries = _menu_entries(resolver, topic_store)
+    page_count = max(1, (len(entries) + _MENU_PAGE_SIZE - 1) // _MENU_PAGE_SIZE)
+    page = max(0, min(page, page_count - 1))
+    start = page * _MENU_PAGE_SIZE
+    rows = []
+    icons = {"DIALOG": "👤", "CHAT": "💬", "CHANNEL": "📢"}
+    for _, chat_id, title, ctype, thread_id in entries[start:start + _MENU_PAGE_SIZE]:
+        linked = "✅ " if thread_id else ""
+        rows.append([InlineKeyboardButton(
+            f"{linked}{icons.get(ctype, '💬')} {title[:42]}",
+            callback_data=f"menu:chat:{chat_id}:{page}",
+        )])
+    if page_count > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("←", callback_data=f"menu:list:{page - 1}"))
+        nav.append(InlineKeyboardButton(f"{page + 1}/{page_count}", callback_data="menu:noop"))
+        if page + 1 < page_count:
+            nav.append(InlineKeyboardButton("→", callback_data=f"menu:list:{page + 1}"))
+        rows.append(nav)
+    rows.append([InlineKeyboardButton("🔄 Обновить", callback_data=f"menu:list:{page}")])
+    return InlineKeyboardMarkup(rows), page, page_count, len(entries)
+
+
+def _management_keyboard(max_chat_id, thread_id: int, *, is_dm: bool = False,
+                         include_back: bool = False, back_page: int = 0):
+    rows = []
+    if thread_id > 0:
+        rows.append([InlineKeyboardButton(
+            "✅ Telegram-топик подключён",
+            callback_data="menu:noop",
+        )])
+    else:
+        rows.append([InlineKeyboardButton(
+            "➕ Создать Telegram-топик",
+            callback_data=f"menu:bind:{max_chat_id}:{back_page}",
+        )])
+    if not is_dm:
+        rows.append([InlineKeyboardButton(
             "🚪 Выйти из MAX",
             callback_data=f"leave:ask:{thread_id}:{max_chat_id}",
-        )
-    ]]
+        )])
     if thread_id > 0:
-        rows.append([
-            InlineKeyboardButton(
-                "🗑 Удалить только Telegram-топик",
-                callback_data=f"del:ask:{thread_id}:{max_chat_id}",
-            )
-        ])
+        rows.append([InlineKeyboardButton(
+            "🗑 Удалить только Telegram-топик",
+            callback_data=f"del:ask:{thread_id}:{max_chat_id}",
+        )])
     if include_back:
-        rows.append([InlineKeyboardButton("← К списку", callback_data="menu:list")])
+        rows.append([InlineKeyboardButton(
+            "← К списку", callback_data=f"menu:list:{back_page}",
+        )])
     return InlineKeyboardMarkup(rows)
 
 
@@ -788,7 +854,7 @@ async def _cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Open a button-based management menu.
 
     Inside a bound topic the menu targets that MAX chat directly. In General
-    it lists known MAX groups/channels by title so no numeric IDs are needed.
+    it lists active MAX dialogs, groups and channels without numeric IDs.
     """
     message = update.message
     if message is None or not _is_admin_user(update, context):
@@ -809,7 +875,10 @@ async def _cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await message.reply_text(
                 f"<b>{escape(title)}</b>\nВыбери действие:",
                 parse_mode="HTML",
-                reply_markup=_management_keyboard(max_chat_id, thread_id),
+                reply_markup=_management_keyboard(
+                    max_chat_id, thread_id,
+                    is_dm=bool(resolver and resolver.is_dm(max_chat_id)),
+                ),
             )
             return
 
@@ -818,35 +887,58 @@ async def _cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await message.reply_text("⚠️ Список MAX-чатов пока недоступен.")
         return
 
-    rows = []
-    for chat_id, title in sorted(
-        resolver.chats.items(), key=lambda item: str(item[1]).casefold()
-    ):
-        ctype = resolver.chat_types.get(chat_id)
-        raw = resolver.chats_raw.get(chat_id) or {}
-        if ctype not in ("CHAT", "CHANNEL"):
-            continue
-        if raw.get("status") in ("LEFT", "CLOSED"):
-            continue
-        icon = "📢" if ctype == "CHANNEL" else "💬"
-        rows.append([
-            InlineKeyboardButton(
-                f"{icon} {str(title)[:48]}",
-                callback_data=f"menu:chat:{chat_id}",
-            )
-        ])
-        if len(rows) >= 30:
-            break
-
-    if not rows:
-        await message.reply_text("Не вижу активных групп или каналов MAX.")
+    markup, page, page_count, total = _menu_list_markup(
+        resolver, topic_store, page=0,
+    )
+    if total == 0:
+        await message.reply_text("Не вижу активных чатов MAX.")
         return
 
     await message.reply_text(
-        "<b>Управление MAX</b>\nВыбери чат или канал:",
+        f"<b>MAX-чаты</b> · {total}\n"
+        f"Страница {page + 1}/{page_count}. ✅ — Telegram-топик уже создан.",
         parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(rows),
+        reply_markup=markup,
     )
+
+
+async def _create_topic_from_menu(context: ContextTypes.DEFAULT_TYPE,
+                                  max_client: MaxClient,
+                                  topic_store: TopicStore,
+                                  max_chat_id) -> tuple[int, str, bool]:
+    resolver = getattr(max_client, "resolver", None)
+    title = _menu_chat_title(resolver, max_chat_id) if resolver else str(max_chat_id)
+    title = (title or str(max_chat_id))[:128]
+    supergroup_id = int(context.bot_data[SUPERGROUP_KEY])
+
+    existing = topic_store.get_topic(max_chat_id)
+    if existing:
+        try:
+            await context.bot.edit_forum_topic(
+                chat_id=supergroup_id,
+                message_thread_id=existing,
+                name=title,
+            )
+            return existing, title, False
+        except BadRequest as exc:
+            error = str(exc).lower()
+            if "message thread not found" not in error and "message_thread_not_found" not in error:
+                return existing, title, False
+            topic_store.remove(max_chat_id)
+        except Exception:
+            log.exception("menu bind: could not verify existing topic")
+            return existing, title, False
+
+    topic = await context.bot.create_forum_topic(
+        chat_id=supergroup_id,
+        name=title,
+    )
+    thread_id = topic.message_thread_id
+    topic_store.set_topic(max_chat_id, thread_id, title)
+    asyncio.create_task(post_topic_intro(
+        context.bot, supergroup_id, max_client, max_chat_id, thread_id,
+    ))
+    return thread_id, title, True
 
 
 async def _on_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -861,49 +953,84 @@ async def _on_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     topic_store: TopicStore = context.bot_data[TOPIC_STORE_KEY]
     resolver = getattr(max_client, "resolver", None) if max_client else None
 
-    if query.data == "menu:list":
+    if query.data == "menu:noop":
+        return
+
+    if query.data == "menu:list" or query.data.startswith("menu:list:"):
         if resolver is None:
             await query.edit_message_text("⚠️ Список MAX-чатов пока недоступен.")
             return
-        rows = []
-        for chat_id, title in sorted(
-            resolver.chats.items(), key=lambda item: str(item[1]).casefold()
-        ):
-            ctype = resolver.chat_types.get(chat_id)
-            raw = resolver.chats_raw.get(chat_id) or {}
-            if ctype not in ("CHAT", "CHANNEL") or raw.get("status") in ("LEFT", "CLOSED"):
-                continue
-            icon = "📢" if ctype == "CHANNEL" else "💬"
-            rows.append([
-                InlineKeyboardButton(
-                    f"{icon} {str(title)[:48]}",
-                    callback_data=f"menu:chat:{chat_id}",
-                )
-            ])
-            if len(rows) >= 30:
-                break
+        try:
+            page = int(query.data.split(":")[2]) if query.data.count(":") == 2 else 0
+        except ValueError:
+            page = 0
+        markup, page, page_count, total = _menu_list_markup(
+            resolver, topic_store, page=page,
+        )
+        if total == 0:
+            await query.edit_message_text("Не вижу активных чатов MAX.")
+            return
         await query.edit_message_text(
-            "<b>Управление MAX</b>\nВыбери чат или канал:",
+            f"<b>MAX-чаты</b> · {total}\n"
+            f"Страница {page + 1}/{page_count}. ✅ — Telegram-топик уже создан.",
             parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(rows),
+            reply_markup=markup,
         )
         return
 
     parts = query.data.split(":")
-    if len(parts) != 3 or parts[:2] != ["menu", "chat"]:
+    if len(parts) != 4 or parts[0] != "menu" or parts[1] not in ("chat", "bind"):
         return
     try:
         max_chat_id = int(parts[2])
+        back_page = int(parts[3])
     except ValueError:
         return
 
-    title = resolver.chat_name(max_chat_id) if resolver else str(max_chat_id)
-    thread_id = topic_store.get_topic(max_chat_id) or 0
+    if resolver is None:
+        await query.edit_message_text("⚠️ Список MAX-чатов пока недоступен.")
+        return
+
+    if parts[1] == "bind":
+        if max_client is None:
+            await query.edit_message_text("⚠️ Max клиент не подключён.")
+            return
+        try:
+            thread_id, title, created = await _create_topic_from_menu(
+                context, max_client, topic_store, max_chat_id,
+            )
+        except Exception as exc:
+            log.exception("menu bind: create_forum_topic failed")
+            await query.edit_message_text(
+                f"⚠️ Не удалось создать Telegram-топик: {escape(str(exc))}",
+                parse_mode="HTML",
+            )
+            return
+        prefix = "✅ Telegram-топик создан." if created else "✅ Telegram-топик уже подключён."
+    else:
+        title = _menu_chat_title(resolver, max_chat_id)
+        thread_id = topic_store.get_topic(max_chat_id) or 0
+        prefix = None
+
+    ctype = resolver.chat_types.get(max_chat_id) or "?"
+    type_label = {
+        "DIALOG": "Личный диалог",
+        "CHAT": "Группа",
+        "CHANNEL": "Канал",
+    }.get(ctype, str(ctype))
+    topic_status = "✅ Telegram-топик подключён" if thread_id else "Telegram-топик не создан"
+    header = f"{prefix}\n\n" if prefix else ""
     await query.edit_message_text(
-        f"<b>{escape(title)}</b>\nВыбери действие:",
+        header
+        + f"<b>{escape(title)}</b> · {escape(type_label)}\n"
+        + topic_status
+        + "\n\nВыбери действие:",
         parse_mode="HTML",
         reply_markup=_management_keyboard(
-            max_chat_id, thread_id, include_back=True,
+            max_chat_id, thread_id,
+            is_dm=resolver.is_dm(max_chat_id),
+            include_back=True,
+            back_page=back_page,
         ),
     )
 
