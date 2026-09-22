@@ -41,6 +41,9 @@ class TestOpCode:
     def test_chat_get(self):
         assert OpCode.CHAT_GET == 48
 
+    def test_chat_leave(self):
+        assert OpCode.CHAT_LEAVE == 58
+
     def test_send_message(self):
         assert OpCode.SEND_MESSAGE == 64
 

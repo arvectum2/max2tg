@@ -40,6 +40,12 @@ class TestSetAndGet:
         store.update_title(42, "Alice")
         assert store.get_title(42) == "Alice"
 
+    def test_message_mapping_round_trip(self, tmp_path):
+        store = TopicStore(_path(tmp_path))
+        store.set_message(42, "max-1", 501)
+        assert store.tg_for_max_message(42, "max-1") == 501
+        assert store.max_for_tg_message(42, 501) == "max-1"
+
 
 class TestPersistence:
     def test_mapping_survives_reload(self, tmp_path):
@@ -68,6 +74,15 @@ class TestPersistence:
 
         reloaded = TopicStore(path)
         assert reloaded.get_title(42) == "Alice"
+
+    def test_message_mapping_survives_reload(self, tmp_path):
+        path = _path(tmp_path)
+        store = TopicStore(path)
+        store.set_message(42, "max-1", 501)
+
+        reloaded = TopicStore(path)
+        assert reloaded.tg_for_max_message(42, "max-1") == 501
+        assert reloaded.max_for_tg_message(42, 501) == "max-1"
 
     def test_file_is_valid_json(self, tmp_path):
         path = _path(tmp_path)

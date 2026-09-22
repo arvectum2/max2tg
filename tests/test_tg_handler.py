@@ -195,6 +195,95 @@ class TestOnTopicMessage:
         update.message.reply_text.assert_called_once()
         assert "⚠️" in update.message.reply_text.call_args[0][0]
 
+    async def test_native_reply_is_sent_as_max_reply(self):
+        max_client = MagicMock()
+        max_client.send_message = AsyncMock(
+            return_value={"message": {"id": "max-new"}}
+        )
+        store = _make_topic_store({10: 42})
+        store.max_for_tg_message.return_value = "max-old"
+
+        update = _make_update("Ответ", thread_id=10)
+        update.message.reply_to_message = MagicMock()
+        update.message.reply_to_message.message_id = 77
+        ctx = _make_context(max_client=max_client, topic_store=store)
+
+        await _on_topic_message(update, ctx)
+
+        max_client.send_message.assert_called_once_with(
+            42,
+            "Ответ",
+            elements=[],
+            link={"type": "REPLY", "messageId": "max-old"},
+        )
+        store.set_message.assert_called_once_with(42, "max-new", 500)
+
+
+# ---------------------------------------------------------------------------
+# /leave
+# ---------------------------------------------------------------------------
+
+class TestLeave:
+    async def test_admin_gets_leave_confirmation(self):
+        max_client = MagicMock()
+        resolver = MagicMock()
+        resolver.is_dm.return_value = False
+        resolver.chat_name.return_value = "Test group"
+        max_client.resolver = resolver
+
+        store = _make_topic_store({10: -123})
+        update = _make_update(thread_id=10, user_id=100)
+        ctx = _make_context(
+            max_client=max_client,
+            topic_store=store,
+            allowed_user_ids={100},
+            admin_user_id=100,
+        )
+
+        await _cmd_leave(update, ctx)
+
+        update.message.reply_text.assert_called_once()
+        assert "Выйти из" in update.message.reply_text.call_args[0][0]
+
+    async def test_confirmed_leave_calls_max_then_removes_topic(self):
+        max_client = MagicMock()
+        max_client.leave_chat = AsyncMock(
+            return_value={"message": {"attaches": [{"event": "leave"}]}}
+        )
+        resolver = MagicMock()
+        resolver.chats = {-123: "Test group"}
+        resolver.chat_types = {-123: "CHAT"}
+        resolver.chats_raw = {-123: {"type": "CHAT"}}
+        max_client.resolver = resolver
+
+        store = MagicMock()
+        update = MagicMock()
+        update.callback_query = MagicMock()
+        update.callback_query.data = "leave:ok:10:-123"
+        update.callback_query.answer = AsyncMock()
+        update.callback_query.edit_message_text = AsyncMock()
+        update.effective_user = MagicMock()
+        update.effective_user.id = 100
+
+        ctx = _make_context(
+            max_client=max_client,
+            topic_store=store,
+            allowed_user_ids={100},
+            admin_user_id=100,
+        )
+        ctx.bot_data[SUPERGROUP_KEY] = -100999
+        ctx.bot = MagicMock()
+        ctx.bot.delete_forum_topic = AsyncMock()
+
+        await _on_leave_callback(update, ctx)
+
+        max_client.leave_chat.assert_awaited_once_with(-123)
+        store.remove.assert_called_once_with(-123)
+        ctx.bot.delete_forum_topic.assert_awaited_once_with(
+            chat_id=-100999,
+            message_thread_id=10,
+        )
+
 
 # ---------------------------------------------------------------------------
 # family admin ACL
