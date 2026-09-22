@@ -801,6 +801,69 @@ class TestSearch:
         assert resolver.chat_types[chat_id] == "DIALOG"
         assert resolver.users[55] == "Иван Иванов"
 
+    async def test_search_connect_continues_if_callback_ack_network_fails(self):
+        max_client = MagicMock()
+        resolver = MagicMock()
+        resolver.my_id = 100
+        resolver.chats = {}
+        resolver.chat_types = {}
+        resolver.chats_raw = {}
+        resolver.contacts_raw = {}
+        resolver.users = {}
+        resolver.is_dm.return_value = False
+        resolver.chat_name.side_effect = lambda cid: resolver.chats.get(cid, str(cid))
+        max_client.resolver = resolver
+        max_client.open_by_link = AsyncMock(return_value={
+            "chat": {
+                "id": -777,
+                "type": "CHANNEL",
+                "title": "Новости",
+                "link": "https://max.ru/news",
+                "status": "ACTIVE",
+            }
+        })
+        store = _make_topic_store({})
+        record = {
+            "chat_id": -777,
+            "type": "CHANNEL",
+            "title": "Новости",
+            "link": "https://max.ru/news",
+            "raw": {"id": -777, "type": "CHANNEL", "title": "Новости"},
+        }
+
+        update = MagicMock()
+        update.callback_query = MagicMock()
+        update.callback_query.data = "search:connect:-777"
+        update.callback_query.answer = AsyncMock(
+            side_effect=RuntimeError("temporary Telegram proxy failure")
+        )
+        update.callback_query.edit_message_text = AsyncMock()
+        update.effective_user = MagicMock()
+        update.effective_user.id = 100
+
+        ctx = _make_context(
+            max_client=max_client,
+            topic_store=store,
+            allowed_user_ids={100},
+            admin_user_id=100,
+        )
+        ctx.user_data["max_search_results"] = {"-777": record}
+        ctx.bot_data[SUPERGROUP_KEY] = -100999
+        ctx.bot = MagicMock()
+        topic = MagicMock()
+        topic.message_thread_id = 90
+        ctx.bot.create_forum_topic = AsyncMock(return_value=topic)
+        ctx.bot.send_message = AsyncMock()
+        ctx.bot.pin_chat_message = AsyncMock()
+
+        await _on_search_callback(update, ctx)
+
+        max_client.open_by_link.assert_awaited_once_with("https://max.ru/news")
+        ctx.bot.create_forum_topic.assert_awaited_once_with(
+            chat_id=-100999, name="Новости",
+        )
+        store.set_topic.assert_called_once_with(-777, 90, "Новости")
+
     async def test_search_connect_public_channel_opens_link_first(self):
         max_client = MagicMock()
         resolver = MagicMock()

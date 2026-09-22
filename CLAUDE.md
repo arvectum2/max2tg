@@ -94,7 +94,7 @@ WebSocket: `wss://ws-api.oneme.ru/websocket`, `Origin: https://web.max.ru`.
 
 ## Personal UX v1.0 — закрыт
 
-Личная Telegram-first версия закрыта 22.09.2026. Панель в General показывает DIALOG/CHAT/CHANNEL с пагинацией и отметкой подключённых топиков; из карточки можно создать/восстановить Telegram-топик без chat_id. Для DIALOG кнопка выхода из MAX не показывается. Глобальный поиск MAX (opcode 60) встроен: человек → deterministic DIALOG id (`viewer_id ^ contact_id`), группа/канал → открыть/вступить через opcode 57 и создать топик. Lifecycle leave/delete поддерживает как текстовые карточки, так и фото-карточки через caption fallback; успешное удаление/выход подтверждается в General. Reconnect сообщает об обрыве и восстановлении. В супергруппе установлен persistent reply keyboard с кнопкой `☰ Меню`: в General она открывает список MAX-чатов, внутри связанного топика — управление этим чатом; техническое сообщение кнопки не пересылается в MAX.
+Личная Telegram-first версия закрыта 22.09.2026. Панель в General показывает DIALOG/CHAT/CHANNEL с пагинацией и отметкой подключённых топиков; из карточки можно создать/восстановить Telegram-топик без chat_id. Для DIALOG кнопка выхода из MAX не показывается. Глобальный поиск MAX (opcode 60) встроен: человек → deterministic DIALOG id (`viewer_id ^ contact_id`), группа/канал → открыть/вступить через opcode 57 и создать топик. Lifecycle leave/delete поддерживает как текстовые карточки, так и фото-карточки через caption fallback; успешное удаление/выход подтверждается в General. Reconnect сообщает об обрыве и восстановлении. В супергруппе установлен persistent reply keyboard с кнопкой `☰ Меню`: в General она открывает список MAX-чатов, внутри связанного топика — управление этим чатом; техническое сообщение кнопки не пересылается в MAX. `answerCallbackQuery` работает fail-open: временная ошибка Telegram/прокси при снятии spinner не отменяет само действие кнопки.
 
 ## Команды (в супергруппе)
 
@@ -114,7 +114,7 @@ WebSocket: `wss://ws-api.oneme.ru/websocket`, `Origin: https://web.max.ru`.
 
 ## Тесты
 
-`pytest -q` → 227 passed. asyncio_mode=auto. Покрытие: TopicStore, config, listener helpers (форматирование размеров, throttle), tg_handler (роутинг команд, маршрутизация медиа), max_client опкоды.
+`pytest -q` → 228 passed. asyncio_mode=auto. Покрытие: TopicStore, config, listener helpers (форматирование размеров, throttle), tg_handler (роутинг команд, маршрутизация медиа), max_client опкоды.
 
 ## Деплой
 

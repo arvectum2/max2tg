@@ -971,6 +971,18 @@ async def ensure_quick_menu(bot, supergroup_id, topic_store: TopicStore) -> int 
     return sent.message_id
 
 
+async def _answer_callback_safely(query) -> None:
+    """Acknowledge an inline-button press without making it a hard dependency.
+
+    answerCallbackQuery only dismisses Telegram's loading spinner. A transient
+    Bot API/proxy failure must not prevent the actual MAX action from running.
+    """
+    try:
+        await query.answer()
+    except Exception as exc:
+        log.warning("Could not answer Telegram callback; continuing action: %s", exc)
+
+
 async def _edit_callback_content(query, text: str, **kwargs) -> None:
     """Edit callback message whether the button lives on text or media.
 
@@ -1271,7 +1283,7 @@ async def _on_search_callback(update: Update,
     query = update.callback_query
     if query is None or not query.data:
         return
-    await query.answer()
+    await _answer_callback_safely(query)
     if not _is_admin_user(update, context):
         return
 
@@ -1470,7 +1482,7 @@ async def _on_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     query = update.callback_query
     if query is None or not query.data:
         return
-    await query.answer()
+    await _answer_callback_safely(query)
     if not _is_admin_user(update, context):
         return
 
@@ -1655,7 +1667,7 @@ async def _on_del_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     query = update.callback_query
     if query is None or not query.data:
         return
-    await query.answer()
+    await _answer_callback_safely(query)
 
     if not _is_admin_user(update, context):
         return
@@ -1802,7 +1814,7 @@ async def _on_leave_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     query = update.callback_query
     if query is None or not query.data:
         return
-    await query.answer()
+    await _answer_callback_safely(query)
 
     if not _is_admin_user(update, context):
         return
