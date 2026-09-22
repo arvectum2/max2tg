@@ -16,6 +16,8 @@ class Settings:
     reply_enabled: bool = False
     state_dir: str = "state"
     tg_allowed_user_id: int | None = None
+    tg_allowed_user_ids: frozenset[int] = frozenset()
+    tg_admin_user_id: int | None = None
 
 
 def load_settings() -> Settings:
@@ -38,6 +40,8 @@ def load_settings() -> Settings:
         )
 
     allowed_raw = os.environ.get("TG_ALLOWED_USER_ID") or None
+    allowed_many_raw = os.environ.get("TG_ALLOWED_USER_IDS") or ""
+    admin_raw = os.environ.get("TG_ADMIN_USER_ID") or None
     allowed_user_id: int | None = None
     if allowed_raw:
         try:
@@ -46,6 +50,30 @@ def load_settings() -> Settings:
             raise SystemExit(
                 f"TG_ALLOWED_USER_ID must be a valid integer, got: {allowed_raw!r}"
             )
+
+    allowed_user_ids: set[int] = set()
+    if allowed_user_id is not None:
+        allowed_user_ids.add(allowed_user_id)
+    for raw in allowed_many_raw.split(","):
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            allowed_user_ids.add(int(raw))
+        except ValueError:
+            raise SystemExit(
+                f"TG_ALLOWED_USER_IDS must be comma-separated integers, got: {allowed_many_raw!r}"
+            )
+
+    admin_user_id: int | None = None
+    if admin_raw:
+        try:
+            admin_user_id = int(admin_raw)
+        except ValueError:
+            raise SystemExit(
+                f"TG_ADMIN_USER_ID must be a valid integer, got: {admin_raw!r}"
+            )
+        allowed_user_ids.add(admin_user_id)
 
     return Settings(
         max_token=os.environ["MAX_TOKEN"],
@@ -58,4 +86,6 @@ def load_settings() -> Settings:
         reply_enabled=os.environ.get("REPLY_ENABLED", "").lower() in ("1", "true", "yes"),
         state_dir=os.environ.get("STATE_DIR") or "state",
         tg_allowed_user_id=allowed_user_id,
+        tg_allowed_user_ids=frozenset(allowed_user_ids),
+        tg_admin_user_id=admin_user_id,
     )

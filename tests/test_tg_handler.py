@@ -3,9 +3,12 @@
 from unittest.mock import AsyncMock, MagicMock
 
 from app.tg_handler import (
+    ADMIN_USER_KEY,
     ALLOWED_USER_KEY,
+    ALLOWED_USERS_KEY,
     MAX_CLIENT_KEY,
     TOPIC_STORE_KEY,
+    _cmd_bind,
     _on_topic_message,
     build_tg_app,
 )
@@ -36,9 +39,9 @@ def _make_update(text="Hello", thread_id=10, is_topic_message=True, user_id=100)
     return update
 
 
-def _make_context(max_client=None, topic_store=None, allowed_user_id=None):
+def _make_context(max_client=None, topic_store=None, allowed_user_id=None, allowed_user_ids=None, admin_user_id=None):
     ctx = MagicMock()
-    bot_data = {ALLOWED_USER_KEY: allowed_user_id}
+    bot_data = {ALLOWED_USER_KEY: allowed_user_id, ALLOWED_USERS_KEY: frozenset(allowed_user_ids or []), ADMIN_USER_KEY: admin_user_id}
     if max_client is not None:
         bot_data[MAX_CLIENT_KEY] = max_client
     if topic_store is not None:
@@ -131,6 +134,27 @@ class TestOnTopicMessage:
 
         max_client.send_message.assert_called_once()
 
+    async def test_allows_each_member_of_multi_user_acl(self):
+        max_client = MagicMock()
+        max_client.send_message = AsyncMock(return_value={"ok": True})
+        ctx = _make_context(max_client=max_client, topic_store=_make_topic_store(),
+                            allowed_user_ids={100, 200, 300})
+
+        for user_id in (100, 200, 300):
+            max_client.send_message.reset_mock()
+            await _on_topic_message(_make_update(user_id=user_id), ctx)
+            max_client.send_message.assert_called_once()
+
+    async def test_rejects_user_outside_multi_user_acl(self):
+        max_client = MagicMock()
+        max_client.send_message = AsyncMock()
+        ctx = _make_context(max_client=max_client, topic_store=_make_topic_store(),
+                            allowed_user_ids={100, 200, 300})
+
+        await _on_topic_message(_make_update(user_id=999), ctx)
+
+        max_client.send_message.assert_not_called()
+
     async def test_warns_when_max_client_missing(self):
         update = _make_update()
         ctx = _make_context(topic_store=_make_topic_store())
@@ -166,6 +190,27 @@ class TestOnTopicMessage:
 
 
 # ---------------------------------------------------------------------------
+# family admin ACL
+# ---------------------------------------------------------------------------
+
+class TestFamilyAdminAcl:
+    async def test_non_admin_cannot_bind(self):
+        update = _make_update(user_id=200)
+        ctx = _make_context(allowed_user_ids={100, 200, 300}, admin_user_id=100)
+        ctx.args = ["-12345"]
+        await _cmd_bind(update, ctx)
+        update.message.reply_text.assert_not_called()
+
+    async def test_admin_can_enter_bind_flow(self):
+        update = _make_update(user_id=100)
+        ctx = _make_context(allowed_user_ids={100, 200, 300}, admin_user_id=100)
+        ctx.args = []
+        await _cmd_bind(update, ctx)
+        update.message.reply_text.assert_called_once()
+        assert "/bind" in update.message.reply_text.call_args[0][0]
+
+
+# ---------------------------------------------------------------------------
 # build_tg_app
 # ---------------------------------------------------------------------------
 
@@ -186,6 +231,14 @@ class TestBuildTgApp:
                             _make_topic_store())
 
         assert app.bot_data[ALLOWED_USER_KEY] is None
+
+    def test_wires_family_acl_and_admin(self):
+        app = build_tg_app("123456:AAABBBCCC", MagicMock(), "-100123456",
+                           _make_topic_store(), allowed_user_ids={100, 200, 300},
+                           admin_user_id=100)
+
+        assert app.bot_data[ALLOWED_USERS_KEY] == frozenset({100, 200, 300})
+        assert app.bot_data[ADMIN_USER_KEY] == 100
 
     def test_registers_message_handler(self):
         app = build_tg_app("123456:AAABBBCCC", MagicMock(), "-100123456",

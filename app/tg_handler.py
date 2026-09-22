@@ -22,7 +22,9 @@ log = logging.getLogger(__name__)
 
 MAX_CLIENT_KEY = "max_client"
 TOPIC_STORE_KEY = "topic_store"
-ALLOWED_USER_KEY = "allowed_user_id"
+ALLOWED_USER_KEY = "allowed_user_id"  # legacy single-user key
+ALLOWED_USERS_KEY = "allowed_user_ids"
+ADMIN_USER_KEY = "admin_user_id"
 SUPERGROUP_KEY = "supergroup_id"
 
 _MAX_URL_RE = re.compile(r"https?://(?:web\.)?max\.ru/(-?\d+)")
@@ -82,6 +84,28 @@ def _entities_to_max_elements(text: str, entities) -> list:
     return elements
 
 
+def _effective_user_id(update: Update) -> int | None:
+    user = update.effective_user
+    return int(user.id) if user is not None else None
+
+
+def _is_allowed_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    user_id = _effective_user_id(update)
+    allowed = context.bot_data.get(ALLOWED_USERS_KEY)
+    if allowed:
+        return user_id in allowed
+    legacy = context.bot_data.get(ALLOWED_USER_KEY)
+    return not legacy or user_id == legacy
+
+
+def _is_admin_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    user_id = _effective_user_id(update)
+    admin = context.bot_data.get(ADMIN_USER_KEY)
+    if admin:
+        return user_id == admin
+    return _is_allowed_user(update, context)
+
+
 def _parse_max_chat_id(s: str) -> int | None:
     """Accept either a raw chat id or a web.max.ru URL."""
     s = s.strip()
@@ -122,8 +146,7 @@ def _resolve_topic_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
     max_chat_id = topic_store.chat_for_topic(thread_id) if topic_store else None
     if max_chat_id is None:
         return None
-    allowed_user_id = context.bot_data.get(ALLOWED_USER_KEY)
-    if allowed_user_id and update.effective_user and update.effective_user.id != allowed_user_id:
+    if not _is_allowed_user(update, context):
         return None
     max_client: MaxClient | None = context.bot_data.get(MAX_CLIENT_KEY)
     return message, max_chat_id, max_client
@@ -389,8 +412,7 @@ async def _cmd_bind(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if message is None:
         return
 
-    allowed_user_id = context.bot_data.get(ALLOWED_USER_KEY)
-    if allowed_user_id and update.effective_user and update.effective_user.id != allowed_user_id:
+    if not _is_admin_user(update, context):
         return
 
     args = context.args or []
@@ -496,8 +518,7 @@ async def _cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if message is None:
         return
 
-    allowed_user_id = context.bot_data.get(ALLOWED_USER_KEY)
-    if allowed_user_id and update.effective_user and update.effective_user.id != allowed_user_id:
+    if not _is_admin_user(update, context):
         return
 
     args = context.args or []
@@ -644,8 +665,7 @@ async def _cmd_del(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if message is None:
         return
 
-    allowed_user_id = context.bot_data.get(ALLOWED_USER_KEY)
-    if allowed_user_id and update.effective_user and update.effective_user.id != allowed_user_id:
+    if not _is_admin_user(update, context):
         return
 
     target = _resolve_topic_target(update, context)
@@ -680,8 +700,7 @@ async def _on_del_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
     await query.answer()
 
-    allowed_user_id = context.bot_data.get(ALLOWED_USER_KEY)
-    if allowed_user_id and update.effective_user and update.effective_user.id != allowed_user_id:
+    if not _is_admin_user(update, context):
         return
 
     parts = query.data.split(":")
@@ -898,6 +917,8 @@ async def _cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 def build_tg_app(token: str, max_client: MaxClient, supergroup_id: str,
                  topic_store: TopicStore, allowed_user_id: int | None = None,
+                 allowed_user_ids: set[int] | frozenset[int] | None = None,
+                 admin_user_id: int | None = None,
                  proxy_url: str | None = None) -> Application:
     """Build the Telegram Application that routes topic replies back to Max."""
     builder = Application.builder().token(token)
@@ -907,6 +928,13 @@ def build_tg_app(token: str, max_client: MaxClient, supergroup_id: str,
     app.bot_data[MAX_CLIENT_KEY] = max_client
     app.bot_data[TOPIC_STORE_KEY] = topic_store
     app.bot_data[ALLOWED_USER_KEY] = int(allowed_user_id) if allowed_user_id else None
+    allowed = {int(uid) for uid in (allowed_user_ids or set())}
+    if allowed_user_id:
+        allowed.add(int(allowed_user_id))
+    if admin_user_id:
+        allowed.add(int(admin_user_id))
+    app.bot_data[ALLOWED_USERS_KEY] = frozenset(allowed)
+    app.bot_data[ADMIN_USER_KEY] = int(admin_user_id) if admin_user_id else None
     app.bot_data[SUPERGROUP_KEY] = int(supergroup_id)
 
     chat_filter = filters.Chat(chat_id=int(supergroup_id))

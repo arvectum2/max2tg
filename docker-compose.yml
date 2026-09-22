@@ -2,6 +2,7 @@ services:
   max2tg:
     build: .
     restart: unless-stopped
+    init: true
     env_file: .env
     environment:
       LOG_DIR: /app/logs
