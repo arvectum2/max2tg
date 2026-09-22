@@ -115,7 +115,7 @@ WebSocket: `wss://ws-api.oneme.ru/websocket`, `Origin: https://web.max.ru`.
 
 ## Деплой
 
-Docker. `docker-compose.yml` биндит `./logs:/app/logs` и `./state:/app/state`. Алёрт о подключении/обрыве идёт в General-топик.
+Docker-конфигурация в репозитории сохранена для переносимого deployment, но live Personal bridge на 2026-09-22 запущен напрямую на Mac mini через `.venv/bin/python -m app.main`. Алёрт о подключении/обрыве идёт в General-топик.
 
 ## Что осталось / known issues
 
@@ -127,21 +127,23 @@ Docker. `docker-compose.yml` биндит `./logs:/app/logs` и `./state:/app/st
 ## Если нужно ребутнуть знание о репо
 
 ```bash
-# Локально
-cd /d/DevTools/Database/max2tg
+# Канонический рабочий клон и live runtime — Mac mini
+cd /Volumes/ArvectumSSD/Arvectum/arvectum-max-bridge
 git status
+. .venv/bin/activate
 pytest -q
 
-# Прод (VPS Kyonix)
-ssh max2tg "cd /opt/max2tg && docker compose ps && docker compose logs --tail=50 max2tg"
-
-# Структура развёртывания
-# - Контейнер max2tg-max2tg-1, образ собран из ./Dockerfile (python:3.12-slim → alpine; работает несмотря на glibc→musl, потому что слои совместимы).
+# Personal bridge сейчас запускается напрямую, не через Docker/VPS:
+python -m app.main
+# Логи: logs/max2tg.log; state: state/topics.json
 ```
+
+На 2026-09-22 live Personal bridge работает на Mac mini из этого клона. Старое упоминание VPS Kyonix/alias `ssh max2tg` неактуально: такого SSH alias на Mac mini нет.
 
 ## Ссылки
 
-- Upstream: [Aist/max2tg](https://github.com/Aist/max2tg)
+- Canonical: [arvectum2/max2tg](https://github.com/arvectum2/max2tg)
+- Read-only upstream: [ircitdev/MAX2TG-Bridge](https://github.com/ircitdev/MAX2TG-Bridge)
 - Reference opcode-doc: [nsdkinx/vkmax](https://github.com/nsdkinx/vkmax) (особенно [docs/opcodes.md](https://github.com/nsdkinx/vkmax/blob/main/docs/opcodes.md))
 - Официальный бот-API MAX: [max-messenger/max-botapi-python](https://github.com/max-messenger/max-botapi-python) — там же `enums/text_style.py` с правильными именами стилей
 - Альтернативный мост: [mimimiartartart/MaxToTelegramBridge](https://github.com/mimimiartartart/MaxToTelegramBridge) (one-topic-per-всё, аналогичные паттерны)
