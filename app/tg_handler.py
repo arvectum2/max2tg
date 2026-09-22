@@ -6,6 +6,7 @@ from html import escape
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
 from telegram.constants import MessageEntityType
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -478,11 +479,49 @@ async def _cmd_bind(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     topic_store: TopicStore = context.bot_data[TOPIC_STORE_KEY]
     existing = topic_store.get_topic(max_chat_id)
     if existing is not None:
-        await message.reply_text(
-            f"Этот чат MAX уже привязан к топику (thread_id=<code>{existing}</code>).",
-            parse_mode="HTML",
-        )
-        return
+        # A forum topic can be deleted manually by a Telegram admin while our
+        # local mapping survives. Probe the stored thread and self-heal only
+        # when Telegram explicitly says the thread no longer exists.
+        stored_title = topic_store.get_title(max_chat_id) or str(max_chat_id)
+        try:
+            await context.bot.edit_forum_topic(
+                chat_id=int(context.bot_data[SUPERGROUP_KEY]),
+                message_thread_id=existing,
+                name=stored_title[:128],
+            )
+        except BadRequest as exc:
+            text = str(exc).lower()
+            if "message thread not found" in text or "message_thread_not_found" in text:
+                log.warning(
+                    "/bind: stale mapping for MAX chat %s → thread %s; recreating",
+                    max_chat_id, existing,
+                )
+                topic_store.remove(max_chat_id)
+                existing = None
+            else:
+                # "Topic not modified" and similar errors still prove that the
+                # topic exists, so keep the mapping.
+                await message.reply_text(
+                    f"Этот чат MAX уже привязан к топику "
+                    f"(thread_id=<code>{existing}</code>).",
+                    parse_mode="HTML",
+                )
+                return
+        except Exception:
+            log.exception("/bind: could not verify existing forum topic")
+            await message.reply_text(
+                f"Этот чат MAX уже привязан к топику "
+                f"(thread_id=<code>{existing}</code>).",
+                parse_mode="HTML",
+            )
+            return
+        else:
+            await message.reply_text(
+                f"Этот чат MAX уже привязан к топику "
+                f"(thread_id=<code>{existing}</code>).",
+                parse_mode="HTML",
+            )
+            return
 
     max_client: MaxClient = context.bot_data[MAX_CLIENT_KEY]
     resolver = getattr(max_client, "resolver", None)
@@ -681,8 +720,8 @@ HELP_TEXT = (
     "в текущем топике (полезно после смены аватара).\n"
     "• <code>/del</code> — удалить только Telegram-топик и локальную связь "
     "(в MAX останешься).\n"
-    "• <code>/leave</code> — выйти из группы/канала MAX и удалить его Telegram-топик "
-    "(спросит отдельное подтверждение).\n"
+    "• <code>/leave [chat_id]</code> — выйти из группы/канала MAX; "
+    "без аргумента работает внутри топика, с chat_id — даже из General.\n"
     "• <code>/help</code> — эта справка.\n\n"
     "Просто пиши в любом привязанном топике — сообщение уйдёт в "
     "соответствующий чат MAX. Поддерживается жирный/курсив/зачёркнутый/"
@@ -795,22 +834,44 @@ async def _on_del_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def _cmd_leave(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Ask for confirmation before leaving a MAX group/channel."""
+    """Ask for confirmation before leaving a MAX group/channel.
+
+    Usage:
+      /leave                  — inside a bound topic
+      /leave <chat_id-or-url> — anywhere in the bridge supergroup
+    """
     message = update.message
     if message is None or not _is_admin_user(update, context):
         return
 
-    target = _resolve_topic_target(update, context)
-    if not target:
-        await message.reply_text(
-            "Команда работает только внутри топика, связанного с группой/каналом MAX."
-        )
-        return
-
-    _, max_chat_id, max_client = target
+    max_client: MaxClient | None = context.bot_data.get(MAX_CLIENT_KEY)
     if not max_client:
         await message.reply_text("⚠️ Max клиент не подключён.")
         return
+
+    topic_store: TopicStore = context.bot_data[TOPIC_STORE_KEY]
+    args = context.args or []
+
+    if args:
+        max_chat_id = _parse_max_chat_id(args[0])
+        if max_chat_id is None:
+            await message.reply_text(
+                "Не понял chat_id. Пример: <code>/leave -75107924425434</code>",
+                parse_mode="HTML",
+            )
+            return
+        thread_id = topic_store.get_topic(max_chat_id) or 0
+    else:
+        target = _resolve_topic_target(update, context)
+        if not target:
+            await message.reply_text(
+                "Запусти <code>/leave</code> внутри топика или "
+                "<code>/leave &lt;chat_id&gt;</code> из General.",
+                parse_mode="HTML",
+            )
+            return
+        _, max_chat_id, _ = target
+        thread_id = message.message_thread_id or topic_store.get_topic(max_chat_id) or 0
 
     resolver = getattr(max_client, "resolver", None)
     if resolver is not None and resolver.is_dm(max_chat_id):
@@ -818,7 +879,6 @@ async def _cmd_leave(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     title = resolver.chat_name(max_chat_id) if resolver is not None else str(max_chat_id)
-    thread_id = message.message_thread_id
     kb = InlineKeyboardMarkup([
         [
             InlineKeyboardButton(
@@ -913,16 +973,20 @@ async def _on_leave_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         resolver.chats_raw.pop(max_chat_id, None)
 
     supergroup_id = context.bot_data[SUPERGROUP_KEY]
-    try:
-        await context.bot.delete_forum_topic(
-            chat_id=int(supergroup_id),
-            message_thread_id=thread_id,
-        )
-    except Exception:
-        log.exception("/leave: MAX left, but Telegram topic deletion failed")
+    if thread_id > 0:
+        try:
+            await context.bot.delete_forum_topic(
+                chat_id=int(supergroup_id),
+                message_thread_id=thread_id,
+            )
+        except BadRequest as exc:
+            if "message thread not found" not in str(exc).lower():
+                log.exception("/leave: MAX left, but Telegram topic deletion failed")
+        except Exception:
+            log.exception("/leave: MAX left, but Telegram topic deletion failed")
 
     log.info("/leave: left MAX chat=%s and removed topic thread=%s",
-             max_chat_id, thread_id)
+             max_chat_id, thread_id or None)
 
 
 async def _cmd_intro(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

@@ -48,6 +48,7 @@ def _make_update(text="Hello", thread_id=10, is_topic_message=True, user_id=100)
 
 def _make_context(max_client=None, topic_store=None, allowed_user_id=None, allowed_user_ids=None, admin_user_id=None):
     ctx = MagicMock()
+    ctx.args = []
     bot_data = {ALLOWED_USER_KEY: allowed_user_id, ALLOWED_USERS_KEY: frozenset(allowed_user_ids or []), ADMIN_USER_KEY: admin_user_id}
     if max_client is not None:
         bot_data[MAX_CLIENT_KEY] = max_client
@@ -244,6 +245,30 @@ class TestLeave:
 
         update.message.reply_text.assert_called_once()
         assert "Выйти из" in update.message.reply_text.call_args[0][0]
+
+    async def test_leave_by_chat_id_works_from_general(self):
+        max_client = MagicMock()
+        resolver = MagicMock()
+        resolver.is_dm.return_value = False
+        resolver.chat_name.return_value = "Test channel"
+        max_client.resolver = resolver
+
+        store = _make_topic_store({})
+        store.get_topic.return_value = None
+        update = _make_update(thread_id=None, is_topic_message=False, user_id=100)
+        ctx = _make_context(
+            max_client=max_client,
+            topic_store=store,
+            allowed_user_ids={100},
+            admin_user_id=100,
+        )
+        ctx.args = ["-123"]
+
+        await _cmd_leave(update, ctx)
+
+        update.message.reply_text.assert_called_once()
+        markup = update.message.reply_text.call_args.kwargs["reply_markup"]
+        assert markup.inline_keyboard[0][0].callback_data == "leave:ok:0:-123"
 
     async def test_confirmed_leave_calls_max_then_removes_topic(self):
         max_client = MagicMock()
