@@ -10,7 +10,7 @@ from telegram import BotCommand, Update
 
 from app.config import load_settings
 from app.max_listener import create_max_client
-from app.tg_handler import build_tg_app
+from app.tg_handler import build_tg_app, ensure_management_panel
 from app.tg_sender import TelegramSender
 from app.topics import TopicStore
 
@@ -100,6 +100,9 @@ async def main():
         await tg_app.updater.start_polling(
             drop_pending_updates=True,
             allowed_updates=Update.ALL_TYPES,
+        )
+        await ensure_management_panel(
+            tg_app.bot, settings.tg_chat_id, topic_store,
         )
         log.info("Telegram polling started (reply → Max enabled)")
     else:

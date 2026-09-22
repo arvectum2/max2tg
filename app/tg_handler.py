@@ -418,6 +418,7 @@ async def post_topic_intro(bot, supergroup_id, max_client: MaxClient,
                     photo=InputFile(io.BytesIO(data), filename="profile.jpg"),
                     caption=body, parse_mode="HTML",
                     message_thread_id=thread_id,
+                    reply_markup=_management_keyboard(max_chat_id, thread_id),
                 )
             except Exception:
                 log.exception("post_topic_intro: send_photo failed")
@@ -428,6 +429,7 @@ async def post_topic_intro(bot, supergroup_id, max_client: MaxClient,
             sent = await bot.send_message(
                 chat_id=int(supergroup_id), text=body, parse_mode="HTML",
                 message_thread_id=thread_id,
+                reply_markup=_management_keyboard(max_chat_id, thread_id),
             )
         except Exception:
             log.exception("post_topic_intro: send_message failed")
@@ -724,6 +726,62 @@ def _management_keyboard(max_chat_id, thread_id: int, *, include_back: bool = Fa
     if include_back:
         rows.append([InlineKeyboardButton("← К списку", callback_data="menu:list")])
     return InlineKeyboardMarkup(rows)
+
+
+def _general_management_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("⚙️ Управление MAX", callback_data="menu:list"),
+    ]])
+
+
+async def ensure_management_panel(bot, supergroup_id, topic_store: TopicStore) -> int | None:
+    """Ensure a visible, pinned management panel exists in General."""
+    chat_id = int(supergroup_id)
+    message_id = topic_store.get_ui("management_panel_message_id")
+    markup = _general_management_keyboard()
+
+    if message_id:
+        try:
+            await bot.edit_message_reply_markup(
+                chat_id=chat_id,
+                message_id=int(message_id),
+                reply_markup=markup,
+            )
+            return int(message_id)
+        except BadRequest as exc:
+            text = str(exc).lower()
+            if "message is not modified" in text:
+                return int(message_id)
+            log.info("Management panel needs recreation: %s", exc)
+        except Exception:
+            log.exception("Could not verify management panel")
+
+    try:
+        sent = await bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "<b>MAX ↔ Telegram</b>\n"
+                "Управление чатами и каналами — без команд и chat_id."
+            ),
+            parse_mode="HTML",
+            reply_markup=markup,
+        )
+    except Exception:
+        log.exception("Failed to create management panel")
+        return None
+
+    topic_store.set_ui("management_panel_message_id", sent.message_id)
+    try:
+        await bot.pin_chat_message(
+            chat_id=chat_id,
+            message_id=sent.message_id,
+            disable_notification=True,
+        )
+    except Exception:
+        log.exception("Could not pin management panel")
+
+    log.info("Management panel ready: message_id=%s", sent.message_id)
+    return sent.message_id
 
 
 async def _cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

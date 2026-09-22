@@ -46,6 +46,11 @@ class TestSetAndGet:
         assert store.tg_for_max_message(42, "max-1") == 501
         assert store.max_for_tg_message(42, 501) == "max-1"
 
+    def test_ui_state_round_trip(self, tmp_path):
+        store = TopicStore(_path(tmp_path))
+        store.set_ui("management_panel_message_id", 777)
+        assert store.get_ui("management_panel_message_id") == 777
+
 
 class TestPersistence:
     def test_mapping_survives_reload(self, tmp_path):
@@ -83,6 +88,14 @@ class TestPersistence:
         reloaded = TopicStore(path)
         assert reloaded.tg_for_max_message(42, "max-1") == 501
         assert reloaded.max_for_tg_message(42, 501) == "max-1"
+
+    def test_ui_state_survives_reload(self, tmp_path):
+        path = _path(tmp_path)
+        store = TopicStore(path)
+        store.set_ui("management_panel_message_id", 777)
+
+        reloaded = TopicStore(path)
+        assert reloaded.get_ui("management_panel_message_id") == 777
 
     def test_file_is_valid_json(self, tmp_path):
         path = _path(tmp_path)

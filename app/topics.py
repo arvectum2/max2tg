@@ -28,6 +28,7 @@ class TopicStore:
         self._by_topic: dict[int, Any] = {}  # topic_id → max_chat_id (original type)
         self._messages: dict[str, dict[str, int]] = {}  # chat_id → max_message_id → tg_message_id
         self._by_tg_message: dict[tuple[str, int], str] = {}
+        self._ui: dict[str, Any] = {}
         self._load()
 
     def _load(self) -> None:
@@ -38,6 +39,7 @@ class TopicStore:
                 data = json.load(f)
             self._chats = data.get("chats", {})
             self._messages = data.get("messages", {})
+            self._ui = data.get("ui", {})
             for key, rec in self._chats.items():
                 tid = rec.get("topic_id")
                 if tid is not None:
@@ -57,6 +59,7 @@ class TopicStore:
             self._by_topic = {}
             self._messages = {}
             self._by_tg_message = {}
+            self._ui = {}
 
     def _save(self) -> None:
         directory = os.path.dirname(self._path) or "."
@@ -65,7 +68,7 @@ class TopicStore:
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(
-                    {"chats": self._chats, "messages": self._messages},
+                    {"chats": self._chats, "messages": self._messages, "ui": self._ui},
                     f, ensure_ascii=False, indent=2,
                 )
             os.replace(tmp_path, self._path)
@@ -73,6 +76,16 @@ class TopicStore:
             log.exception("Failed to save topic store %s", self._path)
             if os.path.exists(tmp_path):
                 os.unlink(tmp_path)
+
+    def get_ui(self, key: str, default=None):
+        return self._ui.get(key, default)
+
+    def set_ui(self, key: str, value: Any) -> None:
+        if value is None:
+            self._ui.pop(key, None)
+        else:
+            self._ui[key] = value
+        self._save()
 
     def get_topic(self, max_chat_id: Any) -> int | None:
         rec = self._chats.get(str(max_chat_id))
