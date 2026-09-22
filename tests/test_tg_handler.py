@@ -2,6 +2,8 @@
 
 from unittest.mock import AsyncMock, MagicMock
 
+from telegram.error import BadRequest
+
 from app.tg_handler import (
     ADMIN_USER_KEY,
     ALLOWED_USER_KEY,
@@ -312,6 +314,8 @@ class TestLeave:
         max_client.leave_chat.assert_awaited_once_with(-123)
         store.remove.assert_called_once_with(-123)
         ctx.bot.delete_forum_topic.assert_not_awaited()
+        success_text = update.callback_query.edit_message_text.call_args.args[0]
+        assert "Вышли из" in success_text
 
     async def test_confirmed_leave_calls_max_then_removes_topic(self):
         max_client = MagicMock()
@@ -411,6 +415,42 @@ class TestMenu:
         assert any("Канал" in label for label in labels)
         assert any("Группа" in label for label in labels)
         assert any("Личный" in label for label in labels)
+        callbacks = [
+            button.callback_data for row in markup.inline_keyboard for button in row
+        ]
+        assert "menu:search" in callbacks
+
+    async def test_refresh_ignores_telegram_not_modified(self):
+        max_client = MagicMock()
+        resolver = MagicMock()
+        resolver.chats = {-123: "Канал"}
+        resolver.chat_types = {-123: "CHANNEL"}
+        resolver.chats_raw = {-123: {"status": "ACTIVE"}}
+        resolver.chat_name.return_value = "Канал"
+        resolver.is_dm.return_value = False
+        max_client.resolver = resolver
+        store = _make_topic_store({})
+
+        update = MagicMock()
+        update.callback_query = MagicMock()
+        update.callback_query.data = "menu:list:0"
+        update.callback_query.answer = AsyncMock()
+        update.callback_query.edit_message_text = AsyncMock(
+            side_effect=BadRequest("Message is not modified")
+        )
+        update.effective_user = MagicMock()
+        update.effective_user.id = 100
+
+        ctx = _make_context(
+            max_client=max_client,
+            topic_store=store,
+            allowed_user_ids={100},
+            admin_user_id=100,
+        )
+
+        await _on_menu_callback(update, ctx)
+
+        update.callback_query.edit_message_text.assert_awaited_once()
 
     async def test_dm_card_has_create_topic_but_no_leave(self):
         max_client = MagicMock()

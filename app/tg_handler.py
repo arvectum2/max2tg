@@ -764,7 +764,10 @@ def _menu_list_markup(resolver, topic_store: TopicStore, page: int = 0):
         if page + 1 < page_count:
             nav.append(InlineKeyboardButton("→", callback_data=f"menu:list:{page + 1}"))
         rows.append(nav)
-    rows.append([InlineKeyboardButton("🔄 Обновить", callback_data=f"menu:list:{page}")])
+    rows.append([
+        InlineKeyboardButton("🔎 Поиск в MAX", callback_data="menu:search"),
+        InlineKeyboardButton("🔄 Обновить", callback_data=f"menu:list:{page}"),
+    ])
     return InlineKeyboardMarkup(rows), page, page_count, len(entries)
 
 
@@ -1333,7 +1336,7 @@ async def _on_search_callback(update: Update,
               if created else "✅ Этот Telegram-топик уже подключён.")
     await query.edit_message_text(
         f"{prefix}\n\n<b>{escape(title)}</b>\n"
-        f"Теперь MAX-чат связан с Telegram thread <code>{thread_id}</code>.",
+        "Теперь переписка доступна через созданный Telegram-топик.",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("← К результатам", callback_data="search:results"),
@@ -1425,12 +1428,16 @@ async def _on_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         if total == 0:
             await query.edit_message_text("Не вижу активных чатов MAX.")
             return
-        await query.edit_message_text(
-            f"<b>MAX-чаты</b> · {total}\n"
-            f"Страница {page + 1}/{page_count}. ✅ — Telegram-топик уже создан.",
-            parse_mode="HTML",
-            reply_markup=markup,
-        )
+        try:
+            await query.edit_message_text(
+                f"<b>MAX-чаты</b> · {total}\n"
+                f"Страница {page + 1}/{page_count}. ✅ — Telegram-топик уже создан.",
+                parse_mode="HTML",
+                reply_markup=markup,
+            )
+        except BadRequest as exc:
+            if "message is not modified" not in str(exc).lower():
+                raise
         return
 
     parts = query.data.split(":")
@@ -1791,9 +1798,10 @@ async def _on_leave_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     topic_store: TopicStore = context.bot_data[TOPIC_STORE_KEY]
+    resolver = getattr(max_client, "resolver", None)
+    title = resolver.chat_name(max_chat_id) if resolver is not None else str(max_chat_id)
     topic_store.remove(max_chat_id)
 
-    resolver = getattr(max_client, "resolver", None)
     if resolver is not None:
         resolver.chats.pop(max_chat_id, None)
         resolver.chat_types.pop(max_chat_id, None)
@@ -1814,6 +1822,18 @@ async def _on_leave_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     log.info("/leave: left MAX chat=%s and removed topic thread=%s",
              max_chat_id, thread_id or None)
+    try:
+        await query.edit_message_text(
+            f"✅ Вышли из <b>{escape(str(title))}</b> в MAX.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("💬 Мои чаты", callback_data="menu:list:0"),
+            ]]),
+        )
+    except Exception:
+        # If the confirmation lived inside the deleted topic, there is
+        # nothing left to edit. General-menu callbacks remain visible.
+        pass
 
 
 async def _cmd_intro(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

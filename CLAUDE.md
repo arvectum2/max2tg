@@ -20,7 +20,7 @@ app/
   tg_sender.py     # TelegramSender + ensure_topic (create/rename)
   tg_handler.py    # TG → MAX + Personal UX: menu/search/bind/add/profile/intro/del/leave/help
   topics.py        # TopicStore: JSON-карта max_chat_id ↔ thread_id
-tests/             # 221 pytest, asyncio_mode=auto
+tests/             # 222 pytest, asyncio_mode=auto
 docs/cover.jpg     # обложка README
 state/             # runtime (топик-карта), gitignored
 logs/              # логи, gitignored
