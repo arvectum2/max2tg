@@ -68,6 +68,7 @@ class OpCode(IntEnum):
     CONTACT_GET = 32
     CONTACT_PRESENCE = 35
     CHAT_GET = 48
+    CHAT_HISTORY = 49
     CHAT_OPEN_LINK = 57
     CHAT_LEAVE = 58
     GLOBAL_SEARCH = 60
@@ -372,6 +373,35 @@ class MaxClient:
         ok = bool(resp) and "_max_error" not in resp
         log.info("send_message(chat=%s, attaches=%d) → %s",
                  chat_id, len(attaches), "OK" if ok else "FAIL")
+        return resp
+
+    async def fetch_history(self, chat_id, count: int = 20,
+                            from_time: int | None = None) -> dict | None:
+        """Fetch the newest MAX history window via opcode 49.
+
+        ``from_time`` is a millisecond timestamp marker. Current time returns
+        the newest messages; the Personal UX limits one import to 100.
+        """
+        count = max(1, min(int(count), 100))
+        if from_time is None:
+            from_time = int(time.time() * 1000)
+        resp = await self.cmd(
+            OpCode.CHAT_HISTORY,
+            {
+                "chatId": chat_id,
+                "from": int(from_time),
+                "forward": 0,
+                "backward": count,
+                "getMessages": True,
+            },
+            none_on_timeout=True,
+        )
+        log.info(
+            "fetch_history(chat=%s, count=%s) → %s messages",
+            chat_id,
+            count,
+            len((resp or {}).get("messages") or []) if isinstance(resp, dict) else 0,
+        )
         return resp
 
     async def search_global(self, query: str, count: int = 20) -> dict | None:

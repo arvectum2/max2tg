@@ -336,6 +336,131 @@ def _remember_message(sender: TelegramSender, msg: MaxMessage, tg_message) -> No
         sender.topic_store.set_message(msg.chat_id, msg.message_id, tg_message_id)
 
 
+def _history_time_label(timestamp) -> str:
+    try:
+        value = float(timestamp)
+        if value > 10_000_000_000:
+            value /= 1000
+        return datetime.fromtimestamp(value).strftime("%d.%m.%Y %H:%M")
+    except (TypeError, ValueError, OSError, OverflowError):
+        return ""
+
+
+async def import_recent_history(
+    client: MaxClient,
+    sender: TelegramSender,
+    resolver: ContactResolver,
+    chat_id,
+    thread_id: int,
+    count: int,
+) -> int:
+    """Import the newest MAX messages into an already-created TG topic."""
+    try:
+        count = max(0, min(int(count), 100))
+    except (TypeError, ValueError):
+        count = 20
+    if count == 0:
+        return 0
+
+    try:
+        response = await client.fetch_history(chat_id, count=count)
+    except Exception:
+        log.exception("History fetch failed for chat=%s", chat_id)
+        return 0
+    if not isinstance(response, dict) or response.get("_max_error"):
+        log.warning("History fetch failed for chat=%s: %s", chat_id, response)
+        return 0
+
+    raw_messages = [m for m in (response.get("messages") or []) if isinstance(m, dict)]
+    raw_messages.sort(key=lambda item: item.get("time") or 0)
+    imported = 0
+
+    for body in raw_messages:
+        msg = client._parse_message({"chatId": chat_id, "message": body})
+        if msg is None or not msg.message_id:
+            continue
+        if sender.topic_store.tg_for_max_message(chat_id, msg.message_id) is not None:
+            continue
+
+        raw_sender = ""
+        if msg.is_self:
+            raw_sender = "Вы"
+        elif msg.sender_id is not None:
+            raw_sender = await resolver.resolve_user(msg.sender_id)
+        is_dm = resolver.is_dm(chat_id)
+        raw_chat = resolver.chat_name(chat_id)
+        header_text = _header(msg, escape(raw_sender), escape(raw_chat), is_dm)
+        time_label = _history_time_label(msg.timestamp)
+        if time_label:
+            header_text = f"🕘 <i>{escape(time_label)}</i>\n{header_text}"
+
+        link = msg.link
+        link_type = link.get("type") if isinstance(link, dict) else None
+        if link_type == "REPLY":
+            inner = link.get("message") or {}
+            replied_max_id = inner.get("id") or link.get("messageId")
+            replied_tg_id = None
+            if replied_max_id:
+                replied_tg_id = sender.topic_store.tg_for_max_message(
+                    chat_id, replied_max_id,
+                )
+            if replied_tg_id is not None:
+                sent = await _send_message_content(
+                    msg, header_text, client, sender, thread_id,
+                    reply_to_message_id=replied_tg_id,
+                )
+                _remember_message(sender, msg, sent)
+                imported += 1
+                continue
+
+            source_sender_id = inner.get("sender")
+            source_label = ""
+            if source_sender_id is not None:
+                if client._my_id and int(source_sender_id) == int(client._my_id):
+                    source_label = "Вы"
+                else:
+                    source_label = escape(await resolver.resolve_user(source_sender_id))
+            reply_header = f"{header_text}\n↩ <b>Ответ"
+            if source_label:
+                reply_header += f" на {source_label}"
+            reply_header += "</b>"
+            quoted = inner.get("text") or ""
+            if quoted:
+                reply_header += f"\n<blockquote>{escape(quoted[:700])}</blockquote>"
+            elif inner.get("attaches"):
+                reply_header += "\n<blockquote>[вложение]</blockquote>"
+            sent = await _send_message_content(
+                msg, reply_header, client, sender, thread_id,
+            )
+            _remember_message(sender, msg, sent)
+            imported += 1
+            continue
+
+        if link_type == "FORWARD":
+            await _handle_linked_message(
+                link, link_type, header_text, client, sender, resolver,
+                thread_id=thread_id, msg=msg,
+            )
+            sent = None
+            if msg.text:
+                sent = await sender.send(
+                    f"{header_text}\n{escape(msg.text)}",
+                    message_thread_id=thread_id,
+                )
+            _remember_message(sender, msg, sent)
+            imported += 1
+            continue
+
+        sent = await _send_message_content(
+            msg, header_text, client, sender, thread_id,
+        )
+        _remember_message(sender, msg, sent)
+        imported += 1
+
+    log.info("Imported %d/%d history messages for chat=%s", imported, count, chat_id)
+    return imported
+
+
 def _human_size(n: int) -> str:
     for unit in ("Б", "КБ", "МБ", "ГБ"):
         if n < 1024:
@@ -350,8 +475,9 @@ def create_max_client(
 ) -> MaxClient:
     client = MaxClient(token=max_token, device_id=max_device_id, debug=debug, chat_ids=max_chat_ids)
     resolver = ContactResolver(client=client)
-    # Expose for tg_handler commands like /profile.
+    # Expose runtime helpers for Telegram-side management actions.
     client.resolver = resolver
+    client._tg_sender = sender
 
     _first_connect = True
     _notif_count = 0
@@ -436,13 +562,25 @@ def create_max_client(
         existing_thread = sender.topic_store.get_topic(msg.chat_id)
         thread_id = await sender.ensure_topic(msg.chat_id, topic_title)
 
-        # First time we touch this chat → publish a pinned profile card so the
-        # topic starts with context (avatar, name, etc.).
+        # First time we touch this chat → publish context first, then import
+        # the configured recent history before the live message. This keeps a
+        # newly-created Telegram topic chronological.
         if existing_thread is None and thread_id is not None:
             from app.tg_handler import post_topic_intro
-            asyncio.create_task(post_topic_intro(
+            await post_topic_intro(
                 sender.bot, sender.chat_id, client, msg.chat_id, thread_id,
-            ))
+            )
+            history_limit = sender.topic_store.get_ui("history_import_limit", 20)
+            await import_recent_history(
+                client, sender, resolver, msg.chat_id, thread_id, history_limit,
+            )
+            if (
+                msg.message_id
+                and sender.topic_store.tg_for_max_message(msg.chat_id, msg.message_id)
+                is not None
+            ):
+                log.info("Live message already imported with initial history; skipping duplicate")
+                return
 
         sender_label = escape(raw_sender)
         chat_label = escape(raw_chat)

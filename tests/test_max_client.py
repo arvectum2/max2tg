@@ -50,6 +50,9 @@ class TestOpCode:
     def test_chat_leave(self):
         assert OpCode.CHAT_LEAVE == 58
 
+    def test_chat_history(self):
+        assert OpCode.CHAT_HISTORY == 49
+
     def test_global_search(self):
         assert OpCode.GLOBAL_SEARCH == 60
 
@@ -287,6 +290,34 @@ class TestMaxClientInit:
 
         result = c.on_disconnect(my_handler)
         assert result is my_handler
+
+    async def test_fetch_history_uses_opcode_49_payload(self):
+        c = MaxClient(token="tok", device_id="dev")
+        c.cmd = AsyncMock(return_value={"messages": []})
+
+        resp = await c.fetch_history(-123, count=20, from_time=1700000000000)
+
+        assert resp == {"messages": []}
+        c.cmd.assert_awaited_once_with(
+            OpCode.CHAT_HISTORY,
+            {
+                "chatId": -123,
+                "from": 1700000000000,
+                "forward": 0,
+                "backward": 20,
+                "getMessages": True,
+            },
+            none_on_timeout=True,
+        )
+
+    async def test_fetch_history_clamps_to_100(self):
+        c = MaxClient(token="tok", device_id="dev")
+        c.cmd = AsyncMock(return_value={"messages": []})
+
+        await c.fetch_history(-123, count=999, from_time=1700000000000)
+
+        payload = c.cmd.await_args.args[1]
+        assert payload["backward"] == 100
 
     async def test_leave_chat_accepts_empty_success_payload(self):
         c = MaxClient(token="tok", device_id="dev")

@@ -15,11 +15,14 @@ from app.tg_handler import (
     _cmd_leave,
     _cmd_menu,
     _cmd_search,
+    _history_import_limit,
     _normalize_global_search_results,
     _on_quick_menu_button,
+    _on_history_setting_input,
     _on_del_callback,
     _on_leave_callback,
     _on_menu_callback,
+    _on_settings_callback,
     _on_search_callback,
     _on_search_input,
     _on_topic_message,
@@ -433,6 +436,79 @@ class TestDeleteTopic:
             for button in row
         ]
         assert "del:ok:10:-123" in callbacks
+
+
+# ---------------------------------------------------------------------------
+# history import settings
+# ---------------------------------------------------------------------------
+
+class TestHistorySettings:
+    def test_default_is_20_and_value_is_clamped(self):
+        store = MagicMock()
+        store.get_ui.return_value = None
+        assert _history_import_limit(store) == 20
+        store.get_ui.return_value = 150
+        assert _history_import_limit(store) == 100
+        store.get_ui.return_value = -5
+        assert _history_import_limit(store) == 0
+
+    async def test_settings_open_shows_current_value(self):
+        store = MagicMock()
+        store.get_ui.return_value = 35
+        update = MagicMock()
+        update.callback_query = MagicMock()
+        update.callback_query.data = "settings:open"
+        update.callback_query.answer = AsyncMock()
+        update.callback_query.edit_message_text = AsyncMock()
+        update.effective_user = MagicMock()
+        update.effective_user.id = 100
+        ctx = _make_context(
+            topic_store=store,
+            allowed_user_ids={100},
+            admin_user_id=100,
+        )
+
+        await _on_settings_callback(update, ctx)
+
+        text = update.callback_query.edit_message_text.await_args.args[0]
+        assert "35" in text
+        assert "0" in text and "100" in text
+
+    async def test_valid_history_limit_is_saved(self):
+        store = _make_topic_store({})
+        update = _make_update(text="42", thread_id=None,
+                              is_topic_message=False, user_id=100)
+        update.message.delete = AsyncMock()
+        ctx = _make_context(
+            topic_store=store,
+            allowed_user_ids={100},
+            admin_user_id=100,
+        )
+        ctx.user_data["awaiting_history_limit"] = True
+
+        await _on_history_setting_input(update, ctx)
+
+        store.set_ui.assert_called_once_with("history_import_limit", 42)
+        assert ctx.user_data["awaiting_history_limit"] is False
+        assert "42" in update.message.reply_text.await_args.args[0]
+        update.message.delete.assert_awaited_once()
+
+    async def test_invalid_history_limit_is_rejected(self):
+        store = _make_topic_store({})
+        update = _make_update(text="101", thread_id=None,
+                              is_topic_message=False, user_id=100)
+        ctx = _make_context(
+            topic_store=store,
+            allowed_user_ids={100},
+            admin_user_id=100,
+        )
+        ctx.user_data["awaiting_history_limit"] = True
+
+        await _on_history_setting_input(update, ctx)
+
+        store.set_ui.assert_not_called()
+        assert ctx.user_data["awaiting_history_limit"] is True
+        assert "0 до 100" in update.message.reply_text.await_args.args[0]
 
 
 # ---------------------------------------------------------------------------

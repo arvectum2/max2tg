@@ -17,6 +17,7 @@ from telegram.ext import (
 )
 
 from app.max_client import MaxClient
+from app.tg_sender import TelegramSender
 from app.topics import TopicStore
 
 log = logging.getLogger(__name__)
@@ -37,6 +38,9 @@ _SEARCH_RESULTS_KEY = "max_search_results"
 _SEARCH_QUERY_KEY = "max_search_query"
 _QUICK_MENU_TEXT = "☰ Меню"
 _QUICK_MENU_MESSAGE_KEY = "quick_menu_message_id"
+_HISTORY_LIMIT_UI_KEY = "history_import_limit"
+_HISTORY_LIMIT_DEFAULT = 20
+_HISTORY_SETTING_WAITING_KEY = "awaiting_history_limit"
 
 # Telegram entity type → MAX element type. The MAX names match what the
 # existing codebase used (STRONG) and what MAX renders for the formatting
@@ -454,6 +458,33 @@ async def post_topic_intro(bot, supergroup_id, max_client: MaxClient,
             log.exception("post_topic_intro: pin_chat_message failed")
 
 
+async def _bootstrap_new_topic(context: ContextTypes.DEFAULT_TYPE,
+                               max_client: MaxClient,
+                               topic_store: TopicStore,
+                               max_chat_id,
+                               thread_id: int) -> int:
+    """Post topic info, then import the configured recent MAX history."""
+    supergroup_id = context.bot_data[SUPERGROUP_KEY]
+    await post_topic_intro(
+        context.bot, supergroup_id, max_client, max_chat_id, thread_id,
+    )
+
+    history_limit = _history_import_limit(topic_store)
+    if history_limit == 0:
+        return 0
+
+    sender = getattr(max_client, "_tg_sender", None)
+    resolver = getattr(max_client, "resolver", None)
+    if not isinstance(sender, TelegramSender) or resolver is None:
+        log.warning("History import skipped: runtime TelegramSender/resolver unavailable")
+        return 0
+
+    from app.max_listener import import_recent_history
+    return await import_recent_history(
+        max_client, sender, resolver, max_chat_id, thread_id, history_limit,
+    )
+
+
 async def _cmd_bind(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Create a forum topic bound to a specific Max chat id.
 
@@ -562,11 +593,8 @@ async def _cmd_bind(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"(thread_id=<code>{thread_id}</code>). Пиши в новом топике — улетит в MAX.",
         parse_mode="HTML",
     )
-    # Post & pin a profile card in the freshly-created topic.
-    supergroup_id = context.bot_data[SUPERGROUP_KEY]
-    asyncio.create_task(
-        post_topic_intro(context.bot, supergroup_id, max_client,
-                          max_chat_id, thread_id)
+    await _bootstrap_new_topic(
+        context, max_client, topic_store, max_chat_id, thread_id,
     )
 
 
@@ -711,9 +739,8 @@ async def _cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"(thread_id=<code>{thread_id}</code>).",
         parse_mode="HTML",
     )
-    asyncio.create_task(
-        post_topic_intro(context.bot, supergroup_id, max_client,
-                          chat_id, thread_id)
+    await _bootstrap_new_topic(
+        context, max_client, topic_store, chat_id, thread_id,
     )
 
 
@@ -769,6 +796,9 @@ def _menu_list_markup(resolver, topic_store: TopicStore, page: int = 0):
     rows.append([
         InlineKeyboardButton("🔎 Поиск в MAX", callback_data="menu:search"),
         InlineKeyboardButton("🔄 Обновить", callback_data=f"menu:list:{page}"),
+    ])
+    rows.append([
+        InlineKeyboardButton("⚙️ Настройки", callback_data="settings:open"),
     ])
     return InlineKeyboardMarkup(rows), page, page_count, len(entries)
 
@@ -932,10 +962,27 @@ def _management_keyboard(max_chat_id, thread_id: int, *, is_dm: bool = False,
     return InlineKeyboardMarkup(rows)
 
 
+def _history_import_limit(topic_store: TopicStore) -> int:
+    raw = topic_store.get_ui(_HISTORY_LIMIT_UI_KEY, _HISTORY_LIMIT_DEFAULT)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = _HISTORY_LIMIT_DEFAULT
+    return max(0, min(value, 100))
+
+
+def _settings_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✏️ Изменить историю", callback_data="settings:history:edit")],
+        [InlineKeyboardButton("← Назад", callback_data="menu:list:0")],
+    ])
+
+
 def _general_management_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("💬 Мои чаты", callback_data="menu:list:0")],
         [InlineKeyboardButton("🔎 Поиск в MAX", callback_data="menu:search")],
+        [InlineKeyboardButton("⚙️ Настройки", callback_data="settings:open")],
     ])
 
 
@@ -1077,6 +1124,7 @@ async def _cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     context.user_data[_SEARCH_WAITING_KEY] = False
+    context.user_data[_HISTORY_SETTING_WAITING_KEY] = False
     topic_store: TopicStore = context.bot_data[TOPIC_STORE_KEY]
     max_client: MaxClient | None = context.bot_data.get(MAX_CLIENT_KEY)
     if max_client is None:
@@ -1132,6 +1180,94 @@ async def _on_quick_menu_button(update: Update, context: ContextTypes.DEFAULT_TY
         await message.delete()
     except Exception:
         log.debug("Could not delete quick-menu trigger message", exc_info=True)
+
+
+def _settings_text(topic_store: TopicStore) -> str:
+    limit = _history_import_limit(topic_store)
+    status = "выключена" if limit == 0 else f"последние <b>{limit}</b> сообщений"
+    return (
+        "<b>⚙️ Настройки</b>\n\n"
+        f"История при создании нового топика: {status}.\n\n"
+        "Можно установить любое целое число от <b>0</b> до <b>100</b>. "
+        "0 — не загружать старые сообщения."
+    )
+
+
+async def _on_settings_callback(update: Update,
+                                context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None or not query.data:
+        return
+    await _answer_callback_safely(query)
+    if not _is_admin_user(update, context):
+        return
+
+    topic_store: TopicStore = context.bot_data[TOPIC_STORE_KEY]
+    context.user_data[_SEARCH_WAITING_KEY] = False
+
+    if query.data == "settings:open":
+        context.user_data[_HISTORY_SETTING_WAITING_KEY] = False
+        await query.edit_message_text(
+            _settings_text(topic_store),
+            parse_mode="HTML",
+            reply_markup=_settings_keyboard(),
+        )
+        return
+
+    if query.data == "settings:history:edit":
+        context.user_data[_HISTORY_SETTING_WAITING_KEY] = True
+        current = _history_import_limit(topic_store)
+        await query.edit_message_text(
+            "<b>История новых топиков</b>\n\n"
+            f"Сейчас: <b>{current}</b>. Напиши в General новое число "
+            "от <b>0</b> до <b>100</b>.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("Отмена", callback_data="settings:open"),
+            ]]),
+        )
+
+
+async def _on_history_setting_input(update: Update,
+                                    context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    if message is None or not _is_admin_user(update, context):
+        return
+    if not context.user_data.get(_HISTORY_SETTING_WAITING_KEY):
+        return
+
+    topic_store: TopicStore = context.bot_data[TOPIC_STORE_KEY]
+    if (
+        message.is_topic_message
+        and message.message_thread_id is not None
+        and topic_store.chat_for_topic(message.message_thread_id) is not None
+    ):
+        return
+
+    raw = (message.text or "").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        value = -1
+    if not 0 <= value <= 100:
+        await message.reply_text(
+            "Нужно целое число от 0 до 100.",
+            do_quote=False,
+        )
+        return
+
+    topic_store.set_ui(_HISTORY_LIMIT_UI_KEY, value)
+    context.user_data[_HISTORY_SETTING_WAITING_KEY] = False
+    status = "История отключена." if value == 0 else f"Буду загружать последние {value} сообщений."
+    await message.reply_text(
+        f"✅ {status}",
+        reply_markup=_settings_keyboard(),
+        do_quote=False,
+    )
+    try:
+        await message.delete()
+    except Exception:
+        log.debug("Could not delete history-setting input", exc_info=True)
 
 
 def _search_prompt_markup() -> InlineKeyboardMarkup:
@@ -1210,6 +1346,7 @@ async def _cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if message is None or not _is_admin_user(update, context):
         return
     query_text = " ".join(context.args or []).strip()
+    context.user_data[_HISTORY_SETTING_WAITING_KEY] = False
     if not query_text:
         context.user_data[_SEARCH_WAITING_KEY] = True
         await message.reply_text(
@@ -1472,9 +1609,9 @@ async def _create_topic_from_menu(context: ContextTypes.DEFAULT_TYPE,
     )
     thread_id = topic.message_thread_id
     topic_store.set_topic(max_chat_id, thread_id, title)
-    asyncio.create_task(post_topic_intro(
-        context.bot, supergroup_id, max_client, max_chat_id, thread_id,
-    ))
+    await _bootstrap_new_topic(
+        context, max_client, topic_store, max_chat_id, thread_id,
+    )
     return thread_id, title, True
 
 
@@ -1494,6 +1631,7 @@ async def _on_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     if query.data == "menu:search":
+        context.user_data[_HISTORY_SETTING_WAITING_KEY] = False
         context.user_data[_SEARCH_WAITING_KEY] = True
         await query.edit_message_text(
             "<b>Поиск в MAX</b>\n"
@@ -2147,6 +2285,7 @@ def build_tg_app(token: str, max_client: MaxClient, supergroup_id: str,
     app.add_handler(CommandHandler("leave", _cmd_leave, filters=chat_filter))
     app.add_handler(CommandHandler("help", _cmd_help, filters=chat_filter))
     app.add_handler(CallbackQueryHandler(_on_menu_callback, pattern=r"^menu:"))
+    app.add_handler(CallbackQueryHandler(_on_settings_callback, pattern=r"^settings:"))
     app.add_handler(CallbackQueryHandler(_on_search_callback, pattern=r"^search:"))
     app.add_handler(CallbackQueryHandler(_on_del_callback, pattern=r"^del:"))
     app.add_handler(CallbackQueryHandler(_on_leave_callback, pattern=r"^leave:"))
@@ -2156,8 +2295,14 @@ def build_tg_app(token: str, max_client: MaxClient, supergroup_id: str,
         MessageHandler(quick_menu_filter & chat_filter, _on_quick_menu_button),
         group=-1,
     )
-    # Search capture runs in a separate earlier handler group so ordinary
-    # topic messages still continue to the MAX forwarding handler in group 0.
+    # Settings and search capture run before ordinary topic forwarding.
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND & ~quick_menu_filter & chat_filter,
+            _on_history_setting_input,
+        ),
+        group=-2,
+    )
     app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND & ~quick_menu_filter & chat_filter,
