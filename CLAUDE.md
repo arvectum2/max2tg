@@ -119,7 +119,7 @@ WebSocket: `wss://ws-api.oneme.ru/websocket`, `Origin: https://web.max.ru`.
 
 ## Деплой
 
-Docker-конфигурация в репозитории сохранена для переносимого deployment, но live Personal bridge на 2026-09-22 запущен напрямую на Mac mini через `.venv/bin/python -m app.main`. Алёрт о подключении/обрыве идёт в General-топик.
+Docker-конфигурация в репозитории сохранена для переносимого deployment, но live Personal bridge на Mac mini работает через `launchd`: `com.arvectum.max2tg` (`RunAtLoad + KeepAlive`) запускает `scripts/max2tg-launch.sh`, который ждёт внешний SSD и локальный Telegram-прокси. `com.arvectum.max2tg-session-watch` каждые 30 секунд запускает `scripts/max2tg-session-watch.js`: он находит выделенный Chrome-профиль по имени `MAX`, локально читает `__oneme_auth`, не логирует секрет, атомарно обновляет `MAX_TOKEN` при ротации и делает `launchctl kickstart -k` основного bridge. Node должен иметь Full Disk Access. Полный logout всё равно требует ручного SMS-входа; после повторного входа watcher восстанавливает bridge автоматически.
 
 ## Что осталось / known issues
 

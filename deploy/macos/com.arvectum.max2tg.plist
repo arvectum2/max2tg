@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.arvectum.max2tg</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/master/bin/max2tg-launch.sh</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>/Users/master/Library/Logs/Arvectum/max2tg.launchd.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/master/Library/Logs/Arvectum/max2tg.launchd.error.log</string>
+</dict>
+</plist>
