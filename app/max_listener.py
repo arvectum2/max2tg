@@ -11,6 +11,9 @@ log = logging.getLogger(__name__)
 
 PHOTO_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
+_ACTIVE_CHAT_TYPES = {"DIALOG", "CHAT", "CHANNEL"}
+_KNOWN_MAX_CHATS_UI_KEY = "known_max_chat_ids"
+_MAX_SERVICE_PEER_IDS = {543835}
 
 
 def _header(msg: MaxMessage, sender_label: str, chat_label: str, is_dm: bool) -> str:
@@ -469,6 +472,123 @@ def _human_size(n: int) -> str:
     return f"{n:.1f} ТБ"
 
 
+def _peer_id_for_dialog(resolver: ContactResolver, chat_id):
+    chat = resolver.chats_raw.get(chat_id) or {}
+    participants = chat.get("participants") or {}
+    for raw_id in participants:
+        try:
+            uid = int(raw_id)
+        except (TypeError, ValueError):
+            continue
+        if resolver.my_id is None or uid != int(resolver.my_id):
+            return uid
+    return None
+
+
+def _is_max_service_dialog(resolver: ContactResolver, chat_id) -> bool:
+    if not resolver.is_dm(chat_id):
+        return False
+    peer_id = _peer_id_for_dialog(resolver, chat_id)
+    if peer_id in _MAX_SERVICE_PEER_IDS:
+        return True
+    if peer_id is None:
+        return False
+    return resolver.user_name(peer_id).strip().upper() == "MAX"
+
+
+async def _topic_title_for_chat(resolver: ContactResolver, chat_id) -> str:
+    if resolver.is_dm(chat_id):
+        peer_id = _peer_id_for_dialog(resolver, chat_id)
+        if peer_id is not None:
+            title = await resolver.resolve_user(peer_id)
+            if title and title != str(peer_id):
+                return title
+    title = resolver.chat_name(chat_id)
+    return str(title or chat_id)
+
+
+def _remember_known_chat(sender: TelegramSender, chat_id) -> None:
+    raw = sender.topic_store.get_ui(_KNOWN_MAX_CHATS_UI_KEY, []) or []
+    known = {str(value) for value in raw}
+    key = str(chat_id)
+    if key in known:
+        return
+    known.add(key)
+    sender.topic_store.set_ui(_KNOWN_MAX_CHATS_UI_KEY, sorted(known))
+
+
+async def _refresh_chat_metadata(client: MaxClient, resolver: ContactResolver,
+                                 chat_id) -> None:
+    if chat_id in resolver.chats_raw:
+        return
+    response = await client.fetch_chats([chat_id])
+    chats = (response or {}).get("chats") or [] if isinstance(response, dict) else []
+    participant_ids = resolver.upsert_chats(chats)
+    if participant_ids:
+        await resolver.resolve_users_batch(participant_ids)
+
+
+async def _bootstrap_chat_topic(client: MaxClient, sender: TelegramSender,
+                                resolver: ContactResolver, chat_id) -> int | None:
+    """Create one missing Telegram topic and import its configured history."""
+    if sender.topic_store.get_topic(chat_id) is not None:
+        _remember_known_chat(sender, chat_id)
+        return sender.topic_store.get_topic(chat_id)
+    if _is_max_service_dialog(resolver, chat_id):
+        _remember_known_chat(sender, chat_id)
+        log.info("Skipping automatic topic for MAX service dialog chat=%s", chat_id)
+        return None
+
+    title = await _topic_title_for_chat(resolver, chat_id)
+    thread_id = await sender.ensure_topic(chat_id, title)
+    if thread_id is None:
+        return None
+
+    from app.tg_handler import post_topic_intro
+    await post_topic_intro(
+        sender.bot, sender.chat_id, client, chat_id, thread_id,
+    )
+    history_limit = sender.topic_store.get_ui("history_import_limit", 20)
+    await import_recent_history(
+        client, sender, resolver, chat_id, thread_id, history_limit,
+    )
+    _remember_known_chat(sender, chat_id)
+    return thread_id
+
+
+async def _reconcile_snapshot_chats(client: MaxClient, sender: TelegramSender,
+                                    resolver: ContactResolver) -> int:
+    """Create topics for active MAX chats first seen since the previous snapshot."""
+    current = {
+        str(chat_id): chat_id
+        for chat_id, raw in resolver.chats_raw.items()
+        if resolver.chat_types.get(chat_id) in _ACTIVE_CHAT_TYPES
+        and (raw or {}).get("status") not in ("LEFT", "CLOSED")
+    }
+    raw_known = sender.topic_store.get_ui(_KNOWN_MAX_CHATS_UI_KEY)
+    if raw_known is None:
+        sender.topic_store.set_ui(_KNOWN_MAX_CHATS_UI_KEY, sorted(current))
+        log.info("MAX chat reconciliation baseline initialized: %d chats", len(current))
+        return 0
+
+    known = {str(value) for value in (raw_known or [])}
+    new_ids = [current[key] for key in sorted(set(current) - known)]
+    created = 0
+    for chat_id in new_ids:
+        if await _bootstrap_chat_topic(client, sender, resolver, chat_id) is not None:
+            created += 1
+
+    # Keep a monotonic seen-set: a temporarily absent chat must not look new later.
+    known.update(current)
+    sender.topic_store.set_ui(_KNOWN_MAX_CHATS_UI_KEY, sorted(known))
+    if new_ids:
+        log.info(
+            "MAX chat reconciliation: %d unseen, %d topics created",
+            len(new_ids), created,
+        )
+    return created
+
+
 def create_max_client(
     max_token: str, max_device_id: str, sender: TelegramSender, max_chat_ids: str | None = None,
     debug: bool = False,
@@ -506,11 +626,17 @@ def create_max_client(
             log.info("Known chats: %s", resolver.chats)
             log.info("Known users: %s", resolver.users)
 
+        created = await _reconcile_snapshot_chats(client, sender, resolver)
+
         if not _first_connect:
-            await sender.send("✅ <b>Max:</b> соединение восстановлено")
+            suffix = f" | новых топиков: {created}" if created else ""
+            await sender.send(f"✅ <b>Max:</b> соединение восстановлено{suffix}")
         else:
             chat_count = len(resolver.chats)
-            await sender.send(f"✅ <b>Max:</b> подключён | чатов: {chat_count}")
+            suffix = f" | новых топиков: {created}" if created else ""
+            await sender.send(
+                f"✅ <b>Max:</b> подключён | чатов: {chat_count}{suffix}"
+            )
         _first_connect = False
 
     @client.on_disconnect
@@ -534,7 +660,20 @@ def create_max_client(
             len(msg.attaches),
         )
 
+        # A new chat can first appear as our own outgoing message. Refresh its
+        # metadata before deciding whether to ignore the self-message, so the
+        # Telegram topic is not lost until somebody replies.
+        if msg.chat_id not in resolver.chats_raw:
+            try:
+                await _refresh_chat_metadata(client, resolver, msg.chat_id)
+            except Exception:
+                log.exception("Could not refresh metadata for new chat=%s", msg.chat_id)
+
         if msg.is_self:
+            if sender.topic_store.get_topic(msg.chat_id) is None:
+                await _bootstrap_chat_topic(client, sender, resolver, msg.chat_id)
+            else:
+                _remember_known_chat(sender, msg.chat_id)
             return
 
         raw_sender = ""
@@ -561,6 +700,7 @@ def create_max_client(
 
         existing_thread = sender.topic_store.get_topic(msg.chat_id)
         thread_id = await sender.ensure_topic(msg.chat_id, topic_title)
+        _remember_known_chat(sender, msg.chat_id)
 
         # First time we touch this chat → publish context first, then import
         # the configured recent history before the live message. This keeps a

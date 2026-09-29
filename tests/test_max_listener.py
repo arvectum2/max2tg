@@ -1,7 +1,16 @@
 """Tests for app/max_listener.py — pure helper functions."""
 
 import pytest
-from app.max_listener import _human_size, _guess_media_kind
+from unittest.mock import AsyncMock, MagicMock, patch
+
+from app.max_listener import (
+    _guess_media_kind,
+    _human_size,
+    _is_max_service_dialog,
+    _reconcile_snapshot_chats,
+    _refresh_chat_metadata,
+)
+from app.resolver import ContactResolver
 
 
 # ---------------------------------------------------------------------------
@@ -144,3 +153,76 @@ class TestGuessMediaKind:
     # Extension appearing in the middle of filename should not trigger false match
     def test_mp4_in_name_not_extension_is_document(self):
         assert _guess_media_kind("mp4_notes.txt") == "document"
+
+
+class TestChatReconciliation:
+    def _resolver(self):
+        resolver = ContactResolver()
+        resolver._my_id = 100
+        resolver.chats_raw = {
+            1: {"id": 1, "type": "CHAT", "status": "ACTIVE", "title": "Old"},
+            2: {"id": 2, "type": "DIALOG", "status": "ACTIVE",
+                "participants": {"100": 1, "55": 2}},
+        }
+        resolver.chat_types = {1: "CHAT", 2: "DIALOG"}
+        resolver.chats = {1: "Old", 2: "DM:55"}
+        resolver.users = {55: "Alice"}
+        return resolver
+
+    async def test_reconcile_creates_only_unseen_chat(self):
+        resolver = self._resolver()
+        sender = MagicMock()
+        sender.topic_store.get_ui.return_value = ["1"]
+        sender.topic_store.set_ui = MagicMock()
+        client = MagicMock()
+
+        with patch("app.max_listener._bootstrap_chat_topic",
+                   new=AsyncMock(return_value=77)) as bootstrap:
+            created = await _reconcile_snapshot_chats(client, sender, resolver)
+
+        assert created == 1
+        bootstrap.assert_awaited_once_with(client, sender, resolver, 2)
+        saved = sender.topic_store.set_ui.call_args.args[1]
+        assert set(saved) == {"1", "2"}
+
+    async def test_reconcile_initializes_baseline_without_creating(self):
+        resolver = self._resolver()
+        sender = MagicMock()
+        sender.topic_store.get_ui.return_value = None
+        sender.topic_store.set_ui = MagicMock()
+        client = MagicMock()
+
+        with patch("app.max_listener._bootstrap_chat_topic",
+                   new=AsyncMock()) as bootstrap:
+            created = await _reconcile_snapshot_chats(client, sender, resolver)
+
+        assert created == 0
+        bootstrap.assert_not_awaited()
+        assert set(sender.topic_store.set_ui.call_args.args[1]) == {"1", "2"}
+
+    def test_max_service_dialog_is_excluded(self):
+        resolver = ContactResolver()
+        resolver._my_id = 100
+        resolver.chats_raw[9] = {
+            "id": 9, "type": "DIALOG", "participants": {"100": 1, "543835": 2},
+        }
+        resolver.chat_types[9] = "DIALOG"
+        resolver.users[543835] = "MAX"
+        assert _is_max_service_dialog(resolver, 9) is True
+
+    async def test_refresh_unknown_chat_uses_chat_get_and_resolves_peer(self):
+        resolver = ContactResolver()
+        resolver._my_id = 100
+        resolver.resolve_users_batch = AsyncMock()
+        client = MagicMock()
+        client.fetch_chats = AsyncMock(return_value={"chats": [{
+            "id": 2, "type": "DIALOG", "status": "ACTIVE",
+            "participants": {"100": 1, "55": 2},
+        }]})
+
+        await _refresh_chat_metadata(client, resolver, 2)
+
+        client.fetch_chats.assert_awaited_once_with([2])
+        assert resolver.chat_types[2] == "DIALOG"
+        assert resolver.chats[2] == "DM:55"
+        resolver.resolve_users_batch.assert_awaited_once()

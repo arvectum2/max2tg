@@ -375,6 +375,23 @@ class MaxClient:
                  chat_id, len(attaches), "OK" if ok else "FAIL")
         return resp
 
+    async def fetch_chats(self, chat_ids: list) -> dict | None:
+        """Fetch current metadata for one or more MAX chats via opcode 48."""
+        ids = list(dict.fromkeys(chat_ids))
+        if not ids:
+            return {"chats": []}
+        resp = await self.cmd(
+            OpCode.CHAT_GET,
+            {"chatIds": ids},
+            none_on_timeout=True,
+        )
+        log.info(
+            "fetch_chats(%s) → %s chats",
+            ids,
+            len((resp or {}).get("chats") or []) if isinstance(resp, dict) else 0,
+        )
+        return resp
+
     async def fetch_history(self, chat_id, count: int = 20,
                             from_time: int | None = None) -> dict | None:
         """Fetch the newest MAX history window via opcode 49.

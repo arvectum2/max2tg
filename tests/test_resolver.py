@@ -185,6 +185,24 @@ class TestLoadSnapshot:
 
 
 # ---------------------------------------------------------------------------
+class TestUpsertChats:
+    def test_upsert_dialog_keeps_viewer_and_builds_dm_name(self):
+        resolver = ContactResolver()
+        resolver._my_id = 100
+
+        ids = resolver.upsert_chats([{
+            "id": 123,
+            "type": "DIALOG",
+            "status": "ACTIVE",
+            "participants": {"100": 1, "55": 2},
+        }])
+
+        assert set(ids) == {100, 55}
+        assert resolver.my_id == 100
+        assert resolver.chats[123] == "DM:55"
+        assert resolver.chat_types[123] == "DIALOG"
+
+
 # get_name helpers on resolver (chat_name, user_name, is_dm)
 # ---------------------------------------------------------------------------
 

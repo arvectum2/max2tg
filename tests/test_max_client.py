@@ -291,6 +291,19 @@ class TestMaxClientInit:
         result = c.on_disconnect(my_handler)
         assert result is my_handler
 
+    async def test_fetch_chats_uses_opcode_48_payload(self):
+        c = MaxClient(token="tok", device_id="dev")
+        c.cmd = AsyncMock(return_value={"chats": [{"id": 123}]})
+
+        resp = await c.fetch_chats([123, 123, 456])
+
+        assert resp == {"chats": [{"id": 123}]}
+        c.cmd.assert_awaited_once_with(
+            OpCode.CHAT_GET,
+            {"chatIds": [123, 456]},
+            none_on_timeout=True,
+        )
+
     async def test_fetch_history_uses_opcode_49_payload(self):
         c = MaxClient(token="tok", device_id="dev")
         c.cmd = AsyncMock(return_value={"messages": []})

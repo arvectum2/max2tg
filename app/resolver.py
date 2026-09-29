@@ -56,7 +56,57 @@ class ContactResolver:
 
     # ── populate from AUTH_SNAPSHOT ────────────────────────────────
 
+    def _upsert_chat(self, chat: dict) -> set[int]:
+        """Merge one MAX chat record into resolver caches."""
+        participant_ids: set[int] = set()
+        cid = chat.get("id")
+        ctype = chat.get("type")
+        title = chat.get("title")
+        if cid is None:
+            return participant_ids
+
+        self.chats_raw[cid] = chat
+        if ctype:
+            self.chat_types[cid] = ctype
+        if title:
+            self.chats[cid] = title
+
+        participants = chat.get("participants", {})
+        for uid_str in participants:
+            try:
+                participant_ids.add(int(uid_str))
+            except (ValueError, TypeError):
+                pass
+
+        if not title and ctype == "DIALOG" and self._my_id:
+            peer_id = None
+            for uid in participants:
+                try:
+                    uid_int = int(uid)
+                except (ValueError, TypeError):
+                    continue
+                if uid_int != self._my_id:
+                    peer_id = uid_int
+                    break
+            if peer_id:
+                self.chats[cid] = f"DM:{peer_id}"
+        return participant_ids
+
+    def upsert_chats(self, chats: list[dict]) -> list[int]:
+        """Merge CHAT_GET results without resetting viewer/profile state."""
+        ids: set[int] = set()
+        for chat in chats:
+            if isinstance(chat, dict):
+                ids.update(self._upsert_chat(chat))
+        return list(ids)
+
     def load_snapshot(self, snapshot: dict) -> list:
+        # AUTH_SNAPSHOT is authoritative for the current chat list. Do not
+        # keep stale chats from a previous connection in the resolver cache.
+        self.chats.clear()
+        self.chat_types.clear()
+        self.chats_raw.clear()
+
         profile = snapshot.get("profile", {})
         self._my_id = profile.get("id")
         names = profile.get("names", [])
@@ -67,42 +117,9 @@ class ContactResolver:
             self.users[self._my_id] = f"{first} {last}".strip() or n.get("name", "")
 
         all_participant_ids: set[int] = set()
-
         for chat in snapshot.get("chats", []):
-            cid = chat.get("id")
-            ctype = chat.get("type")
-            title = chat.get("title")
-
-            if cid is None:
-                continue
-
-            self.chats_raw[cid] = chat
-
-            if ctype:
-                self.chat_types[cid] = ctype
-
-            if title:
-                self.chats[cid] = title
-
-            participants = chat.get("participants", {})
-            for uid_str in participants:
-                try:
-                    all_participant_ids.add(int(uid_str))
-                except (ValueError, TypeError):
-                    pass
-
-            if not title and ctype == "DIALOG" and self._my_id:
-                peer_id = None
-                for uid in participants:
-                    try:
-                        uid_int = int(uid)
-                    except (ValueError, TypeError):
-                        continue
-                    if uid_int != self._my_id:
-                        peer_id = uid_int
-                        break
-                if peer_id:
-                    self.chats[cid] = f"DM:{peer_id}"
+            if isinstance(chat, dict):
+                all_participant_ids.update(self._upsert_chat(chat))
 
         log.info(
             "Snapshot parsed: %d chats, my_id=%s, %d participant IDs to resolve",

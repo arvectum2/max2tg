@@ -39,7 +39,7 @@ WebSocket: `wss://ws-api.oneme.ru/websocket`, `Origin: https://web.max.ru`.
 | 19 | AUTH_SNAPSHOT (логин + первый snapshot чатов) |
 | 32 | CONTACT_GET — возвращает `{names, baseUrl, photoId}`, **НЕ возвращает phone/about** |
 | 35 | CONTACT_PRESENCE |
-| 48 | CHAT_GET |
+| 48 | CHAT_GET — `{chatIds:[...]}`; точечное получение метаданных новых/неизвестных чатов |
 | 49 | CHAT_HISTORY — `{chatId, from, forward, backward, getMessages:true}`; `from` — ms timestamp, история приходит от старых к новым |
 | 57 | CHAT_OPEN_LINK — открыть/вступить/подписаться по публичной chat/channel ссылке; user share `/u/...` остаётся не chat namespace |
 | 58 | CHAT_LEAVE — выйти из группы/канала |
@@ -95,7 +95,7 @@ WebSocket: `wss://ws-api.oneme.ru/websocket`, `Origin: https://web.max.ru`.
 
 ## Personal UX v1.0 — закрыт
 
-Личная Telegram-first версия закрыта 22.09.2026. Панель в General показывает DIALOG/CHAT/CHANNEL с пагинацией и отметкой подключённых топиков; из карточки можно создать/восстановить Telegram-топик без chat_id. Для DIALOG кнопка выхода из MAX не показывается. Глобальный поиск MAX (opcode 60) встроен: человек → deterministic DIALOG id (`viewer_id ^ contact_id`), группа/канал → открыть/вступить через opcode 57 и создать топик. Lifecycle leave/delete поддерживает как текстовые карточки, так и фото-карточки через caption fallback; успешное удаление/выход подтверждается в General. Reconnect сообщает об обрыве и восстановлении. В супергруппе установлен persistent reply keyboard с кнопкой `☰ Меню`: в General она открывает список MAX-чатов, внутри связанного топика — управление этим чатом; техническое сообщение кнопки не пересылается в MAX. `answerCallbackQuery` работает fail-open: временная ошибка Telegram/прокси при снятии spinner не отменяет само действие кнопки. Новые Telegram-топики получают историю MAX через opcode 49: по умолчанию последние 20 сообщений, настройка `history_import_limit` хранится в `state/topics.json` и меняется из General → ⚙️ Настройки в диапазоне 0–100; `0` отключает импорт. История идёт от старых к новым, включает собственные сообщения, сохраняет исходное время и message mapping для reply/dedup.
+Личная Telegram-first версия закрыта 22.09.2026. Панель в General показывает DIALOG/CHAT/CHANNEL с пагинацией и отметкой подключённых топиков; из карточки можно создать/восстановить Telegram-топик без chat_id. Для DIALOG кнопка выхода из MAX не показывается. Глобальный поиск MAX (opcode 60) встроен: человек → deterministic DIALOG id (`viewer_id ^ contact_id`), группа/канал → открыть/вступить через opcode 57 и создать топик. Lifecycle leave/delete поддерживает как текстовые карточки, так и фото-карточки через caption fallback; успешное удаление/выход подтверждается в General. Reconnect сообщает об обрыве и восстановлении. В супергруппе установлен persistent reply keyboard с кнопкой `☰ Меню`: в General она открывает список MAX-чатов, внутри связанного топика — управление этим чатом; техническое сообщение кнопки не пересылается в MAX. `answerCallbackQuery` работает fail-open: временная ошибка Telegram/прокси при снятии spinner не отменяет само действие кнопки. Новые Telegram-топики получают историю MAX через opcode 49: по умолчанию последние 20 сообщений, настройка `history_import_limit` хранится в `state/topics.json` и меняется из General → ⚙️ Настройки в диапазоне 0–100; `0` отключает импорт. История идёт от старых к новым, включает собственные сообщения, сохраняет исходное время и message mapping для reply/dedup. После каждого AUTH_SNAPSHOT/reconnect выполняется reconciliation с сохранённым `known_max_chat_ids`: впервые увиденные активные MAX-чаты автоматически получают Telegram-топик и историю. Если новый чат впервые проявился собственным исходящим сообщением, его метаданные догружаются через CHAT_GET (opcode 48), поэтому self-message больше не теряет новый чат. Служебный DIALOG MAX (peer 543835) из auto-topic исключён.
 
 ## Команды (в супергруппе)
 
@@ -115,7 +115,7 @@ WebSocket: `wss://ws-api.oneme.ru/websocket`, `Origin: https://web.max.ru`.
 
 ## Тесты
 
-`pytest -q` → 238 passed. asyncio_mode=auto. Покрытие: TopicStore, config, listener helpers (форматирование размеров, throttle), tg_handler (роутинг команд, маршрутизация медиа), max_client опкоды.
+`pytest -q` → 244 passed. asyncio_mode=auto. Покрытие: TopicStore, config, listener helpers (форматирование размеров, throttle), tg_handler (роутинг команд, маршрутизация медиа), max_client опкоды.
 
 ## Деплой
 

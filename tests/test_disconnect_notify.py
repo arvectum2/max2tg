@@ -2,7 +2,7 @@
 
 import pytest
 from datetime import datetime
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.max_listener import create_max_client
 
@@ -10,6 +10,10 @@ from app.max_listener import create_max_client
 def _make_client(sender=None):
     if sender is None:
         sender = AsyncMock()
+    # TopicStore methods are synchronous in production. Keep the fixture
+    # faithful so reconnect reconciliation does not receive coroutine mocks.
+    sender.topic_store = MagicMock()
+    sender.topic_store.get_ui.return_value = None
     return create_max_client(
         max_token="tok",
         max_device_id="dev",
