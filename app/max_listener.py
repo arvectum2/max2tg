@@ -9,6 +9,10 @@ from app.resolver import ContactResolver
 from app.tg_sender import TelegramSender
 from app.outbox import OutboxStore, current_delivery
 from app.max_formatting import format_max_html
+from app.max_media import (
+    photo_url, file_url, video_url, video_preview_url, first_media_url,
+    media_filename, media_size, duration_seconds,
+)
 
 log = logging.getLogger(__name__)
 
@@ -30,16 +34,11 @@ def _header(msg: MaxMessage, sender_label: str, chat_label: str, is_dm: bool) ->
 
 
 def _extract_photo_url(attach: dict) -> str | None:
-    """Extract the best available URL for a PHOTO attachment."""
-    return attach.get("baseUrl") or attach.get("url")
+    return photo_url(attach)
 
 
 def _extract_file_url(attach: dict) -> str | None:
-    """Extract download URL for a FILE attachment (url field takes priority)."""
-    url = attach.get("url")
-    if url and url.startswith("http"):
-        return url
-    return None
+    return file_url(attach)
 
 
 async def _get_media(client: MaxClient, url: str,
@@ -98,7 +97,7 @@ async def _send_attach(
                     data, caption=header_text, message_thread_id=thread_id,
                     reply_to_message_id=reply_to_message_id,
                 )
-        dur_s = f" ({duration // 1000}с)" if duration else ""
+        dur_s = f" ({duration_seconds(attach)}с)" if duration else ""
         return await sender.send(
             f"{header_text}\n🎙 <i>[голосовое сообщение{dur_s} — не удалось скачать]</i>",
             message_thread_id=thread_id,
@@ -108,8 +107,12 @@ async def _send_attach(
     if atype == "PHOTO":
         url = _extract_photo_url(attach)
         if not url:
-            log.warning("PHOTO attach has no URL: %s", attach)
-            return None
+            log.warning("PHOTO attachment lacks a downloadable URL")
+            return await sender.send(
+                f"{header_text}\n<i>[фото — ссылка недоступна]</i>",
+                message_thread_id=thread_id,
+                reply_to_message_id=reply_to_message_id,
+            )
         data = await _get_media(client, url, ("send_photo",))
         if data:
             return await sender.send_photo(
@@ -123,36 +126,63 @@ async def _send_attach(
         )
 
     if atype == "VIDEO":
-        thumb = attach.get("thumbnail")
+        original_url = video_url(attach)
+        if original_url:
+            data = await _get_media(
+                client, original_url, ("send_video", "send_document"))
+            if data:
+                result = await sender.send_video(
+                    data, caption=header_text, filename="video.mp4",
+                    message_thread_id=thread_id,
+                    reply_to_message_id=reply_to_message_id,
+                )
+                if result is not None:
+                    return result
+                # A failed/ambiguous API call must be handled by the outbox,
+                # never disguised as a successful preview delivery.
+                return None
+        thumb = video_preview_url(attach)
         if thumb:
             data = await _get_media(client, thumb, ("send_photo",))
             if data:
                 return await sender.send_photo(
-                    data, caption=f"{header_text}\n<i>[видео — превью]</i>",
+                    data, caption=f"{header_text}\n<i>[видео — только превью; "
+                                  "оригинал недоступен]</i>",
                     message_thread_id=thread_id,
                     reply_to_message_id=reply_to_message_id,
                 )
         return await sender.send(
-            f"{header_text}\n<i>[видео]</i>", message_thread_id=thread_id,
+            f"{header_text}\n<i>[видео — исходный файл недоступен]</i>",
+            message_thread_id=thread_id,
             reply_to_message_id=reply_to_message_id,
         )
 
     if atype == "FILE":
-        name = attach.get("name", "file")
-        size = attach.get("size", 0)
+        name = media_filename(attach)
+        size = media_size(attach)
         token_url = _extract_file_url(attach)
         if token_url:
             data = await _get_media(
                 client, token_url, ("send_photo", "send_video", "send_document"))
             if data:
                 kind = _guess_media_kind(name)
-                if kind == "photo":
+                # Telegram Bot API does not reliably accept GIF/WEBP/BMP
+                # through sendPhoto or MOV/MKV/AVI through sendVideo.
+                # Preserve original bytes and filename as a document instead.
+                ext = name.lower().rsplit(".",1)[-1] if "." in name else ""
+                if ext in ("mp3","m4a","wav","flac","aac","ogg","opus"):
+                    return await sender.send_audio(
+                        data,caption=header_text,filename=name,
+                        message_thread_id=thread_id,
+                        reply_to_message_id=reply_to_message_id,
+                    )
+                if kind == "photo" and ext in ("jpg","jpeg","png"):
                     return await sender.send_photo(
                         data, caption=header_text, filename=name,
                         message_thread_id=thread_id,
                         reply_to_message_id=reply_to_message_id,
                     )
-                if kind == "video":
+                if kind == "video" and ext=="mp4":
                     return await sender.send_video(
                         data, caption=header_text, filename=name,
                         message_thread_id=thread_id,
@@ -165,13 +195,18 @@ async def _send_attach(
                 )
         size_str = f" ({_human_size(size)})" if size else ""
         return await sender.send(
-            f"{header_text}\n📎 <b>{escape(name)}</b>{size_str}",
+            f"{header_text}\n📎 <b>{escape(name)}</b>{size_str}"
+            "\n<i>[исходный файл недоступен для скачивания]</i>",
             message_thread_id=thread_id,
             reply_to_message_id=reply_to_message_id,
         )
 
     if atype == "AUDIO":
-        url = attach.get("url")
+        url = first_media_url(attach,"url","fileUrl")
+        if not url and attach.get("audioId") is not None and msg is not None:
+            url = await client.download_audio_url(
+                attach["audioId"], msg.chat_id, msg.message_id,
+                token=attach.get("token"))
         if url:
             data = await _get_media(client, url, ("send_voice", "send_audio"))
             if data:
@@ -215,9 +250,10 @@ async def _send_attach(
         )
 
     if atype == "LOCATION":
-        lat = attach.get("lat") or attach.get("latitude")
-        lon = attach.get("lon") or attach.get("lng") or attach.get("longitude")
-        text = f"{header_text}\n📍 {lat}, {lon}" if lat and lon else (
+        lat = attach.get("lat") if attach.get("lat") is not None else attach.get("latitude")
+        lon = next((attach.get(k) for k in ("lon","lng","longitude")
+                    if attach.get(k) is not None),None)
+        text = f"{header_text}\n📍 {lat}, {lon}" if lat is not None and lon is not None else (
             f"{header_text}\n<i>[геолокация]</i>"
         )
         return await sender.send(
@@ -333,19 +369,68 @@ async def _send_message_content(
     first_sent = None
     if meaningful_attaches:
         text_sent = False
-        for i, attach in enumerate(meaningful_attaches):
-            if i == 0 and body != "<i>[нетекстовое сообщение]</i>":
-                cap = f"{header_text}\n{body}"
-                text_sent = True
-            else:
-                cap = header_text
+        index = 0
+        while index < len(meaningful_attaches):
+            attach = meaningful_attaches[index]
+            cap = (f"{header_text}\n{body}"
+                   if not text_sent and body != "<i>[нетекстовое сообщение]</i>"
+                   else header_text)
+
+            # Consecutive PHOTO items from one MAX message become a Telegram
+            # album, with each batch limited to Telegram's 2..10 rules.
+            group = []
+            for other in meaningful_attaches[index:index+10]:
+                if other.get("_type") != "PHOTO":
+                    break
+                group.append(other)
+            if len(group) >= 2:
+                scope = current_delivery()
+                cached = (scope.cached_media(("send_media_group",))
+                          if scope else None)
+                if cached is not None:
+                    pictures = sender._unpack_album(cached)
+                else:
+                    pictures = []
+                    for photo in group:
+                        url = photo_url(photo)
+                        picture = await client.download_file(url) if url else None
+                        if not picture:
+                            break
+                        pictures.append(picture)
+                # When one source image is missing, fall back to individual
+                # photos and explicit text markers for the failed item.
+                if (len(pictures) == len(group) and
+                    sum(map(len,pictures)) <= 45 * 1024 * 1024):
+                    result = await sender.send_photo_album(
+                        pictures,caption=cap,message_thread_id=thread_id,
+                        reply_to_message_id=(
+                            reply_to_message_id if first_sent is None else None),
+                    )
+                    if result is None:
+                        return None
+                    if first_sent is None:
+                        first_sent = result
+                    if cap != header_text:
+                        text_sent = True
+                    index += len(group)
+                    continue
+
             sent = await _send_attach(
                 attach, client, sender, cap, thread_id=thread_id, msg=msg,
                 reply_to_message_id=reply_to_message_id if first_sent is None else None,
             )
-            if first_sent is None and sent is not None:
+            # Do not mark the parent message SENT if any attachment failed,
+            # even if an earlier attachment already reached Telegram.
+            # Outbox will skip parts with confirmed IDs on retry.
+            if sent is None:
+                log.warning("MAX media item not delivered: type=%s",attach.get("_type"))
+                return None
+            if first_sent is None:
                 first_sent = sent
-            log.info("Forwarded attach _type=%s → TG", attach.get("_type"))
+            if cap != header_text:
+                text_sent = True
+            log.info("Forwarded attachment type=%s to TG",attach.get("_type"))
+            index += 1
 
         if body != "<i>[нетекстовое сообщение]</i>" and not text_sent:
             sent = await sender.send(
@@ -353,6 +438,8 @@ async def _send_message_content(
                 message_thread_id=thread_id,
                 reply_to_message_id=reply_to_message_id if first_sent is None else None,
             )
+            if sent is None:
+                return None
             if first_sent is None:
                 first_sent = sent
     else:
@@ -361,7 +448,7 @@ async def _send_message_content(
             message_thread_id=thread_id,
             reply_to_message_id=reply_to_message_id,
         )
-        log.info("Forwarded text → TG")
+        log.info("Forwarded text to TG")
 
     return first_sent
 

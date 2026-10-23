@@ -1,10 +1,12 @@
 import asyncio
 import io
+import zipfile
+from types import SimpleNamespace
 import logging
 from html import escape
 from html.parser import HTMLParser
 
-from telegram import Bot, InputFile
+from telegram import Bot, InputFile, InputMediaPhoto
 from telegram.constants import ParseMode
 from telegram.error import RetryAfter, TimedOut
 from telegram.request import HTTPXRequest
@@ -206,9 +208,9 @@ class TelegramSender:
         return split_telegram_html(caption, TG_CAPTION_PART_MAX)
 
     async def _send_caption_remainder(self, parts: list[str], media_result,
-                                      message_thread_id: int | None) -> None:
+                                      message_thread_id: int | None) -> bool:
         if media_result is None:
-            return
+            return False
         media_id = getattr(media_result, "message_id", None)
         for part in parts[1:]:
             result = await self.send(
@@ -217,7 +219,8 @@ class TelegramSender:
             )
             if result is None:
                 log.error("Failed to forward remainder of media caption")
-                break
+                return False
+        return True
 
     @staticmethod
     def _reply_kwargs(reply_to_message_id: int | None) -> dict:
@@ -307,7 +310,80 @@ class TelegramSender:
             parse_mode=ParseMode.HTML, message_thread_id=message_thread_id,
             **self._reply_kwargs(reply_to_message_id)),
             file_field="photo", data=data, filename=filename)
-        await self._send_caption_remainder(parts, result, message_thread_id)
+        if not await self._send_caption_remainder(
+            parts,result,message_thread_id):
+            return None
+        return result
+
+    @staticmethod
+    def _pack_album(photos: list[bytes]) -> bytes:
+        output=io.BytesIO()
+        with zipfile.ZipFile(output,"w",compression=zipfile.ZIP_STORED) as pack:
+            for i,content in enumerate(photos):
+                item=zipfile.ZipInfo(f"{i:02d}.jpg")
+                pack.writestr(item,content)
+        return output.getvalue()
+
+    @staticmethod
+    def _unpack_album(data: bytes) -> list[bytes]:
+        with zipfile.ZipFile(io.BytesIO(data),"r") as pack:
+            names=pack.namelist()
+            if not 2<=len(names)<=10 or any(
+                name!=f"{i:02d}.jpg" for i,name in enumerate(names)
+            ):
+                raise ValueError("Invalid stored Telegram photo album")
+            return [pack.read(name) for name in names]
+
+    async def send_photo_album(
+        self, photos: list[bytes], caption: str = "",
+        message_thread_id: int | None = None,
+        reply_to_message_id: int | None = None,
+    ):
+        """Send 2..10 photos as one idempotency-tracked Telegram album.
+
+        The one API operation returns multiple messages; all Telegram IDs are
+        durably stored in one SQLite part for deletion and restart recovery.
+        """
+        if not 2<=len(photos)<=10:
+            raise ValueError("A Telegram album must contain 2-10 photos")
+        parts=self._caption_parts(caption)
+        scope=current_delivery()
+        cached=scope.cached_media(("send_media_group",)) if scope else None
+        packed=cached if cached is not None else self._pack_album(photos)
+        saved_photos=self._unpack_album(packed)
+        options=dict(chat_id=self._chat_id,message_thread_id=message_thread_id,
+                     **self._reply_kwargs(reply_to_message_id))
+
+        async def call():
+            media=[
+                InputMediaPhoto(
+                    media=InputFile(io.BytesIO(data),filename=f"photo-{i+1}.jpg"),
+                    caption=parts[0] if i==0 and parts else None,
+                    parse_mode=ParseMode.HTML if i==0 and parts else None,
+                )
+                for i,data in enumerate(saved_photos)
+            ]
+            return await self._bot.send_media_group(media=media,**options)
+
+        if scope is not None:
+            # Persist photo bytes before the first API call. On RetryAfter,
+            # recover the packed album even if MAX CDN links have expired.
+            result=await scope.send_part("send_media_group",{
+                "kwargs":options,
+                "caption":parts[0] if parts else None,
+                "count":len(saved_photos),
+            },call,media=packed)
+        else:
+            result=await self._retry(call)
+            if isinstance(result,(list,tuple)) and result:
+                result=SimpleNamespace(
+                    message_id=result[0].message_id,
+                    media_group_ids=[m.message_id for m in result],
+                )
+
+        if not await self._send_caption_remainder(
+            parts,result,message_thread_id):
+            return None
         return result
 
     async def send_document(self, data: bytes, caption: str = "", filename: str = "file",
@@ -319,7 +395,9 @@ class TelegramSender:
             parse_mode=ParseMode.HTML, message_thread_id=message_thread_id,
             **self._reply_kwargs(reply_to_message_id)),
             file_field="document", data=data, filename=filename)
-        await self._send_caption_remainder(parts, result, message_thread_id)
+        if not await self._send_caption_remainder(
+            parts,result,message_thread_id):
+            return None
         return result
 
     async def send_video(self, data: bytes, caption: str = "", filename: str = "video.mp4",
@@ -331,7 +409,25 @@ class TelegramSender:
             parse_mode=ParseMode.HTML, message_thread_id=message_thread_id,
             **self._reply_kwargs(reply_to_message_id)),
             file_field="video", data=data, filename=filename)
-        await self._send_caption_remainder(parts, result, message_thread_id)
+        if not await self._send_caption_remainder(
+            parts,result,message_thread_id):
+            return None
+        return result
+
+    async def send_audio(self,data: bytes,caption: str = "",
+                         filename: str = "audio.mp3",
+                         message_thread_id: int | None = None,
+                         reply_to_message_id: int | None = None):
+        """Send a playable audio file, not an OGG/Opus voice note."""
+        parts=self._caption_parts(caption)
+        result=await self._send_api("send_audio",dict(
+            chat_id=self._chat_id,caption=parts[0] if parts else None,
+            parse_mode=ParseMode.HTML,message_thread_id=message_thread_id,
+            **self._reply_kwargs(reply_to_message_id)),
+            file_field="audio",data=data,filename=filename)
+        if not await self._send_caption_remainder(
+            parts,result,message_thread_id):
+            return None
         return result
 
     async def send_voice(self, data: bytes, caption: str = "",
@@ -351,7 +447,9 @@ class TelegramSender:
             result = await self._send_api(
                 "send_audio", opts, file_field="audio",
                 data=data, filename="audio.m4a")
-        await self._send_caption_remainder(parts, result, message_thread_id)
+        if not await self._send_caption_remainder(
+            parts,result,message_thread_id):
+            return None
         return result
 
     async def send_sticker(self, data: bytes, message_thread_id: int | None = None,

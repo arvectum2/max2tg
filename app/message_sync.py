@@ -114,12 +114,17 @@ class MessageSync:
         ).fetchone()
         if row is None:
             return []
-        return [
-            int(item[0]) for item in self.db.execute(
-                "SELECT tg_id FROM parts WHERE job_key=? AND state='SENT' "
-                "AND tg_id IS NOT NULL ORDER BY ordinal DESC", (row["key"],),
-            ).fetchall()
-        ]
+        ids=[]
+        for part in self.db.execute(
+            "SELECT tg_id,tg_ids FROM parts WHERE job_key=? "
+            "AND state='SENT' AND tg_id IS NOT NULL "
+            "ORDER BY ordinal DESC",(row["key"],)
+        ):
+            if part["tg_ids"]:
+                ids.extend(reversed(json.loads(part["tg_ids"])))
+            else:
+                ids.append(int(part["tg_id"]))
+        return ids
 
     async def accept(self, opcode: int, payload: dict) -> bool:
         parsed = parse_mutation(opcode, payload)

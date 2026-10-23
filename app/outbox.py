@@ -67,7 +67,10 @@ class DeliveryContext:
                 self.store._set_job(self.key, "UNKNOWN", "changed part after restart")
                 raise DeliveryInterrupted("UNKNOWN", "outbound part changed after restart")
             if stored["state"] == "SENT":
-                return SimpleNamespace(message_id=int(stored["tg_id"]))
+                ids = json.loads(stored["tg_ids"]) if stored["tg_ids"] else [
+                    int(stored["tg_id"])]
+                return SimpleNamespace(message_id=int(stored["tg_id"]),
+                                       media_group_ids=ids)
             if stored["state"] in ("SENDING", "UNKNOWN", "FAILED"):
                 raise DeliveryInterrupted(stored["state"], "previous uncertain/failed delivery")
         else:
@@ -76,10 +79,20 @@ class DeliveryContext:
         self.store._update_part(self.key, index, "SENDING")
         try:
             result = await send()
+            if isinstance(result,(list,tuple)):
+                # sendMediaGroup is one Telegram API call but returns one
+                # message per photo. Persist all IDs for later deletion.
+                ids = [int(item.message_id) for item in result
+                       if getattr(item,"message_id",None) is not None]
+                if not ids or len(ids) != len(result):
+                    self.store._update_part(self.key,index,"UNKNOWN")
+                    raise DeliveryInterrupted("UNKNOWN","incomplete album acknowledgement")
+                self.store._update_part(self.key,index,"SENT",ids[0],ids)
+                return SimpleNamespace(message_id=ids[0], media_group_ids=ids)
             if result is None or getattr(result, "message_id", None) is None:
                 self.store._update_part(self.key, index, "UNKNOWN")
                 raise DeliveryInterrupted("UNKNOWN", "Telegram response has no message_id")
-            self.store._update_part(self.key, index, "SENT", int(result.message_id))
+            self.store._update_part(self.key,index,"SENT",int(result.message_id))
             return result
         except RetryAfter as exc:
             self.store._update_part(self.key, index, "RETRY")
@@ -143,12 +156,18 @@ class OutboxStore:
                 media BLOB,
                 state TEXT NOT NULL DEFAULT 'PENDING',
                 tg_id INTEGER,
+                tg_ids TEXT,
                 PRIMARY KEY(job_key, ordinal),
                 FOREIGN KEY(job_key) REFERENCES jobs(key) ON DELETE CASCADE
             );
             CREATE INDEX IF NOT EXISTS jobs_due
                 ON jobs(status, next_attempt, created);
         """)
+        # Forward migration for existing SQLite databases, without
+        # dropping jobs, parts, message mappings or stored media.
+        if "tg_ids" not in {r["name"] for r in
+                            self.db.execute("PRAGMA table_info(parts)")}:
+            self.db.execute("ALTER TABLE parts ADD COLUMN tg_ids TEXT")
         # Process was killed between marking SENDING and receiving/storing an
         # acknowledgement. Those calls MUST NOT be repeated blindly.
         with self.db:
@@ -218,10 +237,13 @@ class OutboxStore:
              media,"PENDING"),
         )
 
-    def _update_part(self, key, index, state, message_id=None):
-        self.db.execute("UPDATE parts SET state=?, tg_id=COALESCE(?,tg_id)"
-                        " WHERE job_key=? AND ordinal=?",
-                        (state,message_id,key,index))
+    def _update_part(self,key,index,state,message_id=None,group_ids=None):
+        self.db.execute(
+            "UPDATE parts SET state=?,tg_id=COALESCE(?,tg_id),"
+            "tg_ids=COALESCE(?,tg_ids) WHERE job_key=? AND ordinal=?",
+            (state,message_id,
+             json.dumps(group_ids) if group_ids is not None else None,
+             key,index))
 
     def _set_job(self, key, status, error=None):
         self.db.execute(
