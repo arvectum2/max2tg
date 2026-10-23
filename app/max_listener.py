@@ -7,6 +7,7 @@ from html import escape
 from app.max_client import MaxClient, MaxMessage
 from app.resolver import ContactResolver
 from app.tg_sender import TelegramSender
+from app.outbox import OutboxStore, current_delivery
 
 log = logging.getLogger(__name__)
 
@@ -38,6 +39,17 @@ def _extract_file_url(attach: dict) -> str | None:
     if url and url.startswith("http"):
         return url
     return None
+
+
+async def _get_media(client: MaxClient, url: str,
+                     methods: tuple[str, ...]) -> bytes | None:
+    """Prefer durable media bytes from an unfinished Telegram outbox part."""
+    scope = current_delivery()
+    if scope is not None:
+        cached = scope.cached_media(methods)
+        if cached is not None:
+            return cached
+    return await client.download_file(url)
 
 
 def _guess_media_kind(filename: str) -> str:
@@ -79,7 +91,7 @@ async def _send_attach(
                 audio_id, chat_id, message_id, token=token,
             )
         if url:
-            data = await client.download_file(url)
+            data = await _get_media(client, url, ("send_voice", "send_audio"))
             if data:
                 return await sender.send_voice(
                     data, caption=header_text, message_thread_id=thread_id,
@@ -97,7 +109,7 @@ async def _send_attach(
         if not url:
             log.warning("PHOTO attach has no URL: %s", attach)
             return None
-        data = await client.download_file(url)
+        data = await _get_media(client, url, ("send_photo",))
         if data:
             return await sender.send_photo(
                 data, caption=header_text, message_thread_id=thread_id,
@@ -112,7 +124,7 @@ async def _send_attach(
     if atype == "VIDEO":
         thumb = attach.get("thumbnail")
         if thumb:
-            data = await client.download_file(thumb)
+            data = await _get_media(client, thumb, ("send_photo",))
             if data:
                 return await sender.send_photo(
                     data, caption=f"{header_text}\n<i>[видео — превью]</i>",
@@ -129,7 +141,8 @@ async def _send_attach(
         size = attach.get("size", 0)
         token_url = _extract_file_url(attach)
         if token_url:
-            data = await client.download_file(token_url)
+            data = await _get_media(
+                client, token_url, ("send_photo", "send_video", "send_document"))
             if data:
                 kind = _guess_media_kind(name)
                 if kind == "photo":
@@ -159,7 +172,7 @@ async def _send_attach(
     if atype == "AUDIO":
         url = attach.get("url")
         if url:
-            data = await client.download_file(url)
+            data = await _get_media(client, url, ("send_voice", "send_audio"))
             if data:
                 return await sender.send_voice(
                     data, caption=header_text, message_thread_id=thread_id,
@@ -173,7 +186,7 @@ async def _send_attach(
     if atype == "STICKER":
         url = attach.get("url")
         if url:
-            data = await client.download_file(url)
+            data = await _get_media(client, url, ("send_sticker",))
             if data:
                 return await sender.send_sticker(
                     data, message_thread_id=thread_id,
@@ -351,6 +364,9 @@ async def _send_message_content(
 def _remember_message(sender: TelegramSender, msg: MaxMessage, tg_message) -> None:
     tg_message_id = getattr(tg_message, "message_id", None)
     if msg.message_id and tg_message_id is not None:
+        active = current_delivery()
+        if active is not None:
+            active.store.record_mapping(active.key, tg_message_id)
         sender.topic_store.set_message(msg.chat_id, msg.message_id, tg_message_id)
 
 
@@ -364,6 +380,83 @@ def _history_time_label(timestamp) -> str:
         return ""
 
 
+async def _deliver_history_message(
+    msg: MaxMessage, client: MaxClient, sender: TelegramSender,
+    resolver: ContactResolver, chat_id, thread_id: int,
+) -> bool:
+    """Send one imported message, sharing the live path's durable ledger."""
+    raw_sender = ""
+    if msg.is_self:
+        raw_sender = "Вы"
+    elif msg.sender_id is not None:
+        raw_sender = await resolver.resolve_user(msg.sender_id)
+    is_dm = resolver.is_dm(chat_id)
+    raw_chat = resolver.chat_name(chat_id)
+    header_text = _header(msg, escape(raw_sender), escape(raw_chat), is_dm)
+    label = _history_time_label(msg.timestamp)
+    if label:
+        header_text = f"🕘 <i>{escape(label)}</i>\n{header_text}"
+
+    link = msg.link
+    link_type = link.get("type") if isinstance(link, dict) else None
+    if link_type == "REPLY":
+        inner = link.get("message") or {}
+        if not isinstance(inner, dict):
+            inner = {}
+        replied_max_id = inner.get("id") or link.get("messageId")
+        replied_tg_id = (sender.topic_store.tg_for_max_message(chat_id, replied_max_id)
+                         if replied_max_id else None)
+        if replied_tg_id is not None:
+            sent = await _send_message_content(
+                msg, header_text, client, sender, thread_id,
+                reply_to_message_id=replied_tg_id,
+            )
+            _remember_message(sender, msg, sent)
+            return sent is not None
+
+        source_sender_id = inner.get("sender")
+        source_label = ""
+        if source_sender_id is not None:
+            if client._my_id and str(source_sender_id) == str(client._my_id):
+                source_label = "Вы"
+            else:
+                source_label = escape(await resolver.resolve_user(source_sender_id))
+        reply_header = f"{header_text}\n↩ <b>Ответ"
+        if source_label:
+            reply_header += f" на {source_label}"
+        reply_header += "</b>"
+        quoted = inner.get("text") or ""
+        if quoted:
+            reply_header += f"\n<blockquote>{escape(quoted[:700])}</blockquote>"
+        elif inner.get("attaches"):
+            reply_header += "\n<blockquote>[вложение]</blockquote>"
+        sent = await _send_message_content(
+            msg, reply_header, client, sender, thread_id,
+        )
+        _remember_message(sender, msg, sent)
+        return sent is not None
+
+    if link_type == "FORWARD":
+        forwarded = await _handle_linked_message(
+            link, link_type, header_text, client, sender, resolver,
+            thread_id=thread_id, msg=msg,
+        )
+        comment = None
+        if msg.text:
+            comment = await sender.send(
+                f"{header_text}\n{escape(msg.text)}",
+                message_thread_id=thread_id,
+            )
+        _remember_message(sender, msg, comment or forwarded)
+        return (comment or forwarded) is not None
+
+    sent = await _send_message_content(
+        msg, header_text, client, sender, thread_id,
+    )
+    _remember_message(sender, msg, sent)
+    return sent is not None
+
+
 async def import_recent_history(
     client: MaxClient,
     sender: TelegramSender,
@@ -374,7 +467,7 @@ async def import_recent_history(
     *,
     raw_messages: list[dict] | None = None,
 ) -> int:
-    """Import MAX history in chronological order, skipping mapped message IDs."""
+    """Import ordered history, storing deliveries before their first send."""
     if raw_messages is None:
         try:
             count = max(0, min(int(count), 100))
@@ -388,7 +481,7 @@ async def import_recent_history(
             log.exception("History fetch failed for chat=%s", chat_id)
             return 0
         if not isinstance(response, dict) or response.get("_max_error"):
-            log.warning("History fetch failed for chat=%s: %s", chat_id, response)
+            log.warning("History fetch failed for chat=%s", chat_id)
             return 0
         raw_messages = response.get("messages") or []
     raw_messages = [m for m in raw_messages if isinstance(m, dict)]
@@ -402,82 +495,21 @@ async def import_recent_history(
         if sender.topic_store.tg_for_max_message(chat_id, msg.message_id) is not None:
             continue
 
-        raw_sender = ""
-        if msg.is_self:
-            raw_sender = "Вы"
-        elif msg.sender_id is not None:
-            raw_sender = await resolver.resolve_user(msg.sender_id)
-        is_dm = resolver.is_dm(chat_id)
-        raw_chat = resolver.chat_name(chat_id)
-        header_text = _header(msg, escape(raw_sender), escape(raw_chat), is_dm)
-        time_label = _history_time_label(msg.timestamp)
-        if time_label:
-            header_text = f"🕘 <i>{escape(time_label)}</i>\n{header_text}"
-
-        link = msg.link
-        link_type = link.get("type") if isinstance(link, dict) else None
-        if link_type == "REPLY":
-            inner = link.get("message") or {}
-            replied_max_id = inner.get("id") or link.get("messageId")
-            replied_tg_id = None
-            if replied_max_id:
-                replied_tg_id = sender.topic_store.tg_for_max_message(
-                    chat_id, replied_max_id,
-                )
-            if replied_tg_id is not None:
-                sent = await _send_message_content(
-                    msg, header_text, client, sender, thread_id,
-                    reply_to_message_id=replied_tg_id,
-                )
-                _remember_message(sender, msg, sent)
-                imported += 1
-                continue
-
-            source_sender_id = inner.get("sender")
-            source_label = ""
-            if source_sender_id is not None:
-                if client._my_id and int(source_sender_id) == int(client._my_id):
-                    source_label = "Вы"
-                else:
-                    source_label = escape(await resolver.resolve_user(source_sender_id))
-            reply_header = f"{header_text}\n↩ <b>Ответ"
-            if source_label:
-                reply_header += f" на {source_label}"
-            reply_header += "</b>"
-            quoted = inner.get("text") or ""
-            if quoted:
-                reply_header += f"\n<blockquote>{escape(quoted[:700])}</blockquote>"
-            elif inner.get("attaches"):
-                reply_header += "\n<blockquote>[вложение]</blockquote>"
-            sent = await _send_message_content(
-                msg, reply_header, client, sender, thread_id,
+        async def deliver():
+            return await _deliver_history_message(
+                msg, client, sender, resolver, chat_id, thread_id,
             )
-            _remember_message(sender, msg, sent)
+
+        outbox = getattr(sender, "outbox", None)
+        if isinstance(outbox, OutboxStore):
+            completed = await outbox.process(msg, deliver)
+        else:
+            completed = await deliver()
+        if completed:
             imported += 1
-            continue
 
-        if link_type == "FORWARD":
-            forwarded = await _handle_linked_message(
-                link, link_type, header_text, client, sender, resolver,
-                thread_id=thread_id, msg=msg,
-            )
-            comment = None
-            if msg.text:
-                comment = await sender.send(
-                    f"{header_text}\n{escape(msg.text)}",
-                    message_thread_id=thread_id,
-                )
-            _remember_message(sender, msg, comment or forwarded)
-            imported += 1
-            continue
-
-        sent = await _send_message_content(
-            msg, header_text, client, sender, thread_id,
-        )
-        _remember_message(sender, msg, sent)
-        imported += 1
-
-    log.info("Imported %d/%d history messages for chat=%s", imported, count, chat_id)
+    log.info("Imported %d/%d history messages for chat=%s",
+             imported, len(raw_messages), chat_id)
     return imported
 
 
@@ -774,6 +806,24 @@ def create_max_client(
     client.resolver = resolver
     client._tg_sender = sender
     chat_locks: dict[str, asyncio.Lock] = {}
+    background_outbox = None
+
+    async def recover_outbox():
+        outbox = getattr(sender, "outbox", None)
+        if outbox is None:
+            return
+        for item in outbox.recoverable(limit=50):
+            await handle_message(item)
+
+    async def outbox_poller():
+        while True:
+            try:
+                await recover_outbox()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("Outbox recovery polling failed")
+            await asyncio.sleep(15)
 
     _first_connect = True
     _notif_count = 0
@@ -815,6 +865,12 @@ def create_max_client(
         if restored:
             log.info("Reconnect recovered %d previously missed messages", restored)
 
+        nonlocal background_outbox
+        if isinstance(getattr(sender, "outbox", None), OutboxStore):
+            if background_outbox is None or background_outbox.done():
+                background_outbox = asyncio.create_task(outbox_poller())
+            await recover_outbox()
+
         if not _first_connect:
             suffix = f" | новых топиков: {created}" if created else ""
             await sender.send(f"✅ <b>Max:</b> соединение восстановлено{suffix}")
@@ -839,7 +895,20 @@ def create_max_client(
     @client.on_message
     async def handle_message(msg: MaxMessage):
         async with chat_locks.setdefault(str(msg.chat_id), asyncio.Lock()):
-            await _handle_message_serial(msg)
+            async def deliver():
+                await _handle_message_serial(msg)
+                mapped_id = (sender.topic_store.tg_for_max_message(
+                    msg.chat_id, msg.message_id,
+                ) if msg.message_id else None)
+                active = current_delivery()
+                if active is not None and mapped_id is not None:
+                    active.store.record_mapping(active.key, mapped_id)
+                return mapped_id is not None
+            outbox = getattr(sender, "outbox", None)
+            if isinstance(outbox, OutboxStore):
+                await outbox.process(msg, deliver)
+            else:
+                await deliver()
 
     async def _handle_message_serial(msg: MaxMessage):
         # Never log message content or private contact details.

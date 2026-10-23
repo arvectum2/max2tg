@@ -25,7 +25,7 @@
   хронологический импорт только пропущенных событий. Без безопасной точки
   восстановления первый запуск не должен слепо пересылать старую историю.
   Тест: >100 сообщений, гонки с live, собственные исходящие и TG echoes.
-- [ ] **P0.2 — Persistent Outbox.** SQLite/PostgreSQL queue: RECEIVED →
+- [x] **P0.2 — Persistent Outbox (реализован для MAX → Telegram 23.10.2026).** SQLite/PostgreSQL queue: RECEIVED →
   PENDING → SENDING → SENT, RETRY/UNKNOWN при ошибке, durable payload,
   retry с backoff, сохранение каждой части текста/медиа. Не считать сетевой
   timeout гарантированным отказом: Telegram API не даёт exactly-once.
@@ -83,9 +83,11 @@
 - [ ] GitHub arvectum2/max2tg (main) — source of truth; GitVerse — зеркало;
   выпуск только после проверенного релиза.
 
-**Следующее рабочее задание:** P0.2 (Persistent Outbox). P0.1 закрыт
-на уровне кода, тестов и восстановления службы; сценарии физической
-потери сети/SSD проверяются в общем приёмочном gate P0.5.
+**Следующее рабочее задание:** P0.3 (edit/delete/reactions). P0.1 и
+P0.2 реализованы на уровне кода и тестов для направления MAX → Telegram.
+Протокол приёмки сетевых/дисковых отказов остаётся в P0.5; статус UNKNOWN
+проверяется и разрешается оператором, без слепого повторного отправления.
+Подробнее: docs/RELIABILITY_P0_1.md и docs/RELIABILITY_P0_2.md.
 
 **Последовательность:** P0.1 → P0.2 → P0.3 → P0.4 → P0.5 → P1 →
 SaaS prototype → SaaS beta → коммерческий запуск.

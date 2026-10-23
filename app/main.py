@@ -13,6 +13,7 @@ from app.max_listener import create_max_client
 from app.tg_handler import build_tg_app, ensure_management_panel, ensure_quick_menu
 from app.tg_sender import TelegramSender
 from app.topics import TopicStore
+from app.outbox import OutboxStore
 
 threading.stack_size(524288)
 
@@ -74,8 +75,13 @@ async def main():
     os.makedirs(settings.state_dir, exist_ok=True)
     topic_store = TopicStore(os.path.join(settings.state_dir, "topics.json"))
 
+    outbox = OutboxStore(os.path.join(settings.state_dir, "outbox.sqlite3"))
+    repaired = outbox.reconcile_mappings(topic_store)
+    log.info("Persistent outbox initialized: %s (mappings repaired: %d)",
+             outbox.counts(), repaired)
     sender = TelegramSender(settings.tg_bot_token, settings.tg_chat_id, topic_store,
                             proxy_url=settings.tg_proxy)
+    sender.outbox = outbox
     await sender.start()
 
     client = create_max_client(
@@ -122,6 +128,7 @@ async def main():
             await tg_app.stop()
             await tg_app.shutdown()
         await sender.stop()
+        outbox.close()
 
 
 if __name__ == "__main__":

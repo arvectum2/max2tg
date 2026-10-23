@@ -10,6 +10,7 @@ from telegram.error import RetryAfter, TimedOut
 from telegram.request import HTTPXRequest
 
 from app.topics import TopicStore
+from app.outbox import current_delivery
 
 log = logging.getLogger(__name__)
 
@@ -244,27 +245,52 @@ class TelegramSender:
                 await asyncio.sleep(2 * attempt)
         return None
 
+    async def _send_api(self, method: str, kwargs: dict, *,
+                        file_field: str | None = None,
+                        data: bytes | None = None,
+                        filename: str | None = None):
+        """One durable Telegram API call under an outbox delivery scope.
+
+        Outside that scope keep the old behaviour for control/management
+        messages. Inside, every part is durably recorded before calling TG.
+        """
+        async def call():
+            actual = dict(kwargs)
+            if file_field:
+                actual[file_field] = InputFile(
+                    io.BytesIO(data), filename=filename,
+                )
+            return await getattr(self._bot, method)(**actual)
+
+        current = current_delivery()
+        if current is not None:
+            meta = {
+                "kwargs": kwargs,
+                "file_field": file_field,
+                "filename": filename,
+            }
+            return await current.send_part(method, meta, call, media=data)
+        return await self._retry(call)
+
     # ── send methods ───────────────────────────────────────────────
 
     async def send(self, text: str, message_thread_id: int | None = None,
                    reply_to_message_id: int | None = None):
         if not text:
             return None
-
         first_result = None
         for part in split_telegram_html(text):
-            result = await self._retry(
-                lambda: self._bot.send_message(
-                    chat_id=self._chat_id,
-                    text=part,
-                    parse_mode=ParseMode.HTML,
-                    message_thread_id=message_thread_id,
-                    **self._reply_kwargs(
-                        reply_to_message_id if first_result is None
-                        else getattr(first_result, "message_id", None)
-                    ),
-                )
+            kwargs = dict(
+                chat_id=self._chat_id,
+                text=part,
+                parse_mode=ParseMode.HTML,
+                message_thread_id=message_thread_id,
+                **self._reply_kwargs(
+                    reply_to_message_id if first_result is None
+                    else getattr(first_result, "message_id", None),
+                ),
             )
+            result = await self._send_api("send_message", kwargs)
             if result is None:
                 log.error("Long Telegram message part failed; not marking complete")
                 return None
@@ -275,94 +301,63 @@ class TelegramSender:
     async def send_photo(self, data: bytes, caption: str = "", filename: str = "photo.jpg",
                          message_thread_id: int | None = None,
                          reply_to_message_id: int | None = None):
-        caption_parts = self._caption_parts(caption)
-        caption = caption_parts[0] if caption_parts else ""
-        result = await self._retry(
-            lambda: self._bot.send_photo(
-                chat_id=self._chat_id,
-                photo=InputFile(io.BytesIO(data), filename=filename),
-                caption=caption or None,
-                parse_mode=ParseMode.HTML,
-                message_thread_id=message_thread_id,
-                **self._reply_kwargs(reply_to_message_id),
-            )
-        )
-        await self._send_caption_remainder(caption_parts, result, message_thread_id)
+        parts = self._caption_parts(caption)
+        result = await self._send_api("send_photo", dict(
+            chat_id=self._chat_id, caption=parts[0] if parts else None,
+            parse_mode=ParseMode.HTML, message_thread_id=message_thread_id,
+            **self._reply_kwargs(reply_to_message_id)),
+            file_field="photo", data=data, filename=filename)
+        await self._send_caption_remainder(parts, result, message_thread_id)
         return result
 
     async def send_document(self, data: bytes, caption: str = "", filename: str = "file",
                             message_thread_id: int | None = None,
                             reply_to_message_id: int | None = None):
-        caption_parts = self._caption_parts(caption)
-        caption = caption_parts[0] if caption_parts else ""
-        result = await self._retry(
-            lambda: self._bot.send_document(
-                chat_id=self._chat_id,
-                document=InputFile(io.BytesIO(data), filename=filename),
-                caption=caption or None,
-                parse_mode=ParseMode.HTML,
-                message_thread_id=message_thread_id,
-                **self._reply_kwargs(reply_to_message_id),
-            )
-        )
-        await self._send_caption_remainder(caption_parts, result, message_thread_id)
+        parts = self._caption_parts(caption)
+        result = await self._send_api("send_document", dict(
+            chat_id=self._chat_id, caption=parts[0] if parts else None,
+            parse_mode=ParseMode.HTML, message_thread_id=message_thread_id,
+            **self._reply_kwargs(reply_to_message_id)),
+            file_field="document", data=data, filename=filename)
+        await self._send_caption_remainder(parts, result, message_thread_id)
         return result
 
     async def send_video(self, data: bytes, caption: str = "", filename: str = "video.mp4",
                          message_thread_id: int | None = None,
                          reply_to_message_id: int | None = None):
-        caption_parts = self._caption_parts(caption)
-        caption = caption_parts[0] if caption_parts else ""
-        result = await self._retry(
-            lambda: self._bot.send_video(
-                chat_id=self._chat_id,
-                video=InputFile(io.BytesIO(data), filename=filename),
-                caption=caption or None,
-                parse_mode=ParseMode.HTML,
-                message_thread_id=message_thread_id,
-                **self._reply_kwargs(reply_to_message_id),
-            )
-        )
-        await self._send_caption_remainder(caption_parts, result, message_thread_id)
+        parts = self._caption_parts(caption)
+        result = await self._send_api("send_video", dict(
+            chat_id=self._chat_id, caption=parts[0] if parts else None,
+            parse_mode=ParseMode.HTML, message_thread_id=message_thread_id,
+            **self._reply_kwargs(reply_to_message_id)),
+            file_field="video", data=data, filename=filename)
+        await self._send_caption_remainder(parts, result, message_thread_id)
         return result
 
     async def send_voice(self, data: bytes, caption: str = "",
                          message_thread_id: int | None = None,
                          reply_to_message_id: int | None = None):
-        caption_parts = self._caption_parts(caption)
-        caption = caption_parts[0] if caption_parts else ""
-        result = await self._retry(
-            lambda: self._bot.send_voice(
-                chat_id=self._chat_id,
-                voice=InputFile(io.BytesIO(data), filename="voice.ogg"),
-                caption=caption or None,
-                parse_mode=ParseMode.HTML,
-                message_thread_id=message_thread_id,
-                **self._reply_kwargs(reply_to_message_id),
-            )
+        parts = self._caption_parts(caption)
+        opts = dict(
+            chat_id=self._chat_id, caption=parts[0] if parts else None,
+            parse_mode=ParseMode.HTML, message_thread_id=message_thread_id,
+            **self._reply_kwargs(reply_to_message_id),
         )
+        result = await self._send_api(
+            "send_voice", opts, file_field="voice",
+            data=data, filename="voice.ogg")
         if result is None:
             log.info("send_voice failed, falling back to send_audio")
-            result = await self._retry(
-                lambda: self._bot.send_audio(
-                    chat_id=self._chat_id,
-                    audio=InputFile(io.BytesIO(data), filename="audio.m4a"),
-                    caption=caption or None,
-                    parse_mode=ParseMode.HTML,
-                    message_thread_id=message_thread_id,
-                    **self._reply_kwargs(reply_to_message_id),
-                )
-            )
-        await self._send_caption_remainder(caption_parts, result, message_thread_id)
+            result = await self._send_api(
+                "send_audio", opts, file_field="audio",
+                data=data, filename="audio.m4a")
+        await self._send_caption_remainder(parts, result, message_thread_id)
         return result
 
     async def send_sticker(self, data: bytes, message_thread_id: int | None = None,
                            reply_to_message_id: int | None = None):
-        return await self._retry(
-            lambda: self._bot.send_sticker(
-                chat_id=self._chat_id,
-                sticker=InputFile(io.BytesIO(data), filename="sticker.webp"),
-                message_thread_id=message_thread_id,
-                **self._reply_kwargs(reply_to_message_id),
-            )
-        )
+        return await self._send_api(
+            "send_sticker", dict(
+                chat_id=self._chat_id, message_thread_id=message_thread_id,
+                **self._reply_kwargs(reply_to_message_id)),
+            file_field="sticker", data=data, filename="sticker.webp")
