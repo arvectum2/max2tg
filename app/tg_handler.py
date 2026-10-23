@@ -25,6 +25,8 @@ from app.history_ui import (
 )
 from app.tg_sender import TelegramSender
 from app.topics import TopicStore
+from app.chat_preferences import get_chat_prefs
+from app.chat_settings_ui import cmd_chatsettings,callback_chatsettings
 
 log = logging.getLogger(__name__)
 
@@ -219,6 +221,11 @@ async def _on_topic_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if not target:
         return
     message, max_chat_id, max_client = target
+    if not get_chat_prefs(context.bot_data[TOPIC_STORE_KEY],max_chat_id).sync:
+        await message.reply_text(
+            "⏸️ Синхронизация этого чата приостановлена. "
+            "Включи её командой /chatsettings, затем отправь сообщение ещё раз.")
+        return
     if not message.text:
         return
 
@@ -255,6 +262,8 @@ async def _on_edited_topic_message(
     if not target:
         return
     message, chat_id, client = target
+    if not get_chat_prefs(context.bot_data[TOPIC_STORE_KEY],chat_id).sync:
+        return
     if not client or not message.text:
         return
     mapping: TopicStore = context.bot_data[TOPIC_STORE_KEY]
@@ -297,6 +306,8 @@ async def _on_message_reaction(
     if found is None:
         return
     chat_id, max_id = found
+    if not get_chat_prefs(mapping,chat_id).sync:
+        return
     if not str(max_id).isdigit():
         return
     new = event.new_reaction or []
@@ -331,6 +342,16 @@ async def _on_topic_media(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not target:
         return
     message, max_chat_id, max_client = target
+    prefs=get_chat_prefs(context.bot_data[TOPIC_STORE_KEY],max_chat_id)
+    if not prefs.sync:
+        await message.reply_text(
+            "⏸️ Синхронизация приостановлена. /chatsettings — включить.")
+        return
+    if not prefs.media:
+        await message.reply_text(
+            "🚫 Медиа отключены для этого чата. "
+            "Разреши вложения через /chatsettings.")
+        return
 
     if not max_client:
         await message.reply_text("⚠️ MAX не подключён.")
@@ -543,7 +564,8 @@ async def _bootstrap_new_topic(context: ContextTypes.DEFAULT_TYPE,
         context.bot, supergroup_id, max_client, max_chat_id, thread_id,
     )
 
-    history_limit = _history_import_limit(topic_store)
+    history_limit = get_chat_prefs(topic_store,max_chat_id).effective_history(
+        _history_import_limit(topic_store))
     if history_limit == 0:
         return 0
 
@@ -829,7 +851,8 @@ def _menu_chat_title(resolver, chat_id) -> str:
     return str(title)
 
 
-def _menu_entries(resolver, topic_store: TopicStore) -> list[tuple]:
+def _menu_entries(resolver, topic_store: TopicStore,
+                  *, archived: bool = False) -> list[tuple]:
     entries = []
     chat_ids = set(resolver.chats) | set(resolver.chats_raw)
     for chat_id in chat_ids:
@@ -839,6 +862,8 @@ def _menu_entries(resolver, topic_store: TopicStore) -> list[tuple]:
             continue
         if raw.get("status") in ("LEFT", "CLOSED"):
             continue
+        if get_chat_prefs(topic_store,chat_id).archived != archived:
+            continue
         title = _menu_chat_title(resolver, chat_id)
         entries.append((title.casefold(), chat_id, title, ctype,
                         topic_store.get_topic(chat_id)))
@@ -846,8 +871,9 @@ def _menu_entries(resolver, topic_store: TopicStore) -> list[tuple]:
     return entries
 
 
-def _menu_list_markup(resolver, topic_store: TopicStore, page: int = 0):
-    entries = _menu_entries(resolver, topic_store)
+def _menu_list_markup(resolver, topic_store: TopicStore, page: int = 0,
+                      archived: bool = False):
+    entries = _menu_entries(resolver, topic_store, archived=archived)
     page_count = max(1, (len(entries) + _MENU_PAGE_SIZE - 1) // _MENU_PAGE_SIZE)
     page = max(0, min(page, page_count - 1))
     start = page * _MENU_PAGE_SIZE
@@ -862,14 +888,18 @@ def _menu_list_markup(resolver, topic_store: TopicStore, page: int = 0):
     if page_count > 1:
         nav = []
         if page > 0:
-            nav.append(InlineKeyboardButton("←", callback_data=f"menu:list:{page - 1}"))
+            nav.append(InlineKeyboardButton("←", callback_data=f"menu:{'archived' if archived else 'list'}:{page - 1}"))
         nav.append(InlineKeyboardButton(f"{page + 1}/{page_count}", callback_data="menu:noop"))
         if page + 1 < page_count:
-            nav.append(InlineKeyboardButton("→", callback_data=f"menu:list:{page + 1}"))
+            nav.append(InlineKeyboardButton("→", callback_data=f"menu:{'archived' if archived else 'list'}:{page + 1}"))
         rows.append(nav)
     rows.append([
         InlineKeyboardButton("🔎 Поиск в MAX", callback_data="menu:search"),
-        InlineKeyboardButton("🔄 Обновить", callback_data=f"menu:list:{page}"),
+        InlineKeyboardButton("🔄 Обновить", callback_data=f"menu:{'archived' if archived else 'list'}:{page}"),
+    ])
+    rows.append([
+        InlineKeyboardButton("← Активные чаты" if archived else "🗃 Архивные чаты",
+                             callback_data="menu:list:0" if archived else "menu:archived:0"),
     ])
     rows.append([
         InlineKeyboardButton("⚙️ Настройки", callback_data="settings:open"),
@@ -1025,6 +1055,9 @@ def _management_keyboard(max_chat_id, thread_id: int, *, is_dm: bool = False,
             callback_data=f"leave:ask:{thread_id}:{max_chat_id}",
         )])
     if thread_id > 0:
+        rows.append([InlineKeyboardButton(
+            "⚙️ Настройки чата", callback_data=f"chatpref:show:{max_chat_id}",
+        )])
         rows.append([InlineKeyboardButton(
             "🔎 Поиск сообщений", callback_data="find:help",
         )])
@@ -1239,7 +1272,12 @@ async def _cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         resolver, topic_store, page=0,
     )
     if total == 0:
-        await message.reply_text("Не вижу активных чатов MAX.", do_quote=False)
+        await message.reply_text(
+            "В списке нет активных MAX-чатов. "
+            "Архивные можно открыть кнопкой ниже.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🗃 Архивные чаты",callback_data="menu:archived:0")
+            ]]),do_quote=False)
         return
 
     await message.reply_text(
@@ -1724,7 +1762,9 @@ async def _on_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
         return
 
-    if query.data == "menu:list" or query.data.startswith("menu:list:"):
+    if (query.data == "menu:list" or query.data.startswith("menu:list:")
+        or query.data.startswith("menu:archived:")):
+        archived=query.data.startswith("menu:archived:")
         context.user_data[_SEARCH_WAITING_KEY] = False
         if resolver is None:
             await query.edit_message_text("⚠️ Список MAX-чатов пока недоступен.")
@@ -1734,14 +1774,20 @@ async def _on_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         except ValueError:
             page = 0
         markup, page, page_count, total = _menu_list_markup(
-            resolver, topic_store, page=page,
+            resolver, topic_store, page=page, archived=archived,
         )
         if total == 0:
-            await query.edit_message_text("Не вижу активных чатов MAX.")
+            await query.edit_message_text(
+                "Архив пуст." if archived else "В активном списке нет чатов MAX.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(
+                        "← Мои чаты" if archived else "🗃 Архивные чаты",
+                        callback_data="menu:list:0" if archived else "menu:archived:0")
+                ]]))
             return
         try:
             await query.edit_message_text(
-                f"<b>MAX-чаты</b> · {total}\n"
+                f"<b>{'Архив MAX' if archived else 'MAX-чаты'}</b> · {total}\n"
                 f"Страница {page + 1}/{page_count}. ✅ — Telegram-топик уже создан.",
                 parse_mode="HTML",
                 reply_markup=markup,
@@ -1839,7 +1885,12 @@ HELP_TEXT = (
 
 
 HELP_TEXT += (
-    "\n\n<b>История и сообщения</b>\n"
+    "\n\n<b>Управление чатами</b>\n"
+    "/chatsettings — внутри темы: синхронизация, уведомления, медиа, "
+    "история, архив и имя темы.\n"
+    "Архив скрывает чат из списка, но не удаляет тему.\n"
+    "/intro — обновить карточку и аватар MAX вручную.\n"
+    "\n<b>История и сообщения</b>\n"
     "/find слово — искать сообщения в этой теме (в General — во всех).\n"
     "/findall слово — искать по подключённым MAX-чатам.\n"
     "/find с:2026-10-01 по:2026-10-23 — поиск по датам (МСК).\n"
@@ -2406,6 +2457,7 @@ def build_tg_app(token: str, max_client: MaxClient, supergroup_id: str,
                                    cmd_find(update,context,all_chats=True),
                                    filters=chat_filter))
     app.add_handler(CommandHandler("history", cmd_history, filters=chat_filter))
+    app.add_handler(CommandHandler("chatsettings", cmd_chatsettings, filters=chat_filter))
     app.add_handler(CommandHandler("bind", _cmd_bind, filters=chat_filter))
     app.add_handler(CommandHandler("add", _cmd_add, filters=chat_filter))
     app.add_handler(CommandHandler("profile", _cmd_profile, filters=chat_filter))
@@ -2417,6 +2469,7 @@ def build_tg_app(token: str, max_client: MaxClient, supergroup_id: str,
     app.add_handler(CallbackQueryHandler(_on_health_callback, pattern=r"^health:"))
     app.add_handler(CallbackQueryHandler(callback_find, pattern=r"^find:"))
     app.add_handler(CallbackQueryHandler(callback_history, pattern=r"^history:"))
+    app.add_handler(CallbackQueryHandler(callback_chatsettings, pattern=r"^chatpref:"))
     app.add_handler(CallbackQueryHandler(_on_menu_callback, pattern=r"^menu:"))
     app.add_handler(CallbackQueryHandler(_on_settings_callback, pattern=r"^settings:"))
     app.add_handler(CallbackQueryHandler(_on_search_callback, pattern=r"^search:"))

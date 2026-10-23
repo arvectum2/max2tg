@@ -18,6 +18,7 @@ from telegram.error import BadRequest, TelegramError, TimedOut
 
 from app.outbox import OutboxStore
 from app.max_formatting import format_max_html
+from app.chat_preferences import get_chat_prefs
 from app.topics import TopicStore
 
 log = logging.getLogger(__name__)
@@ -131,7 +132,10 @@ class MessageSync:
         if parsed is None:
             return False
         kind, chat_id, mid, body = parsed
-        if self.topics.get_topic(chat_id) is None:
+        if (self.topics.get_topic(chat_id) is None or
+            not get_chat_prefs(self.topics,chat_id).sync):
+            # Paused means *all* directions, including MAX edits/deletes.
+            # Do not mark the event APPLIED while offline from this chat.
             return False
         key = self._event_key(kind,chat_id,mid,body)
         self.db.execute(
@@ -149,6 +153,8 @@ class MessageSync:
         if row is None or row["state"] in ("APPLIED","BLOCKED","UNKNOWN"):
             return False
         kind, chat_id, mid = row["kind"], row["chat_id"], row["max_id"]
+        if not get_chat_prefs(self.topics,chat_id).sync:
+            return False
         payload = json.loads(row["payload"])
         tg_id = self.topics.tg_for_max_message(chat_id,mid)
         if tg_id is None:

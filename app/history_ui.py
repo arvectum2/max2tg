@@ -14,6 +14,7 @@ import logging
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import TelegramError
 
+from app.chat_preferences import get_chat_prefs
 from app.history_nav import (
     SEARCH_MAX_CHATS, parse_search, search_page, history_position,
     set_history_position, import_next_page, timestamp_ms, HISTORY_PAGE,
@@ -274,6 +275,11 @@ async def callback_history(update,context):
         query.message.message_thread_id!=thread_id):
         return
     action=tokens[1]
+    if action=="load" and not get_chat_prefs(store,chat_id).sync:
+        await query.message.reply_text(
+            "⏸️ Синхронизация этого MAX-чата приостановлена. "
+            "Возобнови её в /chatsettings перед импортом.")
+        return
     if action=="reset":
         set_history_position(store,chat_id,None)
         await query.message.reply_text(

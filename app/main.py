@@ -110,6 +110,7 @@ async def main():
             BotCommand("add", "Подключить чат/канал MAX по ссылке"),
             BotCommand("help", "Справка по bridge"),
             BotCommand("status", "Диагностика MAX2TG"),
+            BotCommand("chatsettings", "Настройки текущего MAX-чата"),
         ])
         await tg_app.start()
         await ensure_management_panel(

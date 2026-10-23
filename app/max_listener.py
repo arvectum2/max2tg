@@ -9,6 +9,7 @@ from app.resolver import ContactResolver
 from app.tg_sender import TelegramSender
 from app.outbox import OutboxStore, current_delivery
 from app.max_formatting import format_max_html
+from app.chat_preferences import get_chat_prefs
 from app.max_media import (
     photo_url, file_url, video_url, video_preview_url, first_media_url,
     media_filename, media_size, duration_seconds,
@@ -364,7 +365,22 @@ async def _send_message_content(
         if isinstance(a, dict)
         and a.get("_type") not in ("CONTROL", "WIDGET", "INLINE_KEYBOARD", "SHARE", None)
     ]
-    body = _message_body(msg)
+    if (msg.chat_id is not None and
+        not get_chat_prefs(sender.topic_store,msg.chat_id).media and
+        meaningful_attaches):
+        # Preserve MAX sender/text and number/types of attachments,
+        # without downloading media or exposing secret CDN URLs.
+        counts={}
+        for item in meaningful_attaches:
+            name=str(item.get("_type") or "FILE")[:24]
+            counts[name]=counts.get(name,0)+1
+        attachments=", ".join(f"{kind}: {amount}" for kind,amount in
+                              sorted(counts.items()))
+        meaningful_attaches=[]
+        body=_message_body(msg)
+        body+=f"\n<i>[вложения отключены в настройках: {escape(attachments)}]</i>"
+    else:
+        body = _message_body(msg)
 
     first_sent = None
     if meaningful_attaches:
@@ -695,7 +711,8 @@ async def _bootstrap_chat_topic(client: MaxClient, sender: TelegramSender,
     await post_topic_intro(
         sender.bot, sender.chat_id, client, chat_id, thread_id,
     )
-    history_limit = sender.topic_store.get_ui("history_import_limit", 20)
+    history_limit = get_chat_prefs(sender.topic_store,chat_id).effective_history(
+        sender.topic_store.get_ui("history_import_limit",20))
     await import_recent_history(
         client, sender, resolver, chat_id, thread_id, history_limit,
     )
@@ -927,7 +944,7 @@ async def catch_up_known_chats(
         if _is_max_service_dialog(resolver, chat_id):
             continue
         topic_id = sender.topic_store.get_topic(chat_id)
-        if topic_id is None:
+        if topic_id is None or not get_chat_prefs(sender.topic_store,chat_id).sync:
             continue
         async with chat_locks.setdefault(str(chat_id), asyncio.Lock()):
             recovered += await catch_up_chat_history(
@@ -1041,6 +1058,11 @@ def create_max_client(
     @client.on_message
     async def handle_message(msg: MaxMessage):
         async with chat_locks.setdefault(str(msg.chat_id), asyncio.Lock()):
+            if not get_chat_prefs(sender.topic_store,msg.chat_id).sync:
+                # Explicit pause: do not enqueue an undeliverable message or
+                # mark its MAX ID as forwarded. Catch-up can restore it later.
+                log.info("Live MAX forwarding paused for chat=%s",msg.chat_id)
+                return
             async def deliver():
                 await _handle_message_serial(msg)
                 mapped_id = (sender.topic_store.tg_for_max_message(
@@ -1131,7 +1153,8 @@ def create_max_client(
             await post_topic_intro(
                 sender.bot, sender.chat_id, client, msg.chat_id, thread_id,
             )
-            history_limit = sender.topic_store.get_ui("history_import_limit", 20)
+            history_limit = get_chat_prefs(sender.topic_store,msg.chat_id).effective_history(
+                sender.topic_store.get_ui("history_import_limit",20))
             await import_recent_history(
                 client, sender, resolver, msg.chat_id, thread_id, history_limit,
             )

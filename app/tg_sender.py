@@ -13,6 +13,7 @@ from telegram.request import HTTPXRequest
 
 from app.topics import TopicStore
 from app.outbox import current_delivery
+from app.chat_preferences import get_chat_prefs
 
 log = logging.getLogger(__name__)
 
@@ -169,7 +170,9 @@ class TelegramSender:
         if existing is not None:
             stored = self._topics.get_title(max_chat_id) or ""
             stored_is_placeholder = _looks_numeric(stored) or stored.strip().lower() in {"none", "unknown"}
-            if title and title != stored and stored_is_placeholder and not _looks_numeric(title):
+            if (title and title != stored and not _looks_numeric(title)
+                and (stored_is_placeholder or get_chat_prefs(
+                    self._topics,max_chat_id).title_sync)):
                 try:
                     await self._bot.edit_forum_topic(
                         chat_id=self._chat_id, message_thread_id=existing, name=title
@@ -248,6 +251,14 @@ class TelegramSender:
                 await asyncio.sleep(2 * attempt)
         return None
 
+    def _notification_kwargs(self,thread_id):
+        store=getattr(self,"_topics",None)
+        if thread_id is not None and store is not None:
+            cid=store.chat_for_topic(thread_id)
+            if cid is not None and get_chat_prefs(self._topics,cid).mute:
+                return {"disable_notification":True}
+        return {}
+
     async def _send_api(self, method: str, kwargs: dict, *,
                         file_field: str | None = None,
                         data: bytes | None = None,
@@ -257,6 +268,8 @@ class TelegramSender:
         Outside that scope keep the old behaviour for control/management
         messages. Inside, every part is durably recorded before calling TG.
         """
+        kwargs=dict(kwargs)
+        kwargs.update(self._notification_kwargs(kwargs.get("message_thread_id")))
         async def call():
             actual = dict(kwargs)
             if file_field:
@@ -352,7 +365,8 @@ class TelegramSender:
         packed=cached if cached is not None else self._pack_album(photos)
         saved_photos=self._unpack_album(packed)
         options=dict(chat_id=self._chat_id,message_thread_id=message_thread_id,
-                     **self._reply_kwargs(reply_to_message_id))
+                     **self._reply_kwargs(reply_to_message_id),
+                     **self._notification_kwargs(message_thread_id))
 
         async def call():
             media=[
