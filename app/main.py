@@ -15,6 +15,8 @@ from app.tg_sender import TelegramSender
 from app.topics import TopicStore
 from app.outbox import OutboxStore
 from app.message_sync import MessageSync
+from app.health import HealthSupervisor
+from app.polling import bind_polling_to_max
 
 threading.stack_size(524288)
 
@@ -107,29 +109,34 @@ async def main():
             BotCommand("search", "Найти человека, группу или канал MAX"),
             BotCommand("add", "Подключить чат/канал MAX по ссылке"),
             BotCommand("help", "Справка по bridge"),
+            BotCommand("status", "Диагностика MAX2TG"),
         ])
         await tg_app.start()
-        await tg_app.updater.start_polling(
-            drop_pending_updates=True,
-            allowed_updates=Update.ALL_TYPES,
-        )
         await ensure_management_panel(
             tg_app.bot, settings.tg_chat_id, topic_store,
         )
         await ensure_quick_menu(
             tg_app.bot, settings.tg_chat_id, topic_store,
         )
-        log.info("Telegram polling started (reply → Max enabled)")
+        log.info("Telegram updates will be processed after MAX is authorized")
     else:
         log.info("Reply to Max disabled (REPLY_ENABLED=false)")
 
+    bind_polling_to_max(client,tg_app)
+    health = HealthSupervisor(client,sender,outbox,topic_store,
+                              tg_app,settings.state_dir)
+    client.health = health
+    health_task = asyncio.create_task(health.monitor(), name="max2tg-health")
     log.info("Starting Max listener...")
     try:
         await client.run()
     finally:
+        health_task.cancel()
+        await asyncio.gather(health_task,return_exceptions=True)
         log.info("Shutting down...")
         if tg_app:
-            await tg_app.updater.stop()
+            if tg_app.updater.running:
+                await tg_app.updater.stop()
             await tg_app.stop()
             await tg_app.shutdown()
         await sender.stop()

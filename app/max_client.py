@@ -117,6 +117,9 @@ class MaxClient:
         self._ws: aiohttp.ClientWebSocketResponse | None = None
         self._seq = 0
         self._my_id = None
+        self._authorized = False
+        self._auth_required = False
+        self._last_rx_monotonic = None
         self._on_ready_cb = None
         self._on_message_cb = None
         self._on_mutation_cb = None
@@ -221,6 +224,8 @@ class MaxClient:
                         self.WS_URL, headers=_WS_HEADERS
                     ) as ws:
                         self._ws = ws
+                        self._authorized = False
+                        self._last_rx_monotonic = time.monotonic()
                         self._seq = 0
                         self._pending.clear()
 
@@ -257,6 +262,8 @@ class MaxClient:
                 finally:
                     if self._heartbeat_task:
                         self._heartbeat_task.cancel()
+                    self._authorized = False
+                    self._ws = None
                     for fut in self._pending.values():
                         if not fut.done():
                             fut.cancel()
@@ -278,6 +285,7 @@ class MaxClient:
     # ── event dispatcher ───────────────────────────────────────────
 
     async def _handle(self, data: dict):
+        self._last_rx_monotonic = time.monotonic()
         op = data.get("opcode")
         cmd = data.get("cmd")
         seq = data.get("seq")
@@ -316,6 +324,8 @@ class MaxClient:
                 )
 
             elif op == OpCode.AUTH_SNAPSHOT and cmd == 1:
+                self._authorized = True
+                self._auth_required = False
                 self._my_id = payload.get("profile", {}).get("id")
                 log.info("Authorized! my_id=%s", self._my_id)
                 if self.debug:
@@ -327,6 +337,16 @@ class MaxClient:
                     # whose responses can only be consumed by this same loop.
                     task = asyncio.create_task(self._on_ready_cb(payload))
                     task.add_done_callback(_log_task_exception)
+
+            elif op == OpCode.AUTH_SNAPSHOT and cmd == 3:
+                self._authorized = False
+                self._auth_required = True
+                log.warning("MAX authentication rejected; interactive re-login required")
+
+            elif op == OpCode.LOGOUT and cmd == 0:
+                self._authorized = False
+                self._auth_required = True
+                log.warning("MAX logout event received; interactive re-login required")
 
             elif op == OpCode.DISPATCH:
                 body = payload.get("message") if isinstance(payload,dict) else None

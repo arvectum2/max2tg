@@ -19,6 +19,7 @@ from telegram.ext import (
 
 from app.max_client import MaxClient
 from app.message_sync import REACTION_EMOJI
+from app.health import status_text
 from app.tg_sender import TelegramSender
 from app.topics import TopicStore
 
@@ -1049,6 +1050,7 @@ def _settings_keyboard() -> InlineKeyboardMarkup:
 
 def _general_management_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🩺 Состояние моста", callback_data="health:refresh")],
         [InlineKeyboardButton("💬 Мои чаты", callback_data="menu:list:0")],
         [InlineKeyboardButton("🔎 Поиск в MAX", callback_data="menu:search")],
         [InlineKeyboardButton("⚙️ Настройки", callback_data="settings:open")],
@@ -1833,6 +1835,39 @@ async def _cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                               disable_web_page_preview=True)
 
 
+async def _cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin-only diagnostics without content/credentials and network mutation."""
+    if update.message is None or not _is_admin_user(update,context):
+        return
+    client=context.bot_data.get(MAX_CLIENT_KEY)
+    health=getattr(client,"health",None)
+    report=health.snapshot() if health is not None else None
+    await update.message.reply_text(
+        status_text(report),parse_mode="HTML",do_quote=False,
+    )
+
+
+async def _on_health_callback(update: Update,
+                              context: ContextTypes.DEFAULT_TYPE) -> None:
+    query=update.callback_query
+    if query is None or not _is_admin_user(update,context):
+        return
+    await _answer_callback_safely(query)
+    if query.data == "health:reauth":
+        message=(
+            "🔐 <b>Повторный вход в MAX</b>\n\n"
+            "Открой на Mac mini профиль Chrome «MAX» и войди в web.max.ru "
+            "по SMS. Не пересылай коды авторизации в Telegram.\n\n"
+            "Session-watch проверяет новую сессию и перезапускает "
+            "MAX2TG, если токен обновился."
+        )
+    else:
+        client=context.bot_data.get(MAX_CLIENT_KEY)
+        health=getattr(client,"health",None)
+        message=status_text(health.snapshot() if health is not None else None)
+    await query.message.reply_text(message,parse_mode="HTML",do_quote=False)
+
+
 async def _cmd_del(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Ask the user to confirm deletion of the current topic. The actual
     deletion happens in ``_on_del_callback`` when the inline button is
@@ -2353,6 +2388,8 @@ def build_tg_app(token: str, max_client: MaxClient, supergroup_id: str,
     app.add_handler(CommandHandler("del", _cmd_del, filters=chat_filter))
     app.add_handler(CommandHandler("leave", _cmd_leave, filters=chat_filter))
     app.add_handler(CommandHandler("help", _cmd_help, filters=chat_filter))
+    app.add_handler(CommandHandler("status", _cmd_status, filters=chat_filter))
+    app.add_handler(CallbackQueryHandler(_on_health_callback, pattern=r"^health:"))
     app.add_handler(CallbackQueryHandler(_on_menu_callback, pattern=r"^menu:"))
     app.add_handler(CallbackQueryHandler(_on_settings_callback, pattern=r"^settings:"))
     app.add_handler(CallbackQueryHandler(_on_search_callback, pattern=r"^search:"))

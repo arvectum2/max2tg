@@ -32,7 +32,7 @@
 - [x] **P0.3 — edit/delete/reactions (безопасный поддерживаемый срез 23.10.2026).** Проверка реальных MAX opcodes;
   двусторонние изменения/удаления/реакции только если API поддерживает,
   корректное отображение и idempotency.
-- [ ] **P0.4 — health + autorecovery.** Монитор WebSocket, Telegram API/polling,
+- [x] **P0.4 — health + autorecovery (первый рабочий срез 23.10.2026).** Монитор WebSocket, Telegram API/polling,
   MAX auth, queue lag, cursor, topic state; автоперезапуск, controlled retries,
   уведомление с действием REAUTH_REQUIRED.
 - [ ] **P0.5 — failure acceptance.** Тест сетевого простоя, MAX logout/login,
@@ -83,14 +83,13 @@
 - [ ] GitHub arvectum2/max2tg (main) — source of truth; GitVerse — зеркало;
   выпуск только после проверенного релиза.
 
-**Следующее рабочее задание:** P0.4 (Health + autorecovery). P0.1—P0.3
-выполнены на уровне кода и тестов с задокументированными ограничениями.
-P0.3 покрывает MAX/TG edit и reaction в обе стороны и одиночное MAX→TG
-delete для сообщений самого бота. Обычные Telegram-delete события
-Bot API не передаёт, а опасная операция MAX opcode 66 отключена.
-Физические тесты отказов остаются в P0.5. Технические границы описаны
-в docs/RELIABILITY_P0_1.md, docs/RELIABILITY_P0_2.md и
-docs/RELIABILITY_P0_3.md.
+**Следующее рабочее задание:** P0.5 (failure acceptance). P0.1—P0.4
+реализованы на уровне кода и регрессионных тестов. P0.4 добавляет
+health.json, /status, алерты, ограниченное переподключение MAX и Telegram
+polling, сохранение ожидающих Telegram updates при коротких отключениях.
+В P0.5 нужны физические/сквозные испытания с учётом границ MAX-протокола,
+Telegram-хранения updates и неопределённых результатов отправки.
+Отчёты: docs/RELIABILITY_P0_1.md — docs/RELIABILITY_P0_4.md.
 
 **Последовательность:** P0.1 → P0.2 → P0.3 → P0.4 → P0.5 → P1 →
 SaaS prototype → SaaS beta → коммерческий запуск.
