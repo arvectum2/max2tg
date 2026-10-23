@@ -69,9 +69,15 @@
 
 - [ ] Onboarding: /start → Подключить MAX → временная SMS-веб-сессия →
   ONLINE/REAUTH/Disconnect. Код SMS и секреты не сохранять в логах.
-- [ ] Multi-user: User/MaxSession/TelegramConnection, изолированные browser
-  profiles и workers, Supervisor, ACL, PostgreSQL, encrypted session state,
-  backup, health checks, worker crash recovery.
+- [x] **P2.1 — локальный Session Capsule прототип (первый срез 23.10.2026).**
+  Реестр User/MaxSession, независимые state/log/profile каталоги,
+  приватные учётные данные, worker на сессию, flock от двойного запуска,
+  supervisor с backoff/health/stop, два параллельных синтетических
+  worker-процесса проверены: docs/SAAS_P2_1_CAPSULES.md.
+- [ ] Multi-user production-изоляция и управление: единый TG dispatcher
+  для публичного бота, независимые интерактивные browser login/sessions,
+  ACL, PostgreSQL, encrypted session state, backup, health checks
+  на выделенной инфраструктуре.
 - [ ] Личные темы бота при подтверждённой поддержке нужного режима
   Telegram Bot API; fallback — приватная форум-супергруппа.
 - [ ] Веб-кабинет и панель оператора: подключения, статусы, очередь, ошибки,
@@ -95,10 +101,11 @@
 - [ ] GitHub arvectum2/max2tg (main) — source of truth; GitVerse — зеркало;
   выпуск только после проверенного релиза.
 
-**Следующее рабочее задание:** P1 UX field acceptance на
-изолированных MAX/TG тестовых аккаунтах; затем P2 multi-user прототип
-на Mac mini и замеры стоимости сессии. P1.1—P1.4 реализованы и
-проверены автоматическими тестами, включая персистентность настроек.
+**Следующее рабочее задание:** реальные независимые MAX/TG тестовые
+аккаунты для P0.5b/P1 field acceptance и подключения двух настоящих
+Session Capsules. P2.1 уже реализован и испытан на двух синтетических
+процессах, но это НЕ подтверждение реального multi-user обмена
+сообщениями. Затем — центральный Telegram dispatcher и onboarding.
 P0.1—P0.4 работают, P0.5a выполнен на изолированных сбойных испытаниях.
 P0.5b остаётся обязательным инфраструктурным этапом перед полноценным
 SaaS SLA. Неоднозначные разрывы истории отмечаются HISTORY_GAP вместо

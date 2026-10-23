@@ -21,7 +21,10 @@ class Settings:
 
 
 def load_settings() -> Settings:
-    load_dotenv()
+    # Isolated SaaS workers must NEVER load the personal bridge .env from
+    # the checkout, even when a capsule credential is missing.
+    if os.environ.get("MAX2TG_NO_DOTENV") != "1":
+        load_dotenv()
 
     required = ["MAX_TOKEN", "MAX_DEVICE_ID", "TG_BOT_TOKEN", "TG_CHAT_ID"]
     missing = [k for k in required if not os.environ.get(k)]
