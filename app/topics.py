@@ -190,6 +190,9 @@ class TopicStore:
         rec = self._chats.pop(chat_key, None)
         message_map = self._messages.pop(chat_key, {})
         self._sync.pop(chat_key, None)
+        pagination=self._ui.get("manual_history_from")
+        if isinstance(pagination,dict):
+            pagination.pop(chat_key,None)
         for tg_message_id in message_map.values():
             self._by_tg_message.pop((chat_key, int(tg_message_id)), None)
 

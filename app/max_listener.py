@@ -599,6 +599,12 @@ async def import_recent_history(
             completed = await deliver()
         if completed:
             imported += 1
+        else:
+            # Keep chronological ordering and stop at the first failed
+            # delivery. The caller must not advance its pagination cursor.
+            log.warning("History import paused on unconfirmed delivery chat=%s",
+                        chat_id)
+            break
 
     log.info("Imported %d/%d history messages for chat=%s",
              imported, len(raw_messages), chat_id)
@@ -940,6 +946,9 @@ def create_max_client(
     client.resolver = resolver
     client._tg_sender = sender
     chat_locks: dict[str, asyncio.Lock] = {}
+    # Explicit user-triggered older-history imports share the same lock as
+    # live events and catch-up, preventing duplicate outbox processing.
+    client._history_locks = chat_locks
     background_outbox = None
 
     async def recover_outbox():

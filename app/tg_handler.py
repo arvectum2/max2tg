@@ -20,6 +20,9 @@ from telegram.ext import (
 from app.max_client import MaxClient
 from app.message_sync import REACTION_EMOJI
 from app.health import status_text
+from app.history_ui import (
+    cmd_find, cmd_history, callback_find, callback_history,
+)
 from app.tg_sender import TelegramSender
 from app.topics import TopicStore
 
@@ -44,6 +47,7 @@ _QUICK_MENU_MESSAGE_KEY = "quick_menu_message_id"
 _HISTORY_LIMIT_UI_KEY = "history_import_limit"
 _HISTORY_LIMIT_DEFAULT = 20
 _HISTORY_SETTING_WAITING_KEY = "awaiting_history_limit"
+_MESSAGE_SEARCH_KEY = "message_find_session"
 
 # Telegram entity type → MAX element type. The MAX names match what the
 # existing codebase used (STRONG) and what MAX renders for the formatting
@@ -1022,6 +1026,12 @@ def _management_keyboard(max_chat_id, thread_id: int, *, is_dm: bool = False,
         )])
     if thread_id > 0:
         rows.append([InlineKeyboardButton(
+            "🔎 Поиск сообщений", callback_data="find:help",
+        )])
+        rows.append([InlineKeyboardButton(
+            "📜 Загрузить историю", callback_data=f"history:show:{max_chat_id}",
+        )])
+        rows.append([InlineKeyboardButton(
             "🗑 Удалить только Telegram-топик",
             callback_data=f"del:ask:{thread_id}:{max_chat_id}",
         )])
@@ -1053,6 +1063,7 @@ def _general_management_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🩺 Состояние моста", callback_data="health:refresh")],
         [InlineKeyboardButton("💬 Мои чаты", callback_data="menu:list:0")],
         [InlineKeyboardButton("🔎 Поиск в MAX", callback_data="menu:search")],
+        [InlineKeyboardButton("🔍 Поиск сообщений", callback_data="find:help")],
         [InlineKeyboardButton("⚙️ Настройки", callback_data="settings:open")],
     ])
 
@@ -1827,6 +1838,15 @@ HELP_TEXT = (
 )
 
 
+HELP_TEXT += (
+    "\n\n<b>История и сообщения</b>\n"
+    "/find слово — искать сообщения в этой теме (в General — во всех).\n"
+    "/findall слово — искать по подключённым MAX-чатам.\n"
+    "/find с:2026-10-01 по:2026-10-23 — поиск по датам (МСК).\n"
+    "/history — в текущей теме вручную загрузить старые сообщения порциями."
+)
+
+
 async def _cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.message
     if message is None:
@@ -2381,6 +2401,11 @@ def build_tg_app(token: str, max_client: MaxClient, supergroup_id: str,
     quick_menu_filter = filters.Regex(r"^☰ Меню$")
     app.add_handler(CommandHandler("menu", _cmd_menu, filters=chat_filter))
     app.add_handler(CommandHandler("search", _cmd_search, filters=chat_filter))
+    app.add_handler(CommandHandler("find", cmd_find, filters=chat_filter))
+    app.add_handler(CommandHandler("findall", lambda update, context:
+                                   cmd_find(update,context,all_chats=True),
+                                   filters=chat_filter))
+    app.add_handler(CommandHandler("history", cmd_history, filters=chat_filter))
     app.add_handler(CommandHandler("bind", _cmd_bind, filters=chat_filter))
     app.add_handler(CommandHandler("add", _cmd_add, filters=chat_filter))
     app.add_handler(CommandHandler("profile", _cmd_profile, filters=chat_filter))
@@ -2390,6 +2415,8 @@ def build_tg_app(token: str, max_client: MaxClient, supergroup_id: str,
     app.add_handler(CommandHandler("help", _cmd_help, filters=chat_filter))
     app.add_handler(CommandHandler("status", _cmd_status, filters=chat_filter))
     app.add_handler(CallbackQueryHandler(_on_health_callback, pattern=r"^health:"))
+    app.add_handler(CallbackQueryHandler(callback_find, pattern=r"^find:"))
+    app.add_handler(CallbackQueryHandler(callback_history, pattern=r"^history:"))
     app.add_handler(CallbackQueryHandler(_on_menu_callback, pattern=r"^menu:"))
     app.add_handler(CallbackQueryHandler(_on_settings_callback, pattern=r"^settings:"))
     app.add_handler(CallbackQueryHandler(_on_search_callback, pattern=r"^search:"))

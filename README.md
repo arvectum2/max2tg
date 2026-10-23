@@ -85,6 +85,7 @@
 - Монитор состояния каждые 30 с: /status в Telegram, health.json, алерты, контролируемое восстановление WebSocket/polling и сохранение Telegram updates при рестарте; подробности в docs/RELIABILITY_P0_4.md
 - P1.1: MAX elements[] сохраняются в Telegram HTML для live/history/forwards/media/edits; docs/PERSONAL_UX_P1_1.md
 - P1.2: фотоальбомы, видео по прямой ссылке, оригинальные файлы/голосовые, превью и безопасная маршрутизация неподдерживаемых форматов; docs/PERSONAL_UX_P1_2.md
+- P1.3: /find и /findall для поиска MAX-сообщений по тексту/датам, /history в теме для ручной загрузки по 20 старых сообщений; docs/PERSONAL_UX_P1_3.md
 - P0.5a: пройдены аварийный SIGKILL + автоматический запуск launchd, SQLite locks, частичные отправки и пограничные timestamp-страницы. Полный физический gate — на отдельном стенде, см. docs/RELIABILITY_P0_5.md
 - На Mac mini хранение настроено в /Users/master/.local/state/max2tg/topics.json, а журналы — в ~/Library/Logs/Arvectum/MAX2TG
 - Авто-переподключение к MAX и алёрт при обрыве
