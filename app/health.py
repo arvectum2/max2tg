@@ -51,6 +51,7 @@ def status_text(report: dict | None) -> str:
         f"Изменения: pending {failures.get('PENDING',0)}, "
         f"unknown {failures.get('UNKNOWN',0)}, blocked {failures.get('BLOCKED',0)}",
         f"MAX-темы: {report.get('topics',0)} | курсоры: {report.get('cursors',0)}",
+        f"Проблемы догрузки: {report.get('history_gaps',0)}",
         f"Задержка очереди: {outbox.get('oldest_due_seconds',0)} с",
         f"Диск: {'✅ доступен' if report.get('disk',{}).get('ok') else '⚠️ проблема'}",
     ]
@@ -157,6 +158,9 @@ class HealthSupervisor:
         if counts.get("FAILED",0): issues.append("OUTBOX_FAILED")
         if mutations.get("UNKNOWN",0): issues.append("MUTATION_UNKNOWN")
         if mutations.get("BLOCKED",0): issues.append("MUTATION_BLOCKED")
+        pending_history = self.topics.get_ui("catch_up_warnings", {}) or {}
+        history_gaps = len(pending_history) if isinstance(pending_history,dict) else 0
+        if history_gaps: issues.append("HISTORY_GAP")
 
         return {
             "time":datetime.now(timezone.utc).isoformat(),
@@ -168,6 +172,7 @@ class HealthSupervisor:
             "mutations":mutations,
             "topics":len(self.topics._chats),
             "cursors":len(self.topics._sync),
+            "history_gaps":history_gaps,
             "disk":{"ok":disk_ok,"free_bytes":free},
             "issues":issues,
         }
@@ -213,7 +218,7 @@ class HealthSupervisor:
             self._issue_hits.pop(issue,None)
         important={"REAUTH_REQUIRED","OUTBOX_UNKNOWN","OUTBOX_FAILED",
                    "STATE_DISK","TELEGRAM_POLLING","MUTATION_UNKNOWN",
-                   "MAX_OFFLINE","MAX_STALLED","QUEUE_DELAY"}
+                   "MAX_OFFLINE","MAX_STALLED","QUEUE_DELAY","HISTORY_GAP"}
         alertable=[key for key in report["issues"] if key in important
                    and self._issue_hits.get(key,0)>=3
                    and now-self._alerts.get(key,0)>=ALERT_COOLDOWN]

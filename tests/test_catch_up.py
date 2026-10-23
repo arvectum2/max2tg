@@ -59,7 +59,7 @@ async def test_pagination_persists_cursor_across_restart(tmp_path):
     client.fetch_history = feed([row(i) for i in range(1,9)])
     with patch("app.max_listener.CATCH_UP_BATCH",3):
         assert await catch_up_chat_history(client,sender,client.resolver,42,777,max_pages=5)==7
-    assert client.fetch_history.await_count==3
+    assert client.fetch_history.await_count==4  # timestamp overlap across pages
     disk=TopicStore(str(tmp_path/"topics.json"))
     assert disk.get_history_cursor(42)==8000
     assert disk.tg_for_max_message(42,"8")==555

@@ -647,6 +647,21 @@ async def _reconcile_snapshot_chats(client: MaxClient, sender: TelegramSender,
     return created
 
 
+_CATCH_UP_WARNINGS_KEY = "catch_up_warnings"
+
+
+def _catch_up_warning(store, chat_id, reason: str | None) -> None:
+    """Persist a diagnostic cursor gap without private message contents."""
+    warnings = dict(store.get_ui(_CATCH_UP_WARNINGS_KEY, {}) or {})
+    key = str(chat_id)
+    if reason is None:
+        warnings.pop(key, None)
+    else:
+        warnings[key] = {"reason": reason, "updated": int(time.time())}
+    if warnings != (store.get_ui(_CATCH_UP_WARNINGS_KEY, {}) or {}):
+        store.set_ui(_CATCH_UP_WARNINGS_KEY, warnings)
+
+
 def _max_message_timestamp(message: dict) -> int:
     """MAX history timestamps are milliseconds; ignore invalid records."""
     try:
@@ -688,9 +703,11 @@ async def catch_up_chat_history(
             )
         except Exception:
             log.exception("Catch-up RPC exception for chat=%s", chat_id)
+            _catch_up_warning(store,chat_id,"RPC_ERROR")
             return 0
         if not isinstance(response, dict) or response.get("_max_error"):
             log.warning("Catch-up aborted for chat=%s: failed history RPC", chat_id)
+            _catch_up_warning(store,chat_id,"RPC_ERROR")
             return 0
         entries = [entry for entry in (response.get("messages") or [])
                    if isinstance(entry, dict) and entry.get("id") is not None]
@@ -703,6 +720,7 @@ async def catch_up_chat_history(
         timestamps = [_max_message_timestamp(x) for x in ordered]
         if not all(timestamps):
             log.warning("Catch-up for chat=%s has un-timestamped message", chat_id)
+            _catch_up_warning(store,chat_id,"INVALID_TIMESTAMP")
             return 0
         newest_ts = max(newest_ts, max(timestamps))
 
@@ -738,9 +756,18 @@ async def catch_up_chat_history(
         if len(entries) < CATCH_UP_BATCH:
             reached_start = True
             break
-        next_marker = min(timestamps) - 1
+        # MAX from-time is an exclusive upper boundary. Overlap the
+        # oldest timestamp from the previous page so that multiple messages
+        # sharing one millisecond cannot fall through a page boundary.
+        # Deduplicate the overlap by exact MAX message ID above.
+        next_marker = min(timestamps) + 1
         if next_marker >= older_than or next_marker <= 0:
-            log.warning("Catch-up pagination cannot advance for chat=%s", chat_id)
+            # A full page at one timestamp cannot be paginated safely using
+            # a timestamp-only API. Leave cursor unchanged, never claim that
+            # hidden messages were recovered.
+            log.warning("Catch-up ambiguous timestamp pagination chat=%s; "
+                        "cursor unchanged (manual reconciliation needed)", chat_id)
+            _catch_up_warning(store,chat_id,"TIMESTAMP_TIE")
             return 0
         older_than = next_marker
     else:
@@ -750,6 +777,7 @@ async def catch_up_chat_history(
         return 0
     if exhausted_budget and not found_anchor and not reached_start:
         log.warning("Catch-up history window exceeded chat=%s; no cursor advance", chat_id)
+        _catch_up_warning(store,chat_id,"BUDGET_EXCEEDED")
         return 0
     if not found_anchor and cursor is None:
         # New feature enabled for a pre-existing chat with no matching
@@ -770,9 +798,11 @@ async def catch_up_chat_history(
         if any(store.tg_for_max_message(chat_id, entry["id"]) is None
                for entry in candidates):
             log.warning("Catch-up partially delivered chat=%s; cursor unchanged", chat_id)
+            _catch_up_warning(store,chat_id,"DELIVERY_INCOMPLETE")
             return imported
 
     store.set_history_cursor(chat_id, newest_ts)
+    _catch_up_warning(store,chat_id,None)
     log.info("Catch-up verified chat=%s imported=%d scanned=%d cursor=%s",
              chat_id, imported, len(visited_ids), newest_ts)
     return imported
