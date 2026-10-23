@@ -399,7 +399,87 @@ async def _on_topic_media(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     caption = message.caption or ""
+    outbound=context.bot_data.get(TG_OUTBOUND_KEY)
+    if outbound is not None:
+        # Durable media *intent* is written before Telegram download or
+        # MAX upload. After upload, the attachment is persisted before
+        # MAX SEND_MESSAGE. A crash during preparation can never duplicate
+        # a MAX chat message; a crash during SEND becomes UNKNOWN.
+        kind=None
+        source=None
+        filename="file"
+        mime="application/octet-stream"
+        if message.photo:
+            kind="photo"
+            source=message.photo[-1]
+            filename="photo.jpg"
+            mime="image/jpeg"
+        elif message.voice:
+            kind="voice"
+            source=message.voice
+            filename="voice.ogg"
+            mime="audio/ogg"
+        elif message.audio:
+            kind="audio"
+            source=message.audio
+            filename=message.audio.file_name or "audio.mp3"
+            mime=message.audio.mime_type or "audio/mpeg"
+        elif message.document:
+            kind="document"
+            source=message.document
+            filename=message.document.file_name or "file"
+            mime=message.document.mime_type or "application/octet-stream"
+        elif message.video:
+            kind="video"
+            source=message.video
+            filename=message.video.file_name or "video.mp4"
+            mime=message.video.mime_type or "video/mp4"
+        if kind is None:
+            return
+        file_id=getattr(source,"file_id",None)
+        if not isinstance(file_id,str) or not file_id:
+            await message.reply_text("⚠️ Telegram не предоставил ID вложения.")
+            return
+        filename=str(filename).replace(chr(92),"/").split("/")[-1][:180]
+        size=getattr(source,"file_size",None)
+        if type(size) is not int or size<0:
+            size=0
+        payload={
+            "text":caption,
+            "elements":_entities_to_max_elements(caption,message.caption_entities),
+            "link":_max_reply_link(message,context.bot_data[TOPIC_STORE_KEY],
+                                   max_chat_id),
+            "media":{"kind":kind,"file_id":file_id,
+                     "filename":filename,"mime":str(mime)[:120],"size":size},
+        }
+        try:
+            state=outbound.enqueue(
+                context.bot_data[SUPERGROUP_KEY],message.message_id,
+                max_chat_id,payload)
+            if state=="RECEIVED":
+                state=await outbound.deliver_one(
+                    max_client,context.bot_data[SUPERGROUP_KEY],
+                    message.message_id,tg_bot=context.bot,
+                    is_allowed=lambda cid:
+                    get_chat_prefs(context.bot_data[TOPIC_STORE_KEY],cid).sync
+                    and get_chat_prefs(context.bot_data[TOPIC_STORE_KEY],cid).media
+                    and context.bot_data[TOPIC_STORE_KEY].get_topic(cid) is not None)
+            if state=="SENT":
+                try:await message.set_reaction("👀")
+                except Exception:pass
+            elif state=="RECEIVED":
+                await message.reply_text("⏳ Файл поставлен в очередь MAX.")
+            else:
+                await message.reply_text(
+                    "⚠️ Доставка файла в MAX: "+state+
+                    ". Повтор не выполняется вслепую. /issues — диагностика.")
+        except Exception:
+            log.exception("TG media outbound queue failure")
+            await message.reply_text(
+                "⚠️ Сбой обработки файла. Проверь /issues перед повтором.")
+        return
 
+    # Compatibility path when a ledger is not installed.
     # ── pick the right uploader for the attached media ────────────
     attach = None
     if message.photo:

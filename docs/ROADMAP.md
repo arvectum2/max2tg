@@ -49,16 +49,16 @@
 
 ### P0.6 — Personal reliability finishing (23.10.2026)
 
-- [x] Durable Telegram→MAX outbox **для текста и ответов**: SQLite
+- [x] Durable Telegram→MAX outbox **для текста, ответов и медиа**: SQLite
   RECEIVED/SENDING/SENT/UNKNOWN/FAILED, дедупликация, подтверждённые
-  MAX IDs, recovery после reconnect и безопасная пауза; медиа отдельно.
+  MAX IDs, media file_id / prepared attachments, reconnect и пауза.
 - [x] Многосоставные текстовые edits бот-сообщений без устаревших частей;
   новые длиннее исходных, медиа и неизвестное авторство — BLOCKED.
 - [x] /issues и /issue_ack для admin-only сверки без слепого повтора
   и без ложного статуса APPLIED.
 - [x] Dry-run восстановления TopicStore/обеих SQLite в отдельной
   временной директории без изменения рабочего сервиса.
-- [ ] Полноценный TG→MAX media outbox / edits & reactions durability.
+- [ ] Durable TG→MAX edits/reactions (основные текст/медиа готовы).
 - [ ] P0.5b на изолированном физическом тестовом аккаунте MAX/TG.
   Отчёт: docs/PERSONAL_RELIABILITY_FINISH.md.
 

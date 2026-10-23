@@ -36,6 +36,7 @@ class TelegramOutbound:
             fingerprint TEXT NOT NULL,
             status TEXT NOT NULL,
             max_id TEXT,
+            prepared TEXT,
             created REAL NOT NULL,
             updated REAL NOT NULL,
             PRIMARY KEY(telegram_chat,telegram_id),
@@ -43,6 +44,9 @@ class TelegramOutbound:
         );
         CREATE INDEX IF NOT EXISTS outbound_state ON outbound(status,updated);
         """)
+        if "prepared" not in {row["name"] for row in
+                              self.db.execute("PRAGMA table_info(outbound)")}:
+            self.db.execute("ALTER TABLE outbound ADD COLUMN prepared TEXT")
         # A killed worker may have sent MAX message before it died.
         self.db.execute("UPDATE outbound SET status='UNKNOWN',updated=? "
                         "WHERE status='SENDING'",(time.time(),))
@@ -62,8 +66,23 @@ class TelegramOutbound:
             raise ValueError("Invalid Telegram message ID")
         if not isinstance(payload,dict):
             raise ValueError("Invalid MAX outbound payload")
-        if set(payload)!={"text","elements","link"} or not isinstance(payload["text"],str):
+        required={"text","elements","link"}
+        if (set(payload) not in (required,required|{"media"})
+            or not isinstance(payload["text"],str)
+            or not isinstance(payload["elements"],list)
+            or payload["link"] is not None and not isinstance(payload["link"],dict)):
             raise ValueError("Unsupported outbound payload shape")
+        if "media" in payload:
+            media=payload["media"]
+            if (not isinstance(media,dict) or
+                set(media)!={"kind","file_id","filename","mime","size"}
+                or media["kind"] not in ("photo","voice","audio","document","video")
+                or not isinstance(media["file_id"],str)
+                or not 1<=len(media["file_id"])<=1024
+                or type(media["size"]) is not int or media["size"]<0
+                or not isinstance(media["filename"],str)
+                or not isinstance(media["mime"],str)):
+                raise ValueError("Invalid media reference")
         if len(payload["text"])>50000:
             raise ValueError("Message exceeds safe queue size")
         key=(str(tg_chat),int(tg_id))
@@ -78,7 +97,10 @@ class TelegramOutbound:
                 raise ValueError("Existing Telegram message changed during retry")
             return row["status"]
         self.db.execute(
-            "INSERT INTO outbound VALUES(?,?,?,?,?,'RECEIVED',NULL,?,?)",
+            "INSERT INTO outbound "
+            "(telegram_chat,telegram_id,max_chat,payload,fingerprint,"
+            "status,created,updated) "
+            "VALUES(?,?,?,?,?,'RECEIVED',?,?)",
             (*key,str(max_chat),json.dumps(payload,ensure_ascii=False),
              fp,time.time(),time.time()))
         return "RECEIVED"
@@ -116,7 +138,8 @@ class TelegramOutbound:
             return str(message["id"])
         return None
 
-    async def deliver_one(self,client,tg_chat,tg_id,*,is_allowed=None):
+    async def deliver_one(self,client,tg_chat,tg_id,*,
+                          is_allowed=None,tg_bot=None):
         """Safely sends RECEIVED. If worker not authorized, leave queued."""
         async with self._lock:
             item=self.row(tg_chat,tg_id)
@@ -129,16 +152,64 @@ class TelegramOutbound:
             if getattr(client,"_authorized",True) is False:
                 return "RECEIVED"
             payload=json.loads(item["payload"])
+            prepared=item.get("prepared")
+            if "media" in payload and not prepared:
+                if tg_bot is None:
+                    return "RECEIVED"
+                # No MAX SEND_MESSAGE request is possible before preparing
+                # the attachment. Any failure here is definite/non-ambiguous
+                # w.r.t. chat message delivery.
+                meta=payload["media"]
+                if meta["size"]>25*1024*1024:
+                    self._mark(tg_chat,tg_id,"FAILED")
+                    return "FAILED"
+                try:
+                    file=await tg_bot.get_file(meta["file_id"])
+                    data=bytes(await file.download_as_bytearray())
+                    if len(data)>25*1024*1024:
+                        self._mark(tg_chat,tg_id,"FAILED")
+                        return "FAILED"
+                    target=int(item["max_chat"]) if item["max_chat"].lstrip("-").isdigit() else item["max_chat"]
+                    if meta["kind"]=="photo":
+                        attached=await client.upload_photo(data,chat_id=target)
+                    elif meta["kind"]=="voice":
+                        attached=await client.upload_audio(
+                            data,chat_id=target,filename=meta["filename"],
+                            mimetype=meta["mime"])
+                    else:
+                        attached=await client.upload_file(
+                            data,chat_id=target,filename=meta["filename"],
+                            mimetype=meta["mime"])
+                    if not isinstance(attached,dict) or not attached:
+                        self._mark(tg_chat,tg_id,"FAILED")
+                        return "FAILED"
+                    prepared=json.dumps(attached,ensure_ascii=False)
+                    if len(prepared)>100000:
+                        self._mark(tg_chat,tg_id,"FAILED")
+                        return "FAILED"
+                    self.db.execute(
+                        "UPDATE outbound SET prepared=?,updated=? "
+                        "WHERE telegram_chat=? AND telegram_id=?",
+                        (prepared,time.time(),str(tg_chat),int(tg_id)))
+                except Exception:
+                    # File preparation did not issue MAX SEND_MESSAGE.
+                    # Mark FAILED for explicit operator review, no silent
+                    # expensive re-download/re-upload loops.
+                    self._mark(tg_chat,tg_id,"FAILED")
+                    return "FAILED"
             self.db.execute(
                 "UPDATE outbound SET status='SENDING',updated=? "
                 "WHERE telegram_chat=? AND telegram_id=?",
                 (time.time(),str(tg_chat),int(tg_id)))
             try:
+                kwargs={"elements":payload["elements"],
+                        "link":payload["link"],
+                        "telegram_message_id":int(tg_id)}
+                if prepared:
+                    kwargs["attaches"]=[json.loads(prepared)]
                 response=await client.send_message(
                     int(item["max_chat"]) if item["max_chat"].lstrip("-").isdigit()
-                    else item["max_chat"],
-                    payload["text"],elements=payload["elements"],
-                    link=payload["link"],telegram_message_id=int(tg_id))
+                    else item["max_chat"],payload["text"],**kwargs)
             except BaseException:
                 self.db.execute(
                     "UPDATE outbound SET status='UNKNOWN',updated=? "
@@ -162,7 +233,13 @@ class TelegramOutbound:
                 self.topics.set_message(item["max_chat"],max_id,int(tg_id))
             return "SENT"
 
-    async def drain(self,client,*,is_allowed,limit=20):
+    def _mark(self,tg_chat,tg_id,state):
+        self.db.execute(
+            "UPDATE outbound SET status=?,updated=? "
+            "WHERE telegram_chat=? AND telegram_id=?",
+            (state,time.time(),str(tg_chat),int(tg_id)))
+
+    async def drain(self,client,*,is_allowed,limit=20,tg_bot=None):
         result={}
         for item in self.pending(limit):
             if not getattr(client,"_authorized",False):
@@ -170,7 +247,7 @@ class TelegramOutbound:
             try:
                 outcome=await self.deliver_one(
                     client,item["telegram_chat"],item["telegram_id"],
-                    is_allowed=is_allowed)
+                    is_allowed=is_allowed,tg_bot=tg_bot)
             except Exception:
                 outcome="UNKNOWN"
             result[outcome]=result.get(outcome,0)+1

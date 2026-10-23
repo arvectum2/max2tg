@@ -174,3 +174,146 @@ def test_persistent_db_private_integrity(tmp_path):
     import stat
     assert stat.S_IMODE((tmp_path/"tg-outbound.sqlite3").stat().st_mode)==0o600
     ledger.close()
+
+
+def media_payload(kind="photo",size=10):
+    return {"text":"Подпись","elements":[],"link":None,
+            "media":{"kind":kind,"file_id":"TG-file-reference-1",
+                     "filename":"photo.jpg" if kind=="photo" else "doc.txt",
+                     "mime":"image/jpeg" if kind=="photo" else "text/plain",
+                     "size":size}}
+
+
+def tg_bot(data=b"image"):
+    f=SimpleNamespace(download_as_bytearray=AsyncMock(return_value=bytearray(data)))
+    return SimpleNamespace(get_file=AsyncMock(return_value=f))
+
+
+async def test_photo_queued_before_download_then_uploaded_and_sent_once(tmp_path):
+    store,ledger=env(tmp_path)
+    ledger.enqueue(-10088,71,42,media_payload())
+    client=mock_client({"message":{"id":"MAX-media-71"}})
+    client.upload_photo=AsyncMock(return_value={"_type":"PHOTO","photoId":3})
+    bot=tg_bot(b"jpegbytes")
+    assert await ledger.deliver_one(client,-10088,71,tg_bot=bot)=="SENT"
+    client.upload_photo.assert_awaited_once_with(b"jpegbytes",chat_id=42)
+    assert client.send_message.await_args.kwargs["attaches"]==[
+        {"_type":"PHOTO","photoId":3}]
+    assert ledger.row(-10088,71)["prepared"] is not None
+    assert await ledger.deliver_one(client,-10088,71,tg_bot=bot)=="SENT"
+    bot.get_file.assert_awaited_once()
+    client.send_message.assert_awaited_once()
+    ledger.close()
+
+
+async def test_offline_media_persisted_and_deferred_until_reconnect(tmp_path):
+    store,ledger=env(tmp_path)
+    ledger.enqueue(-10088,72,42,media_payload("document"))
+    client=mock_client({"message":{"id":"doc72"}})
+    client._authorized=False
+    client.upload_file=AsyncMock(return_value={"_type":"FILE","fileId":8})
+    bot=tg_bot(b"docbytes")
+    assert await ledger.deliver_one(client,-10088,72,tg_bot=bot)=="RECEIVED"
+    bot.get_file.assert_not_awaited()
+    client._authorized=True
+    assert await ledger.deliver_one(client,-10088,72,tg_bot=bot)=="SENT"
+    assert client.upload_file.await_args.kwargs["filename"]=="doc.txt"
+    ledger.close()
+
+
+async def test_media_upload_failure_never_sends_chat_message(tmp_path):
+    store,ledger=env(tmp_path)
+    ledger.enqueue(-10088,73,42,media_payload())
+    client=mock_client()
+    client.upload_photo=AsyncMock(return_value=None)
+    bot=tg_bot()
+    assert await ledger.deliver_one(client,-10088,73,tg_bot=bot)=="FAILED"
+    client.send_message.assert_not_awaited()
+    assert ledger.pending()==[]
+    ledger.close()
+
+
+async def test_media_send_timeout_unknown_does_not_redownload_on_restart(tmp_path):
+    store,ledger=env(tmp_path)
+    ledger.enqueue(-10088,74,42,media_payload())
+    client=mock_client()
+    client.upload_photo=AsyncMock(return_value={"_type":"PHOTO","photoId":74})
+    client.send_message.side_effect=TimeoutError()
+    bot=tg_bot()
+    with pytest.raises(TimeoutError):
+        await ledger.deliver_one(client,-10088,74,tg_bot=bot)
+    assert ledger.row(-10088,74)["status"]=="UNKNOWN"
+    ledger.close()
+    recovered=TelegramOutbound(tmp_path/"tg-outbound.sqlite3",store)
+    client.send_message=AsyncMock()
+    assert await recovered.deliver_one(client,-10088,74,tg_bot=bot)=="UNKNOWN"
+    client.send_message.assert_not_awaited()
+    bot.get_file.assert_awaited_once()
+    recovered.close()
+
+
+async def test_media_too_large_blocks_before_network_download(tmp_path):
+    store,ledger=env(tmp_path)
+    ledger.enqueue(-10088,75,42,media_payload(size=26*1024*1024))
+    client=mock_client()
+    bot=tg_bot()
+    assert await ledger.deliver_one(client,-10088,75,tg_bot=bot)=="FAILED"
+    bot.get_file.assert_not_awaited()
+    ledger.close()
+
+
+async def test_voice_media_is_upload_audio(tmp_path):
+    store,ledger=env(tmp_path)
+    ledger.enqueue(-10088,76,42,media_payload("voice"))
+    client=mock_client()
+    client.upload_audio=AsyncMock(return_value={"_type":"FILE","fileId":76})
+    assert await ledger.deliver_one(client,-10088,76,tg_bot=tg_bot())=="SENT"
+    client.upload_audio.assert_awaited_once()
+    ledger.close()
+
+
+async def test_message_media_handler_calls_new_ledger_before_download(tmp_path):
+    from app.tg_handler import _on_topic_media
+    store,ledger=env(tmp_path)
+    client=mock_client({"message":{"id":"max77"}})
+    client.upload_photo=AsyncMock(return_value={"_type":"PHOTO","photoId":77})
+    update=_make_update(text=None,thread_id=10)
+    update.message.caption="подпись"
+    update.message.caption_entities=[]
+    update.message.photo=[SimpleNamespace(file_id="photo-A",file_size=5)]
+    update.message.voice=None
+    update.message.audio=None
+    update.message.document=None
+    update.message.video=None
+    ctx=_make_context(max_client=client,topic_store=store)
+    ctx.bot_data[SUPERGROUP_KEY]=-10088
+    ctx.bot_data[TG_OUTBOUND_KEY]=ledger
+    ctx.bot=tg_bot()
+    await _on_topic_media(update,ctx)
+    assert ledger.counts()=={"SENT":1}
+    ctx.bot.get_file.assert_awaited_once_with("photo-A")
+    client.send_message.assert_awaited_once()
+    await _on_topic_media(update,ctx)
+    ctx.bot.get_file.assert_awaited_once()
+    ledger.close()
+
+
+def test_upgrade_existing_text_only_db_adds_prepared_column(tmp_path):
+    path=tmp_path/"tg-outbound.sqlite3"
+    con=sqlite3.connect(path)
+    con.executescript("""
+       CREATE TABLE outbound (
+        telegram_chat TEXT NOT NULL,telegram_id INTEGER NOT NULL,
+        max_chat TEXT NOT NULL,payload TEXT NOT NULL,
+        fingerprint TEXT NOT NULL,status TEXT NOT NULL,
+        max_id TEXT,created REAL NOT NULL,updated REAL NOT NULL,
+        PRIMARY KEY(telegram_chat,telegram_id));
+       INSERT INTO outbound VALUES('-100',1,'42','{}','hash','RECEIVED',
+                                   NULL,1,1);
+    """)
+    con.close()
+    ledger=TelegramOutbound(path)
+    columns={row["name"] for row in ledger.db.execute("PRAGMA table_info(outbound)")}
+    assert "prepared" in columns
+    assert ledger.row(-100,1)["status"]=="RECEIVED"
+    ledger.close()
