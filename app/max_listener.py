@@ -236,49 +236,37 @@ async def _handle_linked_message(
     resolver: ContactResolver,
     thread_id: int | None = None,
     msg: MaxMessage | None = None,
-) -> None:
-    """Handle FORWARD or REPLY link inside a message."""
+):
+    """Forward nested content, returning its first Telegram message for dedup."""
     inner = link.get("message") or link
+    if not isinstance(inner, dict):
+        inner = link
     fwd_sender_id = inner.get("sender") or link.get("sender")
     fwd_text = inner.get("text", "") or link.get("text", "")
     fwd_attaches = inner.get("attaches") or link.get("attaches") or []
 
-    fwd_sender_label = ""
+    sender_label = ""
     if fwd_sender_id:
-        fwd_sender_label = escape(await resolver.resolve_user(fwd_sender_id))
+        sender_label = escape(await resolver.resolve_user(fwd_sender_id))
 
     if link_type == "FORWARD":
         prefix = "↩️ <b>Переслано</b>"
-        if fwd_sender_label:
-            prefix = f"↩️ <b>Переслано от {fwd_sender_label}</b>"
+        if sender_label:
+            prefix = f"↩️ <b>Переслано от {sender_label}</b>"
     else:
         prefix = "↩ <b>Ответ</b>"
-        if fwd_sender_label:
-            prefix = f"↩ <b>Ответ на {fwd_sender_label}</b>"
+        if sender_label:
+            prefix = f"↩ <b>Ответ на {sender_label}</b>"
 
-    full_header = f"{header_text}\n{prefix}"
-
-    fwd_meaningful = [
-        a for a in fwd_attaches
-        if isinstance(a, dict) and a.get("_type") not in ("CONTROL", "WIDGET", "INLINE_KEYBOARD", None)
-    ]
-
-    if fwd_meaningful:
-        text_sent = False
-        for i, attach in enumerate(fwd_meaningful):
-            if i == 0 and fwd_text:
-                cap = f"{full_header}\n{escape(fwd_text)}"
-                text_sent = True
-            else:
-                cap = full_header
-            await _send_attach(attach, client, sender, cap, thread_id=thread_id, msg=msg)
-
-        if fwd_text and not text_sent:
-            await sender.send(f"{full_header}\n{escape(fwd_text)}", message_thread_id=thread_id)
-    elif fwd_text:
-        await sender.send(f"{full_header}\n{escape(fwd_text)}", message_thread_id=thread_id)
-    else:
-        await sender.send(f"{full_header}\n<i>[без содержимого]</i>", message_thread_id=thread_id)
+    nested = MaxMessage(
+        chat_id=msg.chat_id if msg else None,
+        message_id=msg.message_id if msg else "",
+        text=fwd_text,
+        attaches=fwd_attaches,
+    )
+    return await _send_message_content(
+        nested, f"{header_text}\n{prefix}", client, sender, thread_id,
+    )
 
 
 def _message_body(msg: MaxMessage) -> str:
@@ -464,17 +452,17 @@ async def import_recent_history(
             continue
 
         if link_type == "FORWARD":
-            await _handle_linked_message(
+            forwarded = await _handle_linked_message(
                 link, link_type, header_text, client, sender, resolver,
                 thread_id=thread_id, msg=msg,
             )
-            sent = None
+            comment = None
             if msg.text:
-                sent = await sender.send(
+                comment = await sender.send(
                     f"{header_text}\n{escape(msg.text)}",
                     message_thread_id=thread_id,
                 )
-            _remember_message(sender, msg, sent)
+            _remember_message(sender, msg, comment or forwarded)
             imported += 1
             continue
 
@@ -581,7 +569,8 @@ async def _bootstrap_chat_topic(client: MaxClient, sender: TelegramSender,
 
 
 async def _reconcile_snapshot_chats(client: MaxClient, sender: TelegramSender,
-                                    resolver: ContactResolver) -> int:
+                                    resolver: ContactResolver,
+                                    chat_locks: dict[str, asyncio.Lock] | None = None) -> int:
     """Create topics for active MAX chats first seen since the previous snapshot."""
     current = {
         str(chat_id): chat_id
@@ -599,7 +588,15 @@ async def _reconcile_snapshot_chats(client: MaxClient, sender: TelegramSender,
     new_ids = [current[key] for key in sorted(set(current) - known)]
     created = 0
     for chat_id in new_ids:
-        if await _bootstrap_chat_topic(client, sender, resolver, chat_id) is not None:
+        # Snapshot imports and live events share the same per-chat lock.
+        # Without it, the same MAX message may be imported and forwarded
+        # concurrently before either path persists its Telegram mapping.
+        if chat_locks is None:
+            thread_id = await _bootstrap_chat_topic(client, sender, resolver, chat_id)
+        else:
+            async with chat_locks.setdefault(str(chat_id), asyncio.Lock()):
+                thread_id = await _bootstrap_chat_topic(client, sender, resolver, chat_id)
+        if thread_id is not None:
             created += 1
 
     # Keep a monotonic seen-set: a temporarily absent chat must not look new later.
@@ -622,6 +619,7 @@ def create_max_client(
     # Expose runtime helpers for Telegram-side management actions.
     client.resolver = resolver
     client._tg_sender = sender
+    chat_locks: dict[str, asyncio.Lock] = {}
 
     _first_connect = True
     _notif_count = 0
@@ -645,12 +643,14 @@ def create_max_client(
         if participant_ids:
             log.info("Batch-resolving %d participants...", len(participant_ids))
             await resolver.resolve_users_batch(participant_ids)
-            log.info("Resolved users: %s", resolver.users)
+            log.info("Resolved %d users", len(resolver.users))
 
-            log.info("Known chats: %s", resolver.chats)
-            log.info("Known users: %s", resolver.users)
+            log.info("Known chats: %d", len(resolver.chats))
+            log.info("Known users: %d", len(resolver.users))
 
-        created = await _reconcile_snapshot_chats(client, sender, resolver)
+        created = await _reconcile_snapshot_chats(
+            client, sender, resolver, chat_locks=chat_locks,
+        )
 
         if not _first_connect:
             suffix = f" | новых топиков: {created}" if created else ""
@@ -675,13 +675,15 @@ def create_max_client(
 
     @client.on_message
     async def handle_message(msg: MaxMessage):
+        async with chat_locks.setdefault(str(msg.chat_id), asyncio.Lock()):
+            await _handle_message_serial(msg)
+
+    async def _handle_message_serial(msg: MaxMessage):
+        # Never log message content or private contact details.
         log.info(
-            "New message: chat=%s sender=%s is_self=%s text=%r attaches=%d",
-            msg.chat_id,
-            msg.sender_id,
-            msg.is_self,
-            (msg.text[:80] + "…") if len(msg.text) > 80 else msg.text,
-            len(msg.attaches),
+            "New message: chat=%s sender=%s is_self=%s text_len=%d attaches=%d",
+            msg.chat_id, msg.sender_id, msg.is_self,
+            len(msg.text or ""), len(msg.attaches),
         )
 
         # A new chat can first appear as our own outgoing message. Refresh its
@@ -816,16 +818,17 @@ def create_max_client(
             return
 
         if link_type == "FORWARD":
-            await _handle_linked_message(
+            forwarded = await _handle_linked_message(
                 link, link_type, header_text, client, sender, resolver,
                 thread_id=thread_id, msg=msg,
             )
+            comment = None
             if msg.text:
-                sent = await sender.send(
+                comment = await sender.send(
                     f"{header_text}\n{escape(msg.text)}",
                     message_thread_id=thread_id,
                 )
-                _remember_message(sender, msg, sent)
+            _remember_message(sender, msg, comment or forwarded)
             log.info("Forwarded link type=FORWARD → TG")
             return
 

@@ -62,20 +62,33 @@ class TopicStore:
             self._ui = {}
 
     def _save(self) -> None:
+        """Keep runtime usable if the state directory temporarily disappears.
+
+        The original JSON is atomically replaced only after a full write.
+        Failed writes are logged, and later mutations attempt persistence again.
+        """
         directory = os.path.dirname(self._path) or "."
-        os.makedirs(directory, exist_ok=True)
-        fd, tmp_path = tempfile.mkstemp(dir=directory, suffix=".tmp")
+        tmp_path = None
         try:
+            os.makedirs(directory, exist_ok=True)
+            fd, tmp_path = tempfile.mkstemp(dir=directory, suffix=".tmp")
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(
                     {"chats": self._chats, "messages": self._messages, "ui": self._ui},
                     f, ensure_ascii=False, indent=2,
                 )
+                f.flush()
+                os.fsync(f.fileno())
             os.replace(tmp_path, self._path)
-        except Exception:
-            log.exception("Failed to save topic store %s", self._path)
-            if os.path.exists(tmp_path):
-                os.unlink(tmp_path)
+        except OSError:
+            log.exception("Could not persist topic store %s; keeping in-memory state", self._path)
+        finally:
+            if tmp_path is not None:
+                try:
+                    if os.path.exists(tmp_path):
+                        os.unlink(tmp_path)
+                except OSError:
+                    log.exception("Could not remove temporary topic store file")
 
     def get_ui(self, key: str, default=None):
         return self._ui.get(key, default)

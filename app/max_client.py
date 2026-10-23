@@ -4,6 +4,7 @@ import logging
 import os
 import random
 import time
+from urllib.parse import urljoin, urlsplit
 from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Any
@@ -13,6 +14,9 @@ import aiohttp
 log = logging.getLogger(__name__)
 
 DEBUG_DIR = "debug"
+MAX_MEDIA_BYTES = 50 * 1024 * 1024  # Telegram Bot API file upload ceiling
+MEDIA_HOST_SUFFIXES = ("oneme.ru", "max.ru", "vk.com", "vk-cdn.net",
+                       "userapi.com", "okcdn.ru")
 
 
 def _log_task_exception(task: "asyncio.Task") -> None:
@@ -99,11 +103,10 @@ class MaxClient:
     WS_URL = "wss://ws-api.oneme.ru/websocket"
     HEARTBEAT_SEC = 30
     RECONNECT_SEC = 5
-    chat_ids = []
-
     def __init__(self, token: str, device_id: str, chat_ids: str | None = None, debug: bool = False):
         self.token = token
         self.device_id = device_id
+        self.chat_ids: list[int] = []
         self.debug = debug
         self._ws: aiohttp.ClientWebSocketResponse | None = None
         self._seq = 0
@@ -165,6 +168,9 @@ class MaxClient:
         need to distinguish a valid empty MAX response from a timeout can set
         none_on_timeout=True.
         """
+        if self._ws is None or self._ws.closed:
+            log.warning("MAX RPC unavailable while WebSocket is disconnected: op=%d", opcode)
+            return None if none_on_timeout else {}
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[dict] = loop.create_future()
         seq = await self._send(opcode, payload)
@@ -244,6 +250,10 @@ class MaxClient:
                         if not fut.done():
                             fut.cancel()
                     self._pending.clear()
+                    for fut in self._file_pending.values():
+                        if not fut.done():
+                            fut.cancel()
+                    self._file_pending.clear()
 
                 if self._on_disconnect_cb:
                     try:
@@ -343,7 +353,9 @@ class MaxClient:
                 log.debug("Heartbeat op=%s", op)
 
             elif cmd not in (1, 3):
-                log.info("<<< EVENT op=%-4s cmd=%-3s | %s", op, cmd, payload_preview[:500])
+                log.info("<<< EVENT op=%s cmd=%s keys=%s",
+                         op, cmd, list(payload)[:12] if isinstance(payload, dict) else [])
+                log.debug("<<< EVENT payload=%s", payload_preview[:500])
 
     async def _deliver_preview(self, key):
         """Merge rapid MAX updates sharing one message ID before forwarding."""
@@ -779,25 +791,73 @@ class MaxClient:
             if close_after:
                 await session.close()
 
+    @staticmethod
+    def _safe_media_url(url: str) -> bool:
+        """Disallow fetching local services or arbitrary attacker-supplied URLs.
+
+        Attachment and profile URLs arrive through MAX message payloads,
+        not from our own code. Limit downloads to trusted MAX media domains.
+        """
+        if not isinstance(url, str):
+            return False
+        try:
+            parsed = urlsplit(url)
+            if parsed.scheme.lower() != "https" or parsed.username or parsed.password:
+                return False
+            if parsed.port not in (None, 443):
+                return False
+            host = (parsed.hostname or "").lower().rstrip(".")
+            return any(
+                host == suffix or host.endswith("." + suffix)
+                for suffix in MEDIA_HOST_SUFFIXES
+            )
+        except (ValueError, TypeError):
+            return False
+
     async def download_file(self, url: str) -> bytes | None:
-        """Download a file by URL, returning raw bytes or None on failure."""
+        """Safely download at most 50 MB from a trusted MAX media host."""
+        if not self._safe_media_url(url):
+            log.warning("Refusing untrusted MAX media URL")
+            return None
         session = getattr(self, "_session", None)
         close_after = False
         if session is None or session.closed:
             session = aiohttp.ClientSession(headers=_BROWSER_HEADERS)
             close_after = True
         try:
-            async with session.get(
-                url, headers=_HTTP_HEADERS,
-                timeout=aiohttp.ClientTimeout(total=120),
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.read()
-                    log.info("Downloaded %s (%d bytes)", url[:120], len(data))
-                    return data
-                log.warning("Download failed %s — HTTP %d", url[:120], resp.status)
+            for _ in range(4):
+                if not self._safe_media_url(url):
+                    log.warning("Blocked redirect to untrusted MAX media URL")
+                    return None
+                async with session.get(
+                    url, headers=_HTTP_HEADERS,
+                    timeout=aiohttp.ClientTimeout(total=120),
+                    allow_redirects=False,
+                ) as resp:
+                    if resp.status in (301, 302, 303, 307, 308):
+                        target = resp.headers.get("Location")
+                        if not target:
+                            return None
+                        url = urljoin(url, target)
+                        continue
+                    if resp.status != 200:
+                        log.warning("MAX media download failed: HTTP %d", resp.status)
+                        return None
+                    if resp.content_length and resp.content_length > MAX_MEDIA_BYTES:
+                        log.warning("MAX media exceeds %d bytes", MAX_MEDIA_BYTES)
+                        return None
+                    result = bytearray()
+                    async for chunk in resp.content.iter_chunked(64 * 1024):
+                        if len(result) + len(chunk) > MAX_MEDIA_BYTES:
+                            log.warning("MAX media exceeded size limit while downloading")
+                            return None
+                        result.extend(chunk)
+                    log.info("Downloaded media from %s (%d bytes)",
+                             urlsplit(url).hostname, len(result))
+                    return bytes(result)
+            log.warning("MAX media has too many redirects")
         except Exception:
-            log.exception("Download error: %s", url[:120])
+            log.exception("MAX media download failed")
         finally:
             if close_after:
                 await session.close()
@@ -813,9 +873,9 @@ class MaxClient:
         msg = MaxMessage(
             chat_id=payload.get("chatId"),
             sender_id=msg_body.get("sender"),
-            text=msg_body.get("text", ""),
+            text=msg_body.get("text") or "",
             timestamp=msg_body.get("time"),
-            message_id=str(msg_body.get("id", "")),
+            message_id=str(msg_body.get("id") or ""),
             attaches=msg_body.get("attaches") or [],
             link=msg_body.get("link") or {},
             raw=payload,
