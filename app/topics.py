@@ -29,6 +29,7 @@ class TopicStore:
         self._messages: dict[str, dict[str, int]] = {}  # chat_id → max_message_id → tg_message_id
         self._by_tg_message: dict[tuple[str, int], str] = {}
         self._ui: dict[str, Any] = {}
+        self._sync: dict[str, int] = {}  # MAX chat -> last fully reconciled timestamp
         self._load()
 
     def _load(self) -> None:
@@ -40,6 +41,14 @@ class TopicStore:
             self._chats = data.get("chats", {})
             self._messages = data.get("messages", {})
             self._ui = data.get("ui", {})
+            self._sync = {}
+            for key, raw in (data.get("sync") or {}).items():
+                try:
+                    value = int(raw)
+                    if value > 0:
+                        self._sync[str(key)] = value
+                except (ValueError, TypeError, OverflowError):
+                    log.warning("Ignoring invalid history cursor chat=%s", key)
             for key, rec in self._chats.items():
                 tid = rec.get("topic_id")
                 if tid is not None:
@@ -60,6 +69,7 @@ class TopicStore:
             self._messages = {}
             self._by_tg_message = {}
             self._ui = {}
+            self._sync = {}
 
     def _save(self) -> None:
         """Keep runtime usable if the state directory temporarily disappears.
@@ -74,7 +84,8 @@ class TopicStore:
             fd, tmp_path = tempfile.mkstemp(dir=directory, suffix=".tmp")
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(
-                    {"chats": self._chats, "messages": self._messages, "ui": self._ui},
+                    {"chats": self._chats, "messages": self._messages,
+                     "ui": self._ui, "sync": self._sync},
                     f, ensure_ascii=False, indent=2,
                 )
                 f.flush()
@@ -89,6 +100,20 @@ class TopicStore:
                         os.unlink(tmp_path)
                 except OSError:
                     log.exception("Could not remove temporary topic store file")
+
+    def get_history_cursor(self, max_chat_id: Any) -> int | None:
+        """Last timestamp fully checked against Telegram for this MAX chat."""
+        return self._sync.get(str(max_chat_id))
+
+    def set_history_cursor(self, max_chat_id: Any, timestamp_ms: int) -> None:
+        """Advance only after a complete successful reconciliation batch."""
+        timestamp_ms = int(timestamp_ms)
+        if timestamp_ms <= 0:
+            return
+        key = str(max_chat_id)
+        if timestamp_ms > self._sync.get(key, 0):
+            self._sync[key] = timestamp_ms
+            self._save()
 
     def get_ui(self, key: str, default=None):
         return self._ui.get(key, default)
@@ -157,6 +182,7 @@ class TopicStore:
         chat_key = str(max_chat_id)
         rec = self._chats.pop(chat_key, None)
         message_map = self._messages.pop(chat_key, {})
+        self._sync.pop(chat_key, None)
         for tg_message_id in message_map.values():
             self._by_tg_message.pop((chat_key, int(tg_message_id)), None)
 

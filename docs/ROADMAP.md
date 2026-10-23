@@ -12,6 +12,86 @@
 - Telegram reply переводится в MAX REPLY;
 - обработка вложений теперь возвращает Telegram message для message mapping.
 
+## Новый план релизов — Reliability → Personal UX → SaaS (23.10.2026)
+
+Первая цель — не терять сообщения и не создавать дубли при сбоях, затем
+улучшить UX и подготовить многопользовательский продукт. Personal UX v1.0
+сохраняет статус закрытого этапа; Reliability v1.1 — новый активный gate.
+
+### P0 — Reliability v1.1 (в работе)
+
+- [x] **P0.1 — догрузка истории (первый срез реализован 23.10.2026).** Известные чаты после
+  reconnect/restart: persisted cursor, пагинация MAX HISTORY, проверка ID,
+  хронологический импорт только пропущенных событий. Без безопасной точки
+  восстановления первый запуск не должен слепо пересылать старую историю.
+  Тест: >100 сообщений, гонки с live, собственные исходящие и TG echoes.
+- [ ] **P0.2 — Persistent Outbox.** SQLite/PostgreSQL queue: RECEIVED →
+  PENDING → SENDING → SENT, RETRY/UNKNOWN при ошибке, durable payload,
+  retry с backoff, сохранение каждой части текста/медиа. Не считать сетевой
+  timeout гарантированным отказом: Telegram API не даёт exactly-once.
+- [ ] **P0.3 — edit/delete/reactions.** Проверка реальных MAX opcodes;
+  двусторонние изменения/удаления/реакции только если API поддерживает,
+  корректное отображение и idempotency.
+- [ ] **P0.4 — health + autorecovery.** Монитор WebSocket, Telegram API/polling,
+  MAX auth, queue lag, cursor, topic state; автоперезапуск, controlled retries,
+  уведомление с действием REAUTH_REQUIRED.
+- [ ] **P0.5 — failure acceptance.** Тест сетевого простоя, MAX logout/login,
+  недоступности Telegram/proxy, перезагрузки Mac mini, ошибок диска и частичной
+  отправки длинного сообщения. Проверка отсутствия потерь и повторов.
+
+**Gate:** после остановки и восстановления пропущенные сообщения появляются
+в правильных темах, reply mappings сохраняются, необъяснимых потерь нет;
+неопределённые отправки видны оператору и не повторяются слепо.
+
+### P1 — Personal UX v1.2
+
+- [ ] Передача структурных MAX elements и форматирования Telegram:
+  bold, italic, lists, quote, code, hyperlink, mentions.
+- [ ] Фотоальбомы, видео, файлы, voice, previews, безопасные fallback.
+- [ ] Поиск сообщений: по тексту, датам, чатам; загрузка старой истории
+  из темы Telegram кнопкой, без ручных IDs.
+- [ ] Индивидуальные настройки чатов: sync, mute, media, history depth,
+  archive/hide и синхронизация имени/аватара.
+
+### P2 — Telegram-first SaaS
+
+- [ ] Onboarding: /start → Подключить MAX → временная SMS-веб-сессия →
+  ONLINE/REAUTH/Disconnect. Код SMS и секреты не сохранять в логах.
+- [ ] Multi-user: User/MaxSession/TelegramConnection, изолированные browser
+  profiles и workers, Supervisor, ACL, PostgreSQL, encrypted session state,
+  backup, health checks, worker crash recovery.
+- [ ] Личные темы бота при подтверждённой поддержке нужного режима
+  Telegram Bot API; fallback — приватная форум-супергруппа.
+- [ ] Веб-кабинет и панель оператора: подключения, статусы, очередь, ошибки,
+  настройки, аналитика и административные действия.
+- [ ] SaaS prototype на Mac mini: минимум два независимых аккаунта, замеры
+  CPU/RAM/сети, стоимость одной круглосуточной сессии и нагрузочный тест.
+- [ ] SaaS beta на Timeweb Cloud (РФ): TLS, защита ПДн, резервирование,
+  мониторинг, политики удаления, требования/уведомления РКН.
+- [ ] Trial 7 дней, платежи, лимиты и тарифы. 99 ₽/аккаунт — гипотеза,
+  до теста себестоимости и retention бизнес-модель не зафиксирована.
+- [ ] Метрики acquisition, activation, retention, delivery reliability,
+  conversion, LTV и unit economics.
+
+### Архитектура на будущее
+
+- [ ] Source Adapter → Bridge Core (event model, queue, dedup, mappings,
+  ACL, monitoring) → Destination Adapter. MAX/TG — первые реализации;
+  новые платформы только после стабилизации ядра.
+- [ ] Официальный MAX Bot API рассматривать отдельно от пользовательского
+  reverse-engineered WebSocket: возможности/права не эквивалентны.
+- [ ] GitHub arvectum2/max2tg (main) — source of truth; GitVerse — зеркало;
+  выпуск только после проверенного релиза.
+
+**Следующее рабочее задание:** P0.2 (Persistent Outbox). P0.1 закрыт
+на уровне кода, тестов и восстановления службы; сценарии физической
+потери сети/SSD проверяются в общем приёмочном gate P0.5.
+
+**Последовательность:** P0.1 → P0.2 → P0.3 → P0.4 → P0.5 → P1 →
+SaaS prototype → SaaS beta → коммерческий запуск.
+
+---
+
 ## Стратегическое направление — MAX2TG SaaS
 
 Целевая модель: пользователь один раз авторизует MAX, после чего его MAX-сессия живёт на нашей инфраструктуре и продолжает работать автономно. Telegram остаётся основным клиентом, а сайт/личный кабинет — вторым полноценным интерфейсом управления.
@@ -231,6 +311,11 @@
 
 ## Порядок ближайших работ
 
+0. **Reliability v1.1 P0** — P0.1 catch-up реализован; далее P0.2
+   Persistent Outbox, P0.3 edit/delete/reactions, P0.4 health/autorecovery,
+   P0.5 тестирование сетевых/дисковых отказов.
+0. **Personal UX v1.2 (P1)** — форматирование, медиа, поиск сообщений
+   и индивидуальные настройки чатов.
 1. Session Capsule v1 на Mac mini.
 2. Вторая независимая MAX-сессия и доказательство multi-user isolation.
 3. Session Supervisor + автоматическое восстановление.

@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 from datetime import datetime
 from html import escape
 
@@ -13,6 +14,8 @@ PHOTO_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 _ACTIVE_CHAT_TYPES = {"DIALOG", "CHAT", "CHANNEL"}
 _KNOWN_MAX_CHATS_UI_KEY = "known_max_chat_ids"
+CATCH_UP_BATCH = 100
+CATCH_UP_MAX_PAGES = 10  # 1000 events max per chat per reconciliation
 _MAX_SERVICE_PEER_IDS = {543835}
 
 
@@ -368,25 +371,27 @@ async def import_recent_history(
     chat_id,
     thread_id: int,
     count: int,
+    *,
+    raw_messages: list[dict] | None = None,
 ) -> int:
-    """Import the newest MAX messages into an already-created TG topic."""
-    try:
-        count = max(0, min(int(count), 100))
-    except (TypeError, ValueError):
-        count = 20
-    if count == 0:
-        return 0
-
-    try:
-        response = await client.fetch_history(chat_id, count=count)
-    except Exception:
-        log.exception("History fetch failed for chat=%s", chat_id)
-        return 0
-    if not isinstance(response, dict) or response.get("_max_error"):
-        log.warning("History fetch failed for chat=%s: %s", chat_id, response)
-        return 0
-
-    raw_messages = [m for m in (response.get("messages") or []) if isinstance(m, dict)]
+    """Import MAX history in chronological order, skipping mapped message IDs."""
+    if raw_messages is None:
+        try:
+            count = max(0, min(int(count), 100))
+        except (TypeError, ValueError):
+            count = 20
+        if count == 0:
+            return 0
+        try:
+            response = await client.fetch_history(chat_id, count=count)
+        except Exception:
+            log.exception("History fetch failed for chat=%s", chat_id)
+            return 0
+        if not isinstance(response, dict) or response.get("_max_error"):
+            log.warning("History fetch failed for chat=%s: %s", chat_id, response)
+            return 0
+        raw_messages = response.get("messages") or []
+    raw_messages = [m for m in raw_messages if isinstance(m, dict)]
     raw_messages.sort(key=lambda item: item.get("time") or 0)
     imported = 0
 
@@ -610,6 +615,155 @@ async def _reconcile_snapshot_chats(client: MaxClient, sender: TelegramSender,
     return created
 
 
+def _max_message_timestamp(message: dict) -> int:
+    """MAX history timestamps are milliseconds; ignore invalid records."""
+    try:
+        return max(0, int(message.get("time") or 0))
+    except (ValueError, TypeError, OverflowError):
+        return 0
+
+
+async def catch_up_chat_history(
+    client: MaxClient,
+    sender: TelegramSender,
+    resolver: ContactResolver,
+    chat_id,
+    thread_id: int,
+    *,
+    max_pages: int = CATCH_UP_MAX_PAGES,
+) -> int:
+    """Recover missed messages after reconnect, never bulk-replaying without an anchor.
+
+    A stored reconciliation cursor or an already mapped MAX message is a
+    safe anchor. Without either, establish a baseline rather than flood a
+    Telegram topic with possibly duplicated old history.
+    """
+    store = sender.topic_store
+    cursor = store.get_history_cursor(chat_id)
+    older_than = int(time.time() * 1000)
+    unseen = {}
+    newest_ts = 0
+    found_anchor = False
+    reached_start = False
+    exhausted_budget = False
+    visited_ids = set()
+    pages = max(1, int(max_pages))
+
+    for page in range(pages):
+        try:
+            response = await client.fetch_history(
+                chat_id, count=CATCH_UP_BATCH, from_time=older_than,
+            )
+        except Exception:
+            log.exception("Catch-up RPC exception for chat=%s", chat_id)
+            return 0
+        if not isinstance(response, dict) or response.get("_max_error"):
+            log.warning("Catch-up aborted for chat=%s: failed history RPC", chat_id)
+            return 0
+        entries = [entry for entry in (response.get("messages") or [])
+                   if isinstance(entry, dict) and entry.get("id") is not None]
+        if not entries:
+            reached_start = True
+            break
+        ordered = sorted(entries,
+                         key=lambda item: (_max_message_timestamp(item),
+                                           str(item.get("id"))), reverse=True)
+        timestamps = [_max_message_timestamp(x) for x in ordered]
+        if not all(timestamps):
+            log.warning("Catch-up for chat=%s has un-timestamped message", chat_id)
+            return 0
+        newest_ts = max(newest_ts, max(timestamps))
+
+        for entry in ordered:
+            ts = _max_message_timestamp(entry)
+            mid = str(entry["id"])
+            if mid in visited_ids:
+                continue
+            visited_ids.add(mid)
+            mapped = store.tg_for_max_message(chat_id, mid) is not None
+            if cursor is not None and ts <= cursor:
+                found_anchor = True
+                break
+            if cursor is None and mapped:
+                found_anchor = True
+                break
+            if not mapped:
+                unseen[mid] = entry
+        if found_anchor:
+            break
+        if len(entries) < CATCH_UP_BATCH:
+            reached_start = True
+            break
+        next_marker = min(timestamps) - 1
+        if next_marker >= older_than or next_marker <= 0:
+            log.warning("Catch-up pagination cannot advance for chat=%s", chat_id)
+            return 0
+        older_than = next_marker
+    else:
+        exhausted_budget = True
+
+    if not newest_ts:
+        return 0
+    if exhausted_budget and not found_anchor and not reached_start:
+        log.warning("Catch-up history window exceeded chat=%s; no cursor advance", chat_id)
+        return 0
+    if not found_anchor and cursor is None:
+        # New feature enabled for a pre-existing chat with no matching
+        # historical Telegram ID. Do not blindly replay old conversations.
+        store.set_history_cursor(chat_id, newest_ts)
+        log.warning("Catch-up baseline initialized without mapped anchor chat=%s", chat_id)
+        return 0
+    candidates = sorted(unseen.values(), key=lambda item:
+                        (_max_message_timestamp(item), str(item["id"])))
+    imported = 0
+    if candidates:
+        imported = await import_recent_history(
+            client, sender, resolver, chat_id, thread_id,
+            count=len(candidates), raw_messages=candidates,
+        )
+        # The importer can encounter TG send failures; never advance the
+        # durable cursor past missing messages.
+        if any(store.tg_for_max_message(chat_id, entry["id"]) is None
+               for entry in candidates):
+            log.warning("Catch-up partially delivered chat=%s; cursor unchanged", chat_id)
+            return imported
+
+    store.set_history_cursor(chat_id, newest_ts)
+    log.info("Catch-up verified chat=%s imported=%d scanned=%d cursor=%s",
+             chat_id, imported, len(visited_ids), newest_ts)
+    return imported
+
+
+async def catch_up_known_chats(
+    client: MaxClient,
+    sender: TelegramSender,
+    resolver: ContactResolver,
+    chat_locks: dict[str, asyncio.Lock],
+    original_topics: set[str],
+) -> int:
+    """Run history reconciliation only for topics that predate this startup."""
+    recovered = 0
+    for chat_id, raw in resolver.chats_raw.items():
+        if str(chat_id) not in original_topics:
+            continue
+        if resolver.chat_types.get(chat_id) not in _ACTIVE_CHAT_TYPES:
+            continue
+        if (raw or {}).get("status") in ("LEFT", "CLOSED"):
+            continue
+        if client.chat_ids and chat_id not in client.chat_ids:
+            continue
+        if _is_max_service_dialog(resolver, chat_id):
+            continue
+        topic_id = sender.topic_store.get_topic(chat_id)
+        if topic_id is None:
+            continue
+        async with chat_locks.setdefault(str(chat_id), asyncio.Lock()):
+            recovered += await catch_up_chat_history(
+                client, sender, resolver, chat_id, topic_id,
+            )
+    return recovered
+
+
 def create_max_client(
     max_token: str, max_device_id: str, sender: TelegramSender, max_chat_ids: str | None = None,
     debug: bool = False,
@@ -648,9 +802,18 @@ def create_max_client(
             log.info("Known chats: %d", len(resolver.chats))
             log.info("Known users: %d", len(resolver.users))
 
+        original_topics = {
+            str(chat_id) for chat_id in resolver.chats_raw
+            if sender.topic_store.get_topic(chat_id) is not None
+        }
         created = await _reconcile_snapshot_chats(
             client, sender, resolver, chat_locks=chat_locks,
         )
+        restored = await catch_up_known_chats(
+            client, sender, resolver, chat_locks, original_topics,
+        )
+        if restored:
+            log.info("Reconnect recovered %d previously missed messages", restored)
 
         if not _first_connect:
             suffix = f" | новых топиков: {created}" if created else ""
