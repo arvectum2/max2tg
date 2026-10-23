@@ -67,6 +67,19 @@
 
 ### P2 — Telegram-first SaaS
 
+- [x] **P2.2a — архитектура одного Telegram-бота (23.10.2026).**
+  Реестр owner↔Telegram, одноразовые приглашения, проверяемая
+  привязка forum↔Session Capsule, SQLite Telegram Inbox с
+  дедупликацией/UNKNOWN, центральный gateway engine и HMAC Unix IPC.
+  Offline-прототип; общий бот не запущен.
+  Документация: docs/SAAS_P2_2_ARCHITECTURE.md.
+- [ ] **P2.2b — подключение gateway к workers:** единый TG egress,
+  отказ от TG polling и общего bot token внутри tenant workers,
+  двусторонний IPC, TG→MAX outbox, настоящая проверка Bot API.
+- [ ] **P2.2c — live acceptance:** отдельный тестовый Telegram-бот,
+  два MAX-аккаунта, две независимые test-forum группы, проверка
+  изоляции и восстановления после сбоя.
+
 - [ ] Onboarding: /start → Подключить MAX → временная SMS-веб-сессия →
   ONLINE/REAUTH/Disconnect. Код SMS и секреты не сохранять в логах.
 - [x] **P2.1 — локальный Session Capsule прототип (первый срез 23.10.2026).**
@@ -101,11 +114,12 @@
 - [ ] GitHub arvectum2/max2tg (main) — source of truth; GitVerse — зеркало;
   выпуск только после проверенного релиза.
 
-**Следующее рабочее задание:** реальные независимые MAX/TG тестовые
-аккаунты для P0.5b/P1 field acceptance и подключения двух настоящих
-Session Capsules. P2.1 уже реализован и испытан на двух синтетических
-процессах, но это НЕ подтверждение реального multi-user обмена
-сообщениями. Затем — центральный Telegram dispatcher и onboarding.
+**Следующее рабочее задание:** P2.2b — связать центральный Telegram
+Gateway с независимыми MAX workers, вынести исходящий Telegram Bot API
+в единый egress, отключить polling внутри capsule и создать TG→MAX
+durable outbox. Затем на отдельных тестовых аккаунтах пройти P0.5b/P1
+field acceptance и P2.2c (две реальные независимые сессии).
+P2.2a — только offline-архитектура; реальный общий бот не запущен.
 P0.1—P0.4 работают, P0.5a выполнен на изолированных сбойных испытаниях.
 P0.5b остаётся обязательным инфраструктурным этапом перед полноценным
 SaaS SLA. Неоднозначные разрывы истории отмечаются HISTORY_GAP вместо

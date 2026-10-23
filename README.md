@@ -88,6 +88,7 @@
 - P1.3: /find и /findall для поиска MAX-сообщений по тексту/датам, /history в теме для ручной загрузки по 20 старых сообщений; docs/PERSONAL_UX_P1_3.md
 - P1.4: /chatsettings — индивидуальная пауза MAX↔TG, mute, media, history depth, архив и синхронизация названий тем; docs/PERSONAL_UX_P1_4.md
 - P2.1: отдельные Session Capsule, SQLite-реестр, приватные state/credentials/profile, независимые процессы, health и crash-backoff; безопасный тест двух сессий без реальных MAX/TG вызовов: docs/SAAS_P2_1_CAPSULES.md
+- P2.2a: архитектура единого Telegram gateway, owner/forum ACL, durable Telegram Inbox, signed IPC; без подключения реальных аккаунтов: docs/SAAS_P2_2_ARCHITECTURE.md
 - P0.5a: пройдены аварийный SIGKILL + автоматический запуск launchd, SQLite locks, частичные отправки и пограничные timestamp-страницы. Полный физический gate — на отдельном стенде, см. docs/RELIABILITY_P0_5.md
 - На Mac mini хранение настроено в /Users/master/.local/state/max2tg/topics.json, а журналы — в ~/Library/Logs/Arvectum/MAX2TG
 - Авто-переподключение к MAX и алёрт при обрыве
