@@ -300,14 +300,50 @@ async def test_separate_telegram_handler_detects_reaction_only_in_right_group():
     assert any(isinstance(h,MessageReactionHandler)
                for handlers in app.handlers.values() for h in handlers)
 
-async def test_edit_of_previous_multipart_message_is_blocked_even_if_new_text_short(tmp_path):
+async def test_edit_of_previous_multipart_message_replaces_stale_parts(tmp_path):
     sync,topics,ledger,bot=bootstrap(tmp_path)
     mark_bot_authored(sync,topics,ledger,"777",
                       parts=[("send_message",500),("send_message",501)])
-    assert not await sync.accept(128,{"chatId":42,"message":{
+    assert await sync.accept(128,{"chatId":42,"message":{
         "id":"777","status":"EDITED","updateTime":19,"text":"short",
     }})
-    bot.edit_message_text.assert_not_awaited()
+    assert bot.edit_message_text.await_count==2
     assert ledger.db.execute(
-        "SELECT state FROM message_mutations").fetchone()["state"]=="BLOCKED"
+        "SELECT state FROM message_mutations").fetchone()["state"]=="APPLIED"
+    ledger.close()
+
+
+async def test_max_edit_multipart_text_updates_all_bot_owned_parts(tmp_path):
+    sync,topics,ledger,bot=bootstrap(tmp_path)
+    mark_bot_authored(sync,topics,ledger,"multi",
+        parts=[("send_message",500),("send_message",501)])
+    packet={"chatId":42,"message":{"id":"multi","status":"EDITED",
+        "updateTime":123,"text":"Исправлено в MAX"}}
+    assert await sync.accept(128,packet) is True
+    assert [v.kwargs["message_id"] for v in
+            bot.edit_message_text.await_args_list]==[500,501]
+    assert "продолжение изменено" in (
+        bot.edit_message_text.await_args_list[1].kwargs["text"])
+    ledger.close()
+
+
+async def test_max_edit_multipart_media_stays_blocked(tmp_path):
+    sync,topics,ledger,bot=bootstrap(tmp_path)
+    mark_bot_authored(sync,topics,ledger,"multi",
+        parts=[("send_photo",500),("send_message",501)])
+    assert not await sync.accept(128,{"chatId":42,"message":{
+        "id":"multi","status":"EDITED","updateTime":123,
+        "text":"Новая подпись"}})
+    bot.edit_message_text.assert_not_awaited()
+    ledger.close()
+
+
+async def test_max_multipart_edit_refuses_more_parts_than_previously_exist(tmp_path):
+    sync,topics,ledger,bot=bootstrap(tmp_path)
+    mark_bot_authored(sync,topics,ledger,"multi",
+        parts=[("send_message",500),("send_message",501)])
+    assert not await sync.accept(128,{"chatId":42,"message":{
+        "id":"multi","status":"EDITED","updateTime":124,
+        "text":"Хлеб "*3500}})
+    bot.edit_message_text.assert_not_awaited()
     ledger.close()

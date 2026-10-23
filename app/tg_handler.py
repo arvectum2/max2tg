@@ -27,6 +27,8 @@ from app.tg_sender import TelegramSender
 from app.topics import TopicStore
 from app.chat_preferences import get_chat_prefs
 from app.chat_settings_ui import cmd_chatsettings,callback_chatsettings
+from app.operator_issues import (get_issues,format_issues,
+                                 acknowledge_blocked_mutation)
 
 log = logging.getLogger(__name__)
 
@@ -36,6 +38,7 @@ ALLOWED_USER_KEY = "allowed_user_id"  # legacy single-user key
 ALLOWED_USERS_KEY = "allowed_user_ids"
 ADMIN_USER_KEY = "admin_user_id"
 SUPERGROUP_KEY = "supergroup_id"
+TG_OUTBOUND_KEY = "tg_outbound"
 
 _MAX_URL_RE = re.compile(r"https?://(?:web\.)?max\.ru/(-?\d+)")
 _MENU_PAGE_SIZE = 8
@@ -236,6 +239,44 @@ async def _on_topic_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     topic_store: TopicStore = context.bot_data[TOPIC_STORE_KEY]
     elements = _entities_to_max_elements(message.text, message.entities)
     link = _max_reply_link(message, topic_store, max_chat_id)
+    outbound=context.bot_data.get(TG_OUTBOUND_KEY)
+    if outbound is not None:
+        # Durable before MAX RPC. Identical redelivered Telegram updates
+        # must never create a second MAX send.
+        payload={"text":message.text,"elements":elements,"link":link}
+        try:
+            state=outbound.enqueue(
+                context.bot_data[SUPERGROUP_KEY],message.message_id,
+                max_chat_id,payload)
+            if state=="SENT":
+                await message.set_reaction("👀")
+                return
+            if state!="RECEIVED":
+                await message.reply_text(
+                    "⚠️ Сообщение уже учтено; статус: "+state+
+                    ". /status — проверка, повтор автоматически запрещён.")
+                return
+            state=await outbound.deliver_one(
+                max_client,context.bot_data[SUPERGROUP_KEY],message.message_id,
+                is_allowed=lambda cid: get_chat_prefs(topic_store,cid).sync
+                and topic_store.get_topic(cid) is not None)
+            if state=="SENT":
+                try:await message.set_reaction("👀")
+                except Exception:pass
+            elif state=="RECEIVED":
+                await message.reply_text("⏳ Сообщение сохранено и ожидает подключения MAX.")
+            else:
+                await message.reply_text(
+                    "⚠️ Отправка в MAX не подтверждена ("+state+
+                    "). Автоматически повторять нельзя. /status — диагностика.")
+        except Exception:
+            log.exception("TG outbound persistence/delivery failure")
+            await message.reply_text(
+                "⚠️ Ошибка очереди MAX. Проверь /status; не пересылай "
+                "сообщение повторно, пока статус не выяснен.")
+        return
+    # Compatibility path for the existing integration tests and
+    # applications which have not installed a persistent ledger yet.
     send_kwargs = {"elements": elements, "telegram_message_id": message.message_id}
     if link:
         send_kwargs["link"] = link
@@ -1906,6 +1947,42 @@ async def _cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                               disable_web_page_preview=True)
 
 
+async def _cmd_issues(update: Update,context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message is None or not _is_admin_user(update,context):
+        return
+    client=context.bot_data.get(MAX_CLIENT_KEY)
+    sync=getattr(client,"message_sync",None)
+    if sync is None:
+        await update.message.reply_text("Диагностика пока недоступна.")
+        return
+    tg_outbound=context.bot_data.get(TG_OUTBOUND_KEY)
+    issues=get_issues(sync.outbox,tg_outbound)
+    await update.message.reply_text(
+        format_issues(issues),parse_mode="HTML",do_quote=False)
+
+
+async def _cmd_issue_ack(update: Update,context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message is None or not _is_admin_user(update,context):
+        return
+    client=context.bot_data.get(MAX_CLIENT_KEY)
+    sync=getattr(client,"message_sync",None)
+    if sync is None:
+        return
+    args=context.args or []
+    if len(args)!=1:
+        await update.message.reply_text(
+            "Укажи код из /issues: /issue_ack КОД")
+        return
+    try:
+        acknowledge_blocked_mutation(sync.outbox,args[0])
+    except ValueError as exc:
+        await update.message.reply_text(str(exc))
+        return
+    await update.message.reply_text(
+        "✅ Операция помечена REVIEWED: просмотрена оператором, "
+        "но НЕ применена в Telegram. Это не повторная отправка.")
+
+
 async def _cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Admin-only diagnostics without content/credentials and network mutation."""
     if update.message is None or not _is_admin_user(update,context):
@@ -2466,6 +2543,8 @@ def build_tg_app(token: str, max_client: MaxClient, supergroup_id: str,
     app.add_handler(CommandHandler("leave", _cmd_leave, filters=chat_filter))
     app.add_handler(CommandHandler("help", _cmd_help, filters=chat_filter))
     app.add_handler(CommandHandler("status", _cmd_status, filters=chat_filter))
+    app.add_handler(CommandHandler("issues", _cmd_issues, filters=chat_filter))
+    app.add_handler(CommandHandler("issue_ack", _cmd_issue_ack, filters=chat_filter))
     app.add_handler(CallbackQueryHandler(_on_health_callback, pattern=r"^health:"))
     app.add_handler(CallbackQueryHandler(callback_find, pattern=r"^find:"))
     app.add_handler(CallbackQueryHandler(callback_history, pattern=r"^history:"))

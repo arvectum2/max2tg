@@ -191,12 +191,42 @@ class MessageSync:
                 # Only edit original bot-authored messages. A TG-originated
                 # message belongs to a user and is not editable by the bot.
                 ids = self._known_bot_message_ids(chat_id,mid)
-                if not ids or len(ids) > 1:
-                    # Editing only the first part of a long message would
-                    # leave its old continuation visible and misleading.
-                    # Require an atomic multi-part edit plan in a later step.
+                if not ids:
                     self._set(key,"BLOCKED")
                     return False
+                if len(ids)>1:
+                    # Best-effort idempotent replacement of bot-owned TEXT
+                    # parts only. Never delete or alter media on a guess.
+                    # Cannot append new segments safely; such edits stay
+                    # BLOCKED until an operator reconciles them.
+                    from app.tg_sender import split_telegram_html
+                    pieces=self.db.execute(
+                        "SELECT method,tg_id FROM parts WHERE job_key=? "
+                        "AND state='SENT' ORDER BY ordinal",
+                        (self.outbox.job_key(chat_id,mid),)).fetchall()
+                    if (len(pieces)!=len(ids) or
+                        any(piece["method"]!="send_message" for piece in pieces)):
+                        self._set(key,"BLOCKED")
+                        return False
+                    chunks=split_telegram_html(text)
+                    if len(chunks)>len(pieces):
+                        self._set(key,"BLOCKED")
+                        return False
+                    # Preserve number of existing Telegram parts, so stale
+                    # continuation text is never left visible after an edit.
+                    chunks+=["<i>[продолжение изменено в MAX]</i>"]*(
+                        len(pieces)-len(chunks))
+                    for piece,chunk in zip(pieces,chunks):
+                        try:
+                            await self.bot.edit_message_text(
+                                chat_id=self.tg_chat_id,
+                                message_id=int(piece["tg_id"]),
+                                text=chunk,parse_mode=ParseMode.HTML)
+                        except BadRequest as exc:
+                            if "message is not modified" not in str(exc).lower():
+                                raise
+                    self._set(key,"APPLIED")
+                    return True
                 # Text/caption selection is based on original API method.
                 method = self.db.execute(
                     "SELECT method FROM parts WHERE job_key=? AND tg_id=?",

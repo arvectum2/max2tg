@@ -42,12 +42,16 @@ def status_text(report: dict | None) -> str:
     outbox = report.get("outbox",{})
     counts = outbox.get("counts",{})
     failures = report.get("mutations",{})
+    tg_out=report.get("tg_outbound",{})
     lines = [
         "🩺 <b>MAX2TG — состояние</b>",
         f"MAX: {labels.get(max_status,'⚠️')} {max_status}",
         f"Telegram: {'✅ работает' if tg.get('polling') else ('⏸️ ожидает MAX' if tg.get('paused_expected') else '⚠️ polling недоступен')}",
         f"Очередь: ожидают {counts.get('RECEIVED',0)+counts.get('RETRY',0)}; "
         f"неопределённые {counts.get('UNKNOWN',0)}; ошибки {counts.get('FAILED',0)}",
+        f"Telegram → MAX: ожидают {tg_out.get('RECEIVED',0)}; "
+        f"неопределённые {tg_out.get('UNKNOWN',0)}; "
+        f"ошибки {tg_out.get('FAILED',0)}",
         f"Изменения: pending {failures.get('PENDING',0)}, "
         f"unknown {failures.get('UNKNOWN',0)}, blocked {failures.get('BLOCKED',0)}",
         f"MAX-темы: {report.get('topics',0)} | курсоры: {report.get('cursors',0)}",
@@ -154,6 +158,10 @@ class HealthSupervisor:
         if not polling and not paused_expected: issues.append("TELEGRAM_POLLING")
         if not disk_ok: issues.append("STATE_DISK")
         if oldest>OUTBOX_OLD_AGE_SEC: issues.append("QUEUE_DELAY")
+        tg_counts=(getattr(self,"tg_outbound",None).counts()
+                   if getattr(self,"tg_outbound",None) else {})
+        if tg_counts.get("UNKNOWN",0): issues.append("TG_OUTBOUND_UNKNOWN")
+        if tg_counts.get("FAILED",0): issues.append("TG_OUTBOUND_FAILED")
         if counts.get("UNKNOWN",0): issues.append("OUTBOX_UNKNOWN")
         if counts.get("FAILED",0): issues.append("OUTBOX_FAILED")
         if mutations.get("UNKNOWN",0): issues.append("MUTATION_UNKNOWN")
@@ -169,6 +177,7 @@ class HealthSupervisor:
                    "authorized":authorized,"rx_age_seconds":age},
             "telegram":{"polling":polling,"paused_expected":paused_expected},
             "outbox":{"counts":counts,"oldest_due_seconds":oldest},
+            "tg_outbound":tg_counts,
             "mutations":mutations,
             "topics":len(self.topics._chats),
             "cursors":len(self.topics._sync),
@@ -218,7 +227,8 @@ class HealthSupervisor:
             self._issue_hits.pop(issue,None)
         important={"REAUTH_REQUIRED","OUTBOX_UNKNOWN","OUTBOX_FAILED",
                    "STATE_DISK","TELEGRAM_POLLING","MUTATION_UNKNOWN",
-                   "MAX_OFFLINE","MAX_STALLED","QUEUE_DELAY","HISTORY_GAP"}
+                   "MAX_OFFLINE","MAX_STALLED","QUEUE_DELAY","HISTORY_GAP",
+                   "TG_OUTBOUND_UNKNOWN","TG_OUTBOUND_FAILED"}
         alertable=[key for key in report["issues"] if key in important
                    and self._issue_hits.get(key,0)>=3
                    and now-self._alerts.get(key,0)>=ALERT_COOLDOWN]

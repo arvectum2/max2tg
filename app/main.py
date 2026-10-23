@@ -14,6 +14,9 @@ from app.tg_handler import build_tg_app, ensure_management_panel, ensure_quick_m
 from app.tg_sender import TelegramSender
 from app.topics import TopicStore
 from app.outbox import OutboxStore
+from app.tg_outbox import TelegramOutbound
+from app.tg_handler import TG_OUTBOUND_KEY
+from app.chat_preferences import get_chat_prefs
 from app.message_sync import MessageSync
 from app.health import HealthSupervisor
 from app.polling import bind_polling_to_max
@@ -79,6 +82,8 @@ async def main():
     topic_store = TopicStore(os.path.join(settings.state_dir, "topics.json"))
 
     outbox = OutboxStore(os.path.join(settings.state_dir, "outbox.sqlite3"))
+    tg_outbound = TelegramOutbound(
+        os.path.join(settings.state_dir,"tg-outbound.sqlite3"),topic_store)
     repaired = outbox.reconcile_mappings(topic_store)
     log.info("Persistent outbox initialized: %s (mappings repaired: %d)",
              outbox.counts(), repaired)
@@ -103,6 +108,7 @@ async def main():
                               allowed_user_ids=settings.tg_allowed_user_ids,
                               admin_user_id=settings.tg_admin_user_id,
                               proxy_url=settings.tg_proxy)
+        tg_app.bot_data[TG_OUTBOUND_KEY]=tg_outbound
         await tg_app.initialize()
         await tg_app.bot.set_my_commands([
             BotCommand("menu", "Действия с MAX-чатами"),
@@ -110,6 +116,7 @@ async def main():
             BotCommand("add", "Подключить чат/канал MAX по ссылке"),
             BotCommand("help", "Справка по bridge"),
             BotCommand("status", "Диагностика MAX2TG"),
+            BotCommand("issues", "Неподтверждённые и заблокированные операции"),
             BotCommand("chatsettings", "Настройки текущего MAX-чата"),
         ])
         await tg_app.start()
@@ -127,13 +134,31 @@ async def main():
     health = HealthSupervisor(client,sender,outbox,topic_store,
                               tg_app,settings.state_dir)
     client.health = health
+    health.tg_outbound=tg_outbound
     health_task = asyncio.create_task(health.monitor(), name="max2tg-health")
+
+    async def tg_outbound_recovery():
+        while True:
+            await asyncio.sleep(20)
+            if not getattr(client,"_authorized",False):
+                continue
+            try:
+                await tg_outbound.drain(
+                    client,is_allowed=lambda cid:
+                    get_chat_prefs(topic_store,cid).sync
+                    and topic_store.get_topic(cid) is not None)
+            except Exception:
+                log.exception("TG outbound recovery encountered an error")
+
+    outbound_task = asyncio.create_task(
+        tg_outbound_recovery(),name="max2tg-tg-outbound")
     log.info("Starting Max listener...")
     try:
         await client.run()
     finally:
         health_task.cancel()
-        await asyncio.gather(health_task,return_exceptions=True)
+        outbound_task.cancel()
+        await asyncio.gather(health_task,outbound_task,return_exceptions=True)
         log.info("Shutting down...")
         if tg_app:
             if tg_app.updater.running:
@@ -142,6 +167,7 @@ async def main():
             await tg_app.shutdown()
         await sender.stop()
         outbox.close()
+        tg_outbound.close()
 
 
 if __name__ == "__main__":
