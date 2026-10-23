@@ -706,6 +706,18 @@ async def catch_up_chat_history(
             return 0
         newest_ts = max(newest_ts, max(timestamps))
 
+        # A historical message may have been edited while the bridge was
+        # offline. The original MAX ID is already mapped, so catch-up normally
+        # skips re-delivery; still apply its latest edited snapshot in place.
+        sync = getattr(client, "message_sync", None)
+        if sync is not None:
+            for entry in ordered:
+                mid = str(entry["id"])
+                if (entry.get("status") == "EDITED"
+                    and sender.topic_store.tg_for_max_message(chat_id,mid)
+                    is not None):
+                    await sync.accept(128,{"chatId":chat_id,"message":entry})
+
         for entry in ordered:
             ts = _max_message_timestamp(entry)
             mid = str(entry["id"])
@@ -819,6 +831,9 @@ def create_max_client(
         while True:
             try:
                 await recover_outbox()
+                sync=getattr(client,"message_sync",None)
+                if sync is not None:
+                    await sync.recover_pending(limit=20)
             except asyncio.CancelledError:
                 raise
             except Exception:

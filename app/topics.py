@@ -177,6 +177,13 @@ class TopicStore:
     def max_for_tg_message(self, max_chat_id: Any, tg_message_id: int) -> str | None:
         return self._by_tg_message.get((str(max_chat_id), int(tg_message_id)))
 
+    def find_max_for_tg_message(self, telegram_message_id: int):
+        """Locate message by TG id; reject ambiguous cross-chat matches."""
+        hits = [(chat_id,max_id) for (chat_id,tg_id),max_id
+                in self._by_tg_message.items()
+                if int(tg_id)==int(telegram_message_id)]
+        return hits[0] if len(hits)==1 else None
+
     def remove(self, max_chat_id: Any) -> int | None:
         """Drop topic and message mappings for a MAX chat."""
         chat_key = str(max_chat_id)

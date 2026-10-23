@@ -81,6 +81,7 @@
 - SOCKS5-прокси для Telegram (`TG_PROXY`)
 - Карта связок переживает рестарт (state/topics.json в Docker; на Mac mini — пользовательский каталог STATE_DIR)
 - SQLite Persistent Outbox для MAX → Telegram: сохранение событий и частей длинных сообщений до отправки, безопасные повторы RetryAfter, блокировка сомнительных таймаутов в UNKNOWN; детали в docs/RELIABILITY_P0_2.md
+- Синхронизация редактирования и реакций MAX/TG, точечные MAX→TG удаления для bot-authored сообщений; ограничения и безопасность в docs/RELIABILITY_P0_3.md
 - На Mac mini хранение настроено в /Users/master/.local/state/max2tg/topics.json, а журналы — в ~/Library/Logs/Arvectum/MAX2TG
 - Авто-переподключение к MAX и алёрт при обрыве
 - На live Mac mini bridge работает под `launchd` (`RunAtLoad + KeepAlive`), а отдельный session-watch каждые 30 секунд проверяет выделенный Chrome-профиль `MAX`: при ротации `__oneme_auth` он локально обновляет `MAX_TOKEN` и перезапускает bridge без ручных действий

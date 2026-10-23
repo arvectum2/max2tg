@@ -79,6 +79,12 @@ class OpCode(IntEnum):
     SEND_MESSAGE = 64
     ATTACH_TYPING = 65        # "I'm uploading <type> in this chat"
     EDIT_MESSAGE = 67
+    # Deletion opcode 66 intentionally NOT exposed for sends: known cascade risk.
+    REACTION_SET = 178
+    REACTION_REMOVE = 179
+    DELETION_PUSH = 142
+    REACTION_PUSH = 156
+    REACTION_PUSH_ALTERNATE = 155
     PHOTO_UPLOAD_URL = 80     # get URL for photo upload
     AUDIO_UPLOAD_URL = 86     # get URL for voice/audio upload (experimental)
     FILE_UPLOAD_URL = 87      # get URL for file upload
@@ -113,6 +119,7 @@ class MaxClient:
         self._my_id = None
         self._on_ready_cb = None
         self._on_message_cb = None
+        self._on_mutation_cb = None
         self._pending_previews = {}
         self._active_previews = set()
         self._telegram_outbound = {}  # cid -> Telegram-originated pending send
@@ -133,6 +140,10 @@ class MaxClient:
 
     def on_message(self, func):
         self._on_message_cb = func
+        return func
+
+    def on_mutation(self, func):
+        self._on_mutation_cb = func
         return func
 
     def on_disconnect(self, func):
@@ -318,6 +329,14 @@ class MaxClient:
                     task.add_done_callback(_log_task_exception)
 
             elif op == OpCode.DISPATCH:
+                body = payload.get("message") if isinstance(payload,dict) else None
+                if isinstance(body,dict) and (
+                    body.get("status")=="EDITED" or body.get("updateTime")
+                ):
+                    if self._on_mutation_cb:
+                        task = asyncio.create_task(self._on_mutation_cb(int(op),payload))
+                        task.add_done_callback(_log_task_exception)
+                    return
                 self._dispatch_counter += 1
                 if self.debug and self._dispatch_counter <= 20:
                     self._dump_json(
@@ -339,6 +358,12 @@ class MaxClient:
                             task = asyncio.create_task(self._on_message_cb(msg))
                         if task is not None:
                             task.add_done_callback(_log_task_exception)
+
+            elif op in (OpCode.DELETION_PUSH, OpCode.REACTION_PUSH,
+                        OpCode.REACTION_PUSH_ALTERNATE) and cmd == 0:
+                if self._on_mutation_cb:
+                    task = asyncio.create_task(self._on_mutation_cb(int(op),payload))
+                    task.add_done_callback(_log_task_exception)
 
             elif op == OpCode.UPLOAD_READY:
                 # Server confirms an uploaded file/video finished server-side processing.
@@ -462,6 +487,39 @@ class MaxClient:
         log.info("send_message(chat=%s, attaches=%d) → %s",
                  chat_id, len(attaches), "OK" if ok else "FAIL")
         return resp
+
+    async def edit_message(self, chat_id, max_message_id, text: str,
+                           elements: list | None = None) -> dict | None:
+        """Edit owned MAX text (no delete opcodes, no automatic retry)."""
+        if not max_message_id or not isinstance(text,str):
+            return None
+        result = await self.cmd(OpCode.EDIT_MESSAGE, {
+            "chatId":chat_id, "messageId":str(max_message_id),
+            "text":text, "elements":elements if elements is not None else [],
+            "attachments":[],
+        },none_on_timeout=True)
+        if not isinstance(result,dict) or result.get("_max_error"):
+            return result
+        msg=result.get("message") or {}
+        if str(msg.get("id"))!=str(max_message_id):
+            return None
+        return result
+
+    async def react_to_message(self, chat_id, max_message_id,
+                               emoji: str | None) -> dict | None:
+        """Only explicit reaction emojis; remove an existing reaction with None."""
+        if not str(max_message_id).isdigit():
+            return None
+        fields={"chatId":chat_id,"messageId":int(max_message_id)}
+        if emoji:
+            fields["reaction"]={"reactionType":"EMOJI","id":emoji}
+            op=OpCode.REACTION_SET
+        else:
+            op=OpCode.REACTION_REMOVE
+        result=await self.cmd(op,fields,none_on_timeout=True)
+        if result is None or (isinstance(result,dict) and result.get("_max_error")):
+            return None
+        return result
 
     async def fetch_chats(self, chat_ids: list) -> dict | None:
         """Fetch current metadata for one or more MAX chats via opcode 48."""

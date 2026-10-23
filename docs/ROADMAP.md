@@ -29,7 +29,7 @@
   PENDING → SENDING → SENT, RETRY/UNKNOWN при ошибке, durable payload,
   retry с backoff, сохранение каждой части текста/медиа. Не считать сетевой
   timeout гарантированным отказом: Telegram API не даёт exactly-once.
-- [ ] **P0.3 — edit/delete/reactions.** Проверка реальных MAX opcodes;
+- [x] **P0.3 — edit/delete/reactions (безопасный поддерживаемый срез 23.10.2026).** Проверка реальных MAX opcodes;
   двусторонние изменения/удаления/реакции только если API поддерживает,
   корректное отображение и idempotency.
 - [ ] **P0.4 — health + autorecovery.** Монитор WebSocket, Telegram API/polling,
@@ -83,11 +83,14 @@
 - [ ] GitHub arvectum2/max2tg (main) — source of truth; GitVerse — зеркало;
   выпуск только после проверенного релиза.
 
-**Следующее рабочее задание:** P0.3 (edit/delete/reactions). P0.1 и
-P0.2 реализованы на уровне кода и тестов для направления MAX → Telegram.
-Протокол приёмки сетевых/дисковых отказов остаётся в P0.5; статус UNKNOWN
-проверяется и разрешается оператором, без слепого повторного отправления.
-Подробнее: docs/RELIABILITY_P0_1.md и docs/RELIABILITY_P0_2.md.
+**Следующее рабочее задание:** P0.4 (Health + autorecovery). P0.1—P0.3
+выполнены на уровне кода и тестов с задокументированными ограничениями.
+P0.3 покрывает MAX/TG edit и reaction в обе стороны и одиночное MAX→TG
+delete для сообщений самого бота. Обычные Telegram-delete события
+Bot API не передаёт, а опасная операция MAX opcode 66 отключена.
+Физические тесты отказов остаются в P0.5. Технические границы описаны
+в docs/RELIABILITY_P0_1.md, docs/RELIABILITY_P0_2.md и
+docs/RELIABILITY_P0_3.md.
 
 **Последовательность:** P0.1 → P0.2 → P0.3 → P0.4 → P0.5 → P1 →
 SaaS prototype → SaaS beta → коммерческий запуск.

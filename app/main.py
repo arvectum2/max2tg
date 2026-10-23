@@ -14,6 +14,7 @@ from app.tg_handler import build_tg_app, ensure_management_panel, ensure_quick_m
 from app.tg_sender import TelegramSender
 from app.topics import TopicStore
 from app.outbox import OutboxStore
+from app.message_sync import MessageSync
 
 threading.stack_size(524288)
 
@@ -88,6 +89,10 @@ async def main():
         settings.max_token, settings.max_device_id, sender, settings.max_chat_ids,
         debug=settings.debug,
     )
+    sync = MessageSync(outbox,topic_store,sender.bot,settings.tg_chat_id)
+    client.message_sync = sync
+    client.on_mutation(sync.accept)
+    log.info("MAX edit/delete/reaction event listener initialized")
 
     tg_app = None
     if settings.reply_enabled:

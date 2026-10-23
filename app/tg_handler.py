@@ -13,10 +13,12 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
     MessageHandler,
+    MessageReactionHandler,
     filters,
 )
 
 from app.max_client import MaxClient
+from app.message_sync import REACTION_EMOJI
 from app.tg_sender import TelegramSender
 from app.topics import TopicStore
 
@@ -149,7 +151,7 @@ def _peer_id_in_dm(resolver, chat_id) -> int | None:
 def _resolve_topic_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Common prelude for topic handlers. Returns (message, max_chat_id, max_client)
     if the message should be routed, or None to drop silently."""
-    message = update.message
+    message = update.message or update.edited_message
     if message is None:
         return None
     thread_id = message.message_thread_id
@@ -238,6 +240,72 @@ async def _on_topic_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         topic_store, max_chat_id, message.message_id, resp,
     )
     await _surface_send_result(message, resp)
+
+
+async def _on_edited_topic_message(
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Edit a Telegram-originated MAX message, never send a new copy."""
+    target = _resolve_topic_target(update, context)
+    if not target:
+        return
+    message, chat_id, client = target
+    if not client or not message.text:
+        return
+    mapping: TopicStore = context.bot_data[TOPIC_STORE_KEY]
+    max_id = mapping.max_for_tg_message(chat_id, message.message_id)
+    if max_id is None:
+        # Editing an unrelated Telegram message must not create a new MAX one.
+        return
+    try:
+        result = await client.edit_message(
+            chat_id, max_id, message.text,
+            _entities_to_max_elements(message.text,message.entities),
+        )
+    except Exception:
+        log.exception("MAX edit request failed chat=%s",chat_id)
+        return
+    if result is None or result.get("_max_error"):
+        log.warning("MAX edit not confirmed chat=%s",chat_id)
+
+
+async def _on_message_reaction(
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Only a user's own TG reaction can be set/removed on its MAX mapping."""
+    event = update.message_reaction
+    if event is None or event.user is None:
+        return
+    if int(event.chat.id) != int(context.bot_data.get(SUPERGROUP_KEY,0)):
+        return
+    allowed = context.bot_data.get(ALLOWED_USERS_KEY)
+    if allowed and event.user.id not in allowed:
+        return
+    legacy = context.bot_data.get(ALLOWED_USER_KEY)
+    if not allowed and legacy and event.user.id != legacy:
+        return
+    mapping: TopicStore | None = context.bot_data.get(TOPIC_STORE_KEY)
+    client: MaxClient | None = context.bot_data.get(MAX_CLIENT_KEY)
+    if mapping is None or client is None:
+        return
+    found = mapping.find_max_for_tg_message(event.message_id)
+    if found is None:
+        return
+    chat_id, max_id = found
+    if not str(max_id).isdigit():
+        return
+    new = event.new_reaction or []
+    if len(new)>1 or (new and new[0].type!="emoji"):
+        return
+    emoji = new[0].emoji if new else None
+    if emoji and emoji not in REACTION_EMOJI:
+        return
+    try:
+        result=await client.react_to_message(chat_id,max_id,emoji)
+        if result is None:
+            log.warning("MAX reaction was not confirmed chat=%s",chat_id)
+    except Exception:
+        log.exception("MAX reaction request failed chat=%s",chat_id)
 
 
 async def _download_tg_file(file_obj) -> bytes | None:
@@ -2293,27 +2361,27 @@ def build_tg_app(token: str, max_client: MaxClient, supergroup_id: str,
     # The persistent menu button sends its label as a normal Telegram message.
     # Consume it before search/forwarding, then delete the trigger message.
     app.add_handler(
-        MessageHandler(quick_menu_filter & chat_filter, _on_quick_menu_button),
+        MessageHandler(quick_menu_filter & filters.UpdateType.MESSAGE & chat_filter, _on_quick_menu_button),
         group=-1,
     )
     # Settings and search capture run before ordinary topic forwarding.
     app.add_handler(
         MessageHandler(
-            filters.TEXT & ~filters.COMMAND & ~quick_menu_filter & chat_filter,
+            filters.TEXT & ~filters.COMMAND & ~quick_menu_filter & filters.UpdateType.MESSAGE & chat_filter,
             _on_history_setting_input,
         ),
         group=-2,
     )
     app.add_handler(
         MessageHandler(
-            filters.TEXT & ~filters.COMMAND & ~quick_menu_filter & chat_filter,
+            filters.TEXT & ~filters.COMMAND & ~quick_menu_filter & filters.UpdateType.MESSAGE & chat_filter,
             _on_search_input,
         ),
         group=-1,
     )
     app.add_handler(
         MessageHandler(
-            filters.TEXT & ~filters.COMMAND & ~quick_menu_filter & chat_filter,
+            filters.TEXT & ~filters.COMMAND & ~quick_menu_filter & filters.UpdateType.MESSAGE & chat_filter,
             _on_topic_message,
         )
     )
@@ -2322,7 +2390,17 @@ def build_tg_app(token: str, max_client: MaxClient, supergroup_id: str,
         | filters.Document.ALL | filters.VIDEO
     )
     app.add_handler(
-        MessageHandler(media_filter & chat_filter, _on_topic_media)
+        MessageHandler(media_filter & filters.UpdateType.MESSAGE & chat_filter, _on_topic_media)
     )
+
+    app.add_handler(MessageHandler(
+        filters.UpdateType.EDITED_MESSAGE & filters.TEXT
+        & ~filters.COMMAND & chat_filter,
+        _on_edited_topic_message,
+    ))
+    app.add_handler(MessageReactionHandler(
+        _on_message_reaction,
+        message_reaction_types=MessageReactionHandler.MESSAGE_REACTION_UPDATED,
+    ))
 
     return app
