@@ -49,8 +49,7 @@
 
 ### P1 — Personal UX v1.2
 
-- [ ] Передача структурных MAX elements и форматирования Telegram:
-  bold, italic, lists, quote, code, hyperlink, mentions.
+- [x] **P1.1 — MAX elements → Telegram HTML (23.10.2026).** Bold/italic/underline/strike/code/quote/links/verified mentions, безопасные ссылки, Unicode и длинные сообщения. Маркеры списков без структуры сохраняются текстом; docs/PERSONAL_UX_P1_1.md.
 - [ ] Фотоальбомы, видео, файлы, voice, previews, безопасные fallback.
 - [ ] Поиск сообщений: по тексту, датам, чатам; загрузка старой истории
   из темы Telegram кнопкой, без ручных IDs.
@@ -87,7 +86,7 @@
 - [ ] GitHub arvectum2/max2tg (main) — source of truth; GitVerse — зеркало;
   выпуск только после проверенного релиза.
 
-**Следующее рабочее задание:** P1.1 (форматирование MAX elements и ссылки).
+**Следующее рабочее задание:** P1.2 (фотоальбомы, оригинальные медиа, voice и fallback). P1.1 реализован для live, history, forward, captions и edits.
 P0.1—P0.4 работают, P0.5a выполнен на изолированных сбойных испытаниях.
 P0.5b остаётся обязательным инфраструктурным этапом перед полноценным
 SaaS SLA. Неоднозначные разрывы истории отмечаются HISTORY_GAP вместо

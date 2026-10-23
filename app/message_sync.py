@@ -17,6 +17,7 @@ from telegram.constants import ParseMode
 from telegram.error import BadRequest, TelegramError, TimedOut
 
 from app.outbox import OutboxStore
+from app.max_formatting import format_max_html
 from app.topics import TopicStore
 
 log = logging.getLogger(__name__)
@@ -174,7 +175,8 @@ class MessageSync:
                             return False
                 if not isinstance(msg.get("text"),str):
                     return False
-                text = f"✏️ <b>Изменено в MAX</b>\n{escape(msg['text'])}"
+                text = ("✏️ <b>Изменено в MAX</b>\n"
+                        + format_max_html(msg["text"], msg.get("elements")))
                 # Only edit original bot-authored messages. A TG-originated
                 # message belongs to a user and is not editable by the bot.
                 ids = self._known_bot_message_ids(chat_id,mid)

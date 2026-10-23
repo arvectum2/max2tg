@@ -8,6 +8,7 @@ from app.max_client import MaxClient, MaxMessage
 from app.resolver import ContactResolver
 from app.tg_sender import TelegramSender
 from app.outbox import OutboxStore, current_delivery
+from app.max_formatting import format_max_html
 
 log = logging.getLogger(__name__)
 
@@ -279,6 +280,7 @@ async def _handle_linked_message(
         message_id=msg.message_id if msg else "",
         text=fwd_text,
         attaches=fwd_attaches,
+        raw={"message": inner},
     )
     return await _send_message_content(
         nested, f"{header_text}\n{prefix}", client, sender, thread_id,
@@ -288,7 +290,10 @@ async def _handle_linked_message(
 def _message_body(msg: MaxMessage) -> str:
     """Include SHARE link previews inside the original text once."""
     raw = msg.text or ""
-    parts = [escape(raw)] if raw else []
+    elements = ((msg.raw.get("message") or {}).get("elements")
+                if isinstance(msg.raw, dict)
+                and isinstance(msg.raw.get("message"), dict) else None)
+    parts = [format_max_html(raw, elements)] if raw else []
     for att in msg.attaches:
         if not isinstance(att, dict) or att.get("_type") != "SHARE":
             continue
@@ -444,7 +449,7 @@ async def _deliver_history_message(
         comment = None
         if msg.text:
             comment = await sender.send(
-                f"{header_text}\n{escape(msg.text)}",
+                f"{header_text}\n{_message_body(msg)}",
                 message_thread_id=thread_id,
             )
         _remember_message(sender, msg, comment or forwarded)
@@ -1102,7 +1107,7 @@ def create_max_client(
             comment = None
             if msg.text:
                 comment = await sender.send(
-                    f"{header_text}\n{escape(msg.text)}",
+                    f"{header_text}\n{_message_body(msg)}",
                     message_thread_id=thread_id,
                 )
             _remember_message(sender, msg, comment or forwarded)
