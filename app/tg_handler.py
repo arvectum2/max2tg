@@ -39,6 +39,7 @@ ALLOWED_USERS_KEY = "allowed_user_ids"
 ADMIN_USER_KEY = "admin_user_id"
 SUPERGROUP_KEY = "supergroup_id"
 TG_OUTBOUND_KEY = "tg_outbound"
+TG_MUTATIONS_KEY = "tg_mutations"
 
 _MAX_URL_RE = re.compile(r"https?://(?:web\.)?max\.ru/(-?\d+)")
 _MENU_PAGE_SIZE = 8
@@ -312,6 +313,18 @@ async def _on_edited_topic_message(
     if max_id is None:
         # Editing an unrelated Telegram message must not create a new MAX one.
         return
+    ledger=context.bot_data.get(TG_MUTATIONS_KEY)
+    if ledger is not None:
+        try:
+            key=ledger.enqueue("edit",chat_id,max_id,{
+                "text":message.text,
+                "elements":_entities_to_max_elements(message.text,message.entities)})
+            outcome=await ledger.apply(key,client)
+            if outcome not in ("SENT","RECEIVED"):
+                log.warning("TG edit requires review: %s",outcome)
+        except Exception:
+            log.exception("Durable TG edit failed")
+        return
     try:
         result = await client.edit_message(
             chat_id, max_id, message.text,
@@ -356,6 +369,16 @@ async def _on_message_reaction(
         return
     emoji = new[0].emoji if new else None
     if emoji and emoji not in REACTION_EMOJI:
+        return
+    ledger=context.bot_data.get(TG_MUTATIONS_KEY)
+    if ledger is not None:
+        try:
+            key=ledger.enqueue("reaction",chat_id,max_id,{"emoji":emoji})
+            outcome=await ledger.apply(key,client)
+            if outcome not in ("SENT","RECEIVED"):
+                log.warning("TG reaction requires review: %s",outcome)
+        except Exception:
+            log.exception("Durable TG reaction failed")
         return
     try:
         result=await client.react_to_message(chat_id,max_id,emoji)
@@ -2036,7 +2059,8 @@ async def _cmd_issues(update: Update,context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text("Диагностика пока недоступна.")
         return
     tg_outbound=context.bot_data.get(TG_OUTBOUND_KEY)
-    issues=get_issues(sync.outbox,tg_outbound)
+    issues=get_issues(sync.outbox,tg_outbound,
+                      tg_mutations=context.bot_data.get(TG_MUTATIONS_KEY))
     await update.message.reply_text(
         format_issues(issues),parse_mode="HTML",do_quote=False)
 

@@ -313,3 +313,5 @@ max2tg/
 Большое спасибо [nsdkinx/vkmax](https://github.com/nsdkinx/vkmax) и [max-messenger/max-botapi-python](https://github.com/max-messenger/max-botapi-python) за документацию опкодов и enum'ы стилей.
 
 Personal reliability: durable Telegram→MAX text/reply/media queue, /issues operator triage, safe multipart text edits and isolated backup restore drill; docs/PERSONAL_RELIABILITY_FINISH.md. Edit/reaction durability and physical acceptance remain open.
+
+Personal v1.2/P0.6: **Maintenance** (23.10.2026). Text/media, edits/reactions journals; test-account fault injection deferred by owner.

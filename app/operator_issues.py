@@ -8,7 +8,7 @@ import time
 PREFIX=re.compile(r"^[0-9a-f]{12,64}$")
 
 
-def get_issues(outbox,tg_outbound=None,limit=12):
+def get_issues(outbox,tg_outbound=None,limit=12,tg_mutations=None):
     results=[]
     for row in outbox.db.execute(
         "SELECT key,kind,chat_id,max_id,state,attempts FROM message_mutations "
@@ -44,6 +44,16 @@ def get_issues(outbox,tg_outbound=None,limit=12):
             results.append({"ref":None,"key":None,
                             "category":"Telegram→MAX","kind":"delivery",
                             "state":row["status"],"cause":"Неясная отправка",
+                            "attempts":None})
+    if tg_mutations:
+        for row in tg_mutations.db.execute(
+            "SELECT kind,status FROM tg_mutations "
+            "WHERE status IN ('UNKNOWN','FAILED') ORDER BY updated DESC LIMIT ?",
+            (limit,)):
+            results.append({"ref":None,"key":None,
+                            "category":"Telegram→MAX изменение",
+                            "kind":row["kind"],"state":row["status"],
+                            "cause":"Нужна ручная сверка, повтор запрещён",
                             "attempts":None})
     return results[:limit]
 

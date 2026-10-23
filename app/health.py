@@ -43,6 +43,7 @@ def status_text(report: dict | None) -> str:
     counts = outbox.get("counts",{})
     failures = report.get("mutations",{})
     tg_out=report.get("tg_outbound",{})
+    tg_mut=report.get("tg_mutations",{})
     lines = [
         "🩺 <b>MAX2TG — состояние</b>",
         f"MAX: {labels.get(max_status,'⚠️')} {max_status}",
@@ -52,6 +53,8 @@ def status_text(report: dict | None) -> str:
         f"Telegram → MAX: ожидают {tg_out.get('RECEIVED',0)}; "
         f"неопределённые {tg_out.get('UNKNOWN',0)}; "
         f"ошибки {tg_out.get('FAILED',0)}",
+        f"TG→MAX правки/реакции: unknown {tg_mut.get('UNKNOWN',0)}, "
+        f"failed {tg_mut.get('FAILED',0)}",
         f"Изменения: pending {failures.get('PENDING',0)}, "
         f"unknown {failures.get('UNKNOWN',0)}, blocked {failures.get('BLOCKED',0)}",
         f"MAX-темы: {report.get('topics',0)} | курсоры: {report.get('cursors',0)}",
@@ -158,8 +161,12 @@ class HealthSupervisor:
         if not polling and not paused_expected: issues.append("TELEGRAM_POLLING")
         if not disk_ok: issues.append("STATE_DISK")
         if oldest>OUTBOX_OLD_AGE_SEC: issues.append("QUEUE_DELAY")
+        tg_mutations=(getattr(self,"tg_mutations",None).counts()
+                      if getattr(self,"tg_mutations",None) else {})
         tg_counts=(getattr(self,"tg_outbound",None).counts()
                    if getattr(self,"tg_outbound",None) else {})
+        if tg_mutations.get("UNKNOWN",0): issues.append("TG_MUTATION_UNKNOWN")
+        if tg_mutations.get("FAILED",0): issues.append("TG_MUTATION_FAILED")
         if tg_counts.get("UNKNOWN",0): issues.append("TG_OUTBOUND_UNKNOWN")
         if tg_counts.get("FAILED",0): issues.append("TG_OUTBOUND_FAILED")
         if counts.get("UNKNOWN",0): issues.append("OUTBOX_UNKNOWN")
@@ -178,6 +185,7 @@ class HealthSupervisor:
             "telegram":{"polling":polling,"paused_expected":paused_expected},
             "outbox":{"counts":counts,"oldest_due_seconds":oldest},
             "tg_outbound":tg_counts,
+            "tg_mutations":tg_mutations,
             "mutations":mutations,
             "topics":len(self.topics._chats),
             "cursors":len(self.topics._sync),
@@ -228,7 +236,8 @@ class HealthSupervisor:
         important={"REAUTH_REQUIRED","OUTBOX_UNKNOWN","OUTBOX_FAILED",
                    "STATE_DISK","TELEGRAM_POLLING","MUTATION_UNKNOWN",
                    "MAX_OFFLINE","MAX_STALLED","QUEUE_DELAY","HISTORY_GAP",
-                   "TG_OUTBOUND_UNKNOWN","TG_OUTBOUND_FAILED"}
+                   "TG_OUTBOUND_UNKNOWN","TG_OUTBOUND_FAILED",
+                   "TG_MUTATION_UNKNOWN","TG_MUTATION_FAILED"}
         alertable=[key for key in report["issues"] if key in important
                    and self._issue_hits.get(key,0)>=3
                    and now-self._alerts.get(key,0)>=ALERT_COOLDOWN]

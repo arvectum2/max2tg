@@ -15,7 +15,8 @@ from app.tg_sender import TelegramSender
 from app.topics import TopicStore
 from app.outbox import OutboxStore
 from app.tg_outbox import TelegramOutbound
-from app.tg_handler import TG_OUTBOUND_KEY
+from app.tg_mutation_outbox import TgMutationOutbox
+from app.tg_handler import TG_OUTBOUND_KEY, TG_MUTATIONS_KEY
 from app.chat_preferences import get_chat_prefs
 from app.message_sync import MessageSync
 from app.health import HealthSupervisor
@@ -84,6 +85,8 @@ async def main():
     outbox = OutboxStore(os.path.join(settings.state_dir, "outbox.sqlite3"))
     tg_outbound = TelegramOutbound(
         os.path.join(settings.state_dir,"tg-outbound.sqlite3"),topic_store)
+    tg_mutations=TgMutationOutbox(
+        os.path.join(settings.state_dir,"tg-mutations.sqlite3"))
     repaired = outbox.reconcile_mappings(topic_store)
     log.info("Persistent outbox initialized: %s (mappings repaired: %d)",
              outbox.counts(), repaired)
@@ -109,6 +112,7 @@ async def main():
                               admin_user_id=settings.tg_admin_user_id,
                               proxy_url=settings.tg_proxy)
         tg_app.bot_data[TG_OUTBOUND_KEY]=tg_outbound
+        tg_app.bot_data[TG_MUTATIONS_KEY]=tg_mutations
         await tg_app.initialize()
         await tg_app.bot.set_my_commands([
             BotCommand("menu", "Действия с MAX-чатами"),
@@ -135,6 +139,7 @@ async def main():
                               tg_app,settings.state_dir)
     client.health = health
     health.tg_outbound=tg_outbound
+    health.tg_mutations=tg_mutations
     health_task = asyncio.create_task(health.monitor(), name="max2tg-health")
 
     async def tg_outbound_recovery():
@@ -168,6 +173,7 @@ async def main():
         await sender.stop()
         outbox.close()
         tg_outbound.close()
+        tg_mutations.close()
 
 
 if __name__ == "__main__":
