@@ -112,6 +112,7 @@ class MaxClient:
         self._on_message_cb = None
         self._pending_previews = {}
         self._active_previews = set()
+        self._telegram_outbound = {}  # cid -> Telegram-originated pending send
         self._heartbeat_task: asyncio.Task | None = None
         self._session: aiohttp.ClientSession | None = None
         self._dispatch_counter = 0
@@ -354,6 +355,44 @@ class MaxClient:
         finally:
             self._active_previews.discard(key)
 
+    def _prune_telegram_outbound(self):
+        now = time.monotonic()
+        for cid, rec in list(self._telegram_outbound.items()):
+            if now - rec["created"] > 60:
+                self._telegram_outbound.pop(cid, None)
+
+    async def telegram_echo_tg_id(self, msg: MaxMessage) -> int | None:
+        """Suppress only verified TG->MAX echoes, including pre-ACK DISPATCH."""
+        if not msg.message_id:
+            return None
+        self._prune_telegram_outbound()
+        raw = msg.raw.get("message") or {}
+        observed_cid = str(raw["cid"]) if raw.get("cid") is not None else None
+        has_media = any(
+            isinstance(a, dict) and a.get("_type") not in
+            ("SHARE", "CONTROL", "WIDGET", "INLINE_KEYBOARD")
+            for a in msg.attaches
+        )
+        for rec in list(self._telegram_outbound.values()):
+            if rec["chat"] != str(msg.chat_id):
+                continue
+            matched_id = rec["max_id"] == msg.message_id
+            matched_cid = observed_cid is not None and observed_cid == rec["cid"]
+            pending = (not rec["done"].is_set() and
+                       rec["text"] == (msg.text or "") and rec["media"] == has_media)
+            if not (matched_id or matched_cid or pending):
+                continue
+            if pending and not (matched_id or matched_cid):
+                try:
+                    await asyncio.wait_for(rec["done"].wait(), timeout=11)
+                except asyncio.TimeoutError:
+                    return None
+            if rec["max_id"] == msg.message_id or (
+                observed_cid is not None and rec["cid"] == observed_cid
+            ):
+                return rec["tg_id"]
+        return None
+
     # ── WebSocket RPC: fetch contacts ──────────────────────────────
 
     async def fetch_contacts(self, contact_ids: list[int]) -> dict:
@@ -367,7 +406,8 @@ class MaxClient:
         return resp
 
     async def send_message(self, chat_id, text: str = "", elements=None,
-                            attaches=None, link: dict | None = None) -> dict:
+                            attaches=None, link: dict | None = None,
+                            telegram_message_id: int | None = None) -> dict:
         """Send a message to a Max chat. Returns the server response.
 
         Both ``elements`` (text formatting) and ``attaches`` (photos, files,
@@ -384,14 +424,28 @@ class MaxClient:
             message["attaches"] = attaches
         if link:
             message["link"] = link
-        resp = await self.cmd(
-            OpCode.SEND_MESSAGE,
-            {
-                "chatId": chat_id,
-                "message": message,
-                "notify": True,
-            },
-        )
+        record = None
+        if telegram_message_id is not None:
+            self._prune_telegram_outbound()
+            record = {
+                "chat": str(chat_id), "text": text or "",
+                "media": bool(attaches), "cid": str(cid),
+                "max_id": None, "tg_id": int(telegram_message_id),
+                "created": time.monotonic(), "done": asyncio.Event(),
+            }
+            self._telegram_outbound[cid] = record
+        resp = None
+        try:
+            resp = await self.cmd(
+                OpCode.SEND_MESSAGE,
+                {"chatId": chat_id, "message": message, "notify": True},
+            )
+        finally:
+            if record is not None:
+                body = (resp or {}).get("message") or {}
+                if isinstance(body, dict) and body.get("id") is not None:
+                    record["max_id"] = str(body["id"])
+                record["done"].set()
         ok = bool(resp) and "_max_error" not in resp
         log.info("send_message(chat=%s, attaches=%d) → %s",
                  chat_id, len(attaches), "OK" if ok else "FAIL")
@@ -767,7 +821,7 @@ class MaxClient:
             raw=payload,
         )
 
-        if self._my_id and msg.sender_id == self._my_id:
+        if self._my_id is not None and str(msg.sender_id) == str(self._my_id):
             msg.is_self = True
 
         return msg

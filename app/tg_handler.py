@@ -222,7 +222,7 @@ async def _on_topic_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     topic_store: TopicStore = context.bot_data[TOPIC_STORE_KEY]
     elements = _entities_to_max_elements(message.text, message.entities)
     link = _max_reply_link(message, topic_store, max_chat_id)
-    send_kwargs = {"elements": elements}
+    send_kwargs = {"elements": elements, "telegram_message_id": message.message_id}
     if link:
         send_kwargs["link"] = link
     try:
@@ -335,6 +335,7 @@ async def _on_topic_media(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "text": caption,
         "elements": elements,
         "attaches": [attach],
+        "telegram_message_id": message.message_id,
     }
     if link:
         send_kwargs["link"] = link

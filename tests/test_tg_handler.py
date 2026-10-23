@@ -89,7 +89,7 @@ class TestOnTopicMessage:
 
         await _on_topic_message(update, ctx)
 
-        max_client.send_message.assert_called_once_with(42, "Hello", elements=[])
+        max_client.send_message.assert_called_once_with(42, "Hello", elements=[], telegram_message_id=500)
 
     async def test_reacts_on_success(self):
         max_client = MagicMock()
@@ -232,6 +232,7 @@ class TestOnTopicMessage:
             42,
             "Ответ",
             elements=[],
+            telegram_message_id=500,
             link={"type": "REPLY", "messageId": "max-old"},
         )
         store.set_message.assert_called_once_with(42, "max-new", 500)

@@ -694,11 +694,14 @@ def create_max_client(
                 log.exception("Could not refresh metadata for new chat=%s", msg.chat_id)
 
         if msg.is_self:
+            # Browser-originated messages must be mirrored as well. On a new
+            # chat, history import may already include this exact message.
             if sender.topic_store.get_topic(msg.chat_id) is None:
                 await _bootstrap_chat_topic(client, sender, resolver, msg.chat_id)
+                if sender.topic_store.get_topic(msg.chat_id) is None:
+                    return
             else:
                 _remember_known_chat(sender, msg.chat_id)
-            return
 
         # A delayed SHARE preview must not be forwarded as a second message.
         if msg.message_id and sender.topic_store.tg_for_max_message(
@@ -707,8 +710,15 @@ def create_max_client(
             log.debug("Already forwarded message %s", msg.message_id)
             return
 
-        raw_sender = ""
-        if msg.sender_id is not None:
+        if msg.is_self:
+            echo_tg_id = await client.telegram_echo_tg_id(msg)
+            if echo_tg_id is not None:
+                sender.topic_store.set_message(msg.chat_id, msg.message_id, echo_tg_id)
+                log.info("Suppressed Telegram-originated MAX echo max=%s", msg.message_id)
+                return
+
+        raw_sender = "Вы" if msg.is_self else ""
+        if not msg.is_self and msg.sender_id is not None:
             raw_sender = await resolver.resolve_user(msg.sender_id)
         is_dm = resolver.is_dm(msg.chat_id)
         raw_chat = resolver.chat_name(msg.chat_id)
