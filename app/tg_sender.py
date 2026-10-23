@@ -1,6 +1,8 @@
 import asyncio
 import io
 import logging
+from html import escape
+from html.parser import HTMLParser
 
 from telegram import Bot, InputFile
 from telegram.constants import ParseMode
@@ -15,6 +17,99 @@ TG_MAX_LENGTH = 4096
 TG_CAPTION_MAX = 1024
 TG_TOPIC_NAME_MAX = 128
 MAX_RETRIES = 3
+# Telegram validates text length AFTER parsing HTML entities; UTF-16 units
+# are the safest bound (including astral emoji). Leave margin for entities.
+TG_TEXT_PART_MAX = 3500
+TG_CAPTION_PART_MAX = 900
+
+
+def _utf16_length(value: str) -> int:
+    return len(value.encode("utf-16-le")) // 2
+
+
+def _take_part(value: str, capacity: int) -> int:
+    """Choose a Unicode-safe cut, preferring paragraphs / word boundaries."""
+    size = 0
+    end = 0
+    for index, char in enumerate(value):
+        units = 2 if ord(char) > 0xFFFF else 1
+        if size + units > capacity:
+            break
+        end = index + 1
+        size += units
+    if end == len(value):
+        return end
+    # Keep exact characters, including spaces and newlines, across splits.
+    piece = value[:end]
+    for mark in ("\n", " "):
+        cut = piece.rfind(mark)
+        if cut >= end // 2 and cut > 0:
+            return cut + 1
+    return end
+
+
+class _HTMLChunker(HTMLParser):
+    """Split Telegram HTML with balanced markup and no lost visible text."""
+
+    def __init__(self, max_units: int):
+        super().__init__(convert_charrefs=True)
+        self.max_units = max_units
+        self.stack: list[tuple[str, str]] = []
+        self.buffer: list[str] = []
+        self.units = 0
+        self.parts: list[str] = []
+
+    def _flush(self):
+        if self.units == 0:
+            return
+        suffix = "".join(f"</{tag}>" for tag, _ in reversed(self.stack))
+        self.parts.append("".join(self.buffer) + suffix)
+        self.buffer = [opening for _, opening in self.stack]
+        self.units = 0
+
+    def handle_starttag(self, tag, attrs):
+        opening = self.get_starttag_text()
+        self.stack.append((tag, opening))
+        self.buffer.append(opening)
+
+    def handle_endtag(self, tag):
+        # HTML sent by the bridge is balanced. Preserve well-formed nesting.
+        if self.stack and self.stack[-1][0] == tag:
+            self.stack.pop()
+            self.buffer.append(f"</{tag}>")
+
+    def handle_data(self, data):
+        while data:
+            if self.units >= self.max_units:
+                self._flush()
+            count = _take_part(data, self.max_units - self.units)
+            if count <= 0:
+                raise ValueError("Cannot split Telegram message at a Unicode boundary")
+            portion, data = data[:count], data[count:]
+            self.buffer.append(escape(portion, quote=False))
+            self.units += _utf16_length(portion)
+            if data:
+                self._flush()
+
+    def handle_startendtag(self, tag, attrs):
+        self.buffer.append(self.get_starttag_text())
+
+
+def split_telegram_html(text: str, max_units: int = TG_TEXT_PART_MAX) -> list[str]:
+    """Return valid HTML parts; each displays <= max_units UTF-16 units."""
+    if not text:
+        return []
+    if max_units < 2:
+        raise ValueError("max_units must be >= 2")
+    # Preserve short inputs literally; avoid unnecessary HTML normalization.
+    if _utf16_length(text) <= max_units:
+        return [text]
+    parser = _HTMLChunker(max_units)
+    parser.feed(text)
+    parser.close()
+    parser._flush()
+    return parser.parts
+
 
 
 def _looks_numeric(title: str) -> bool:
@@ -105,10 +200,23 @@ class TelegramSender:
 
     # ── helpers ────────────────────────────────────────────────────
 
-    def _truncate_caption(self, text: str) -> str:
-        if len(text) > TG_CAPTION_MAX:
-            return text[: TG_CAPTION_MAX - 20] + "\n\n[...усечено]"
-        return text
+    @staticmethod
+    def _caption_parts(caption: str) -> list[str]:
+        return split_telegram_html(caption, TG_CAPTION_PART_MAX)
+
+    async def _send_caption_remainder(self, parts: list[str], media_result,
+                                      message_thread_id: int | None) -> None:
+        if media_result is None:
+            return
+        media_id = getattr(media_result, "message_id", None)
+        for part in parts[1:]:
+            result = await self.send(
+                part, message_thread_id=message_thread_id,
+                reply_to_message_id=media_id,
+            )
+            if result is None:
+                log.error("Failed to forward remainder of media caption")
+                break
 
     @staticmethod
     def _reply_kwargs(reply_to_message_id: int | None) -> dict:
@@ -143,24 +251,33 @@ class TelegramSender:
         if not text:
             return None
 
-        if len(text) > TG_MAX_LENGTH:
-            text = text[: TG_MAX_LENGTH - 20] + "\n\n[...усечено]"
-
-        return await self._retry(
-            lambda: self._bot.send_message(
-                chat_id=self._chat_id,
-                text=text,
-                parse_mode=ParseMode.HTML,
-                message_thread_id=message_thread_id,
-                **self._reply_kwargs(reply_to_message_id),
+        first_result = None
+        for part in split_telegram_html(text):
+            result = await self._retry(
+                lambda: self._bot.send_message(
+                    chat_id=self._chat_id,
+                    text=part,
+                    parse_mode=ParseMode.HTML,
+                    message_thread_id=message_thread_id,
+                    **self._reply_kwargs(
+                        reply_to_message_id if first_result is None
+                        else getattr(first_result, "message_id", None)
+                    ),
+                )
             )
-        )
+            if result is None:
+                log.error("Long Telegram message part failed; not marking complete")
+                return None
+            if first_result is None:
+                first_result = result
+        return first_result
 
     async def send_photo(self, data: bytes, caption: str = "", filename: str = "photo.jpg",
                          message_thread_id: int | None = None,
                          reply_to_message_id: int | None = None):
-        caption = self._truncate_caption(caption)
-        return await self._retry(
+        caption_parts = self._caption_parts(caption)
+        caption = caption_parts[0] if caption_parts else ""
+        result = await self._retry(
             lambda: self._bot.send_photo(
                 chat_id=self._chat_id,
                 photo=InputFile(io.BytesIO(data), filename=filename),
@@ -170,12 +287,15 @@ class TelegramSender:
                 **self._reply_kwargs(reply_to_message_id),
             )
         )
+        await self._send_caption_remainder(caption_parts, result, message_thread_id)
+        return result
 
     async def send_document(self, data: bytes, caption: str = "", filename: str = "file",
                             message_thread_id: int | None = None,
                             reply_to_message_id: int | None = None):
-        caption = self._truncate_caption(caption)
-        return await self._retry(
+        caption_parts = self._caption_parts(caption)
+        caption = caption_parts[0] if caption_parts else ""
+        result = await self._retry(
             lambda: self._bot.send_document(
                 chat_id=self._chat_id,
                 document=InputFile(io.BytesIO(data), filename=filename),
@@ -185,12 +305,15 @@ class TelegramSender:
                 **self._reply_kwargs(reply_to_message_id),
             )
         )
+        await self._send_caption_remainder(caption_parts, result, message_thread_id)
+        return result
 
     async def send_video(self, data: bytes, caption: str = "", filename: str = "video.mp4",
                          message_thread_id: int | None = None,
                          reply_to_message_id: int | None = None):
-        caption = self._truncate_caption(caption)
-        return await self._retry(
+        caption_parts = self._caption_parts(caption)
+        caption = caption_parts[0] if caption_parts else ""
+        result = await self._retry(
             lambda: self._bot.send_video(
                 chat_id=self._chat_id,
                 video=InputFile(io.BytesIO(data), filename=filename),
@@ -200,11 +323,14 @@ class TelegramSender:
                 **self._reply_kwargs(reply_to_message_id),
             )
         )
+        await self._send_caption_remainder(caption_parts, result, message_thread_id)
+        return result
 
     async def send_voice(self, data: bytes, caption: str = "",
                          message_thread_id: int | None = None,
                          reply_to_message_id: int | None = None):
-        caption = self._truncate_caption(caption)
+        caption_parts = self._caption_parts(caption)
+        caption = caption_parts[0] if caption_parts else ""
         result = await self._retry(
             lambda: self._bot.send_voice(
                 chat_id=self._chat_id,
@@ -227,6 +353,7 @@ class TelegramSender:
                     **self._reply_kwargs(reply_to_message_id),
                 )
             )
+        await self._send_caption_remainder(caption_parts, result, message_thread_id)
         return result
 
     async def send_sticker(self, data: bytes, message_thread_id: int | None = None,
