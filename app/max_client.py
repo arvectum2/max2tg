@@ -110,6 +110,8 @@ class MaxClient:
         self._my_id = None
         self._on_ready_cb = None
         self._on_message_cb = None
+        self._pending_previews = {}
+        self._active_previews = set()
         self._heartbeat_task: asyncio.Task | None = None
         self._session: aiohttp.ClientSession | None = None
         self._dispatch_counter = 0
@@ -314,8 +316,18 @@ class MaxClient:
                 if self._on_message_cb:
                     msg = self._parse_message(payload)
                     if msg is not None and ((not self.chat_ids) or (msg.chat_id in self.chat_ids)):
-                        task = asyncio.create_task(self._on_message_cb(msg))
-                        task.add_done_callback(_log_task_exception)
+                        if msg.chat_id is not None and msg.message_id:
+                            key = (str(msg.chat_id), msg.message_id)
+                            self._pending_previews[key] = msg
+                            if key in self._active_previews:
+                                task = None
+                            else:
+                                self._active_previews.add(key)
+                                task = asyncio.create_task(self._deliver_preview(key))
+                        else:
+                            task = asyncio.create_task(self._on_message_cb(msg))
+                        if task is not None:
+                            task.add_done_callback(_log_task_exception)
 
             elif op == OpCode.UPLOAD_READY:
                 # Server confirms an uploaded file/video finished server-side processing.
@@ -331,6 +343,16 @@ class MaxClient:
 
             elif cmd not in (1, 3):
                 log.info("<<< EVENT op=%-4s cmd=%-3s | %s", op, cmd, payload_preview[:500])
+
+    async def _deliver_preview(self, key):
+        """Merge rapid MAX updates sharing one message ID before forwarding."""
+        try:
+            await asyncio.sleep(0.15)
+            while key in self._pending_previews:
+                latest = self._pending_previews.pop(key)
+                await self._on_message_cb(latest)
+        finally:
+            self._active_previews.discard(key)
 
     # ── WebSocket RPC: fetch contacts ──────────────────────────────
 

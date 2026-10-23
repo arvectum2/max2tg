@@ -281,6 +281,30 @@ async def _handle_linked_message(
         await sender.send(f"{full_header}\n<i>[без содержимого]</i>", message_thread_id=thread_id)
 
 
+def _message_body(msg: MaxMessage) -> str:
+    """Include SHARE link previews inside the original text once."""
+    raw = msg.text or ""
+    parts = [escape(raw)] if raw else []
+    for att in msg.attaches:
+        if not isinstance(att, dict) or att.get("_type") != "SHARE":
+            continue
+        title = str(att.get("title") or "").strip()
+        url = str(att.get("url") or "").strip()
+        if not raw and title:
+            parts.append(f"🔗 {escape(title)}")
+        if url:
+            aliases = {url}
+            for prefix in ("mailto:", "http://", "https://"):
+                if url.lower().startswith(prefix):
+                    aliases.add(url[len(prefix):])
+            if any(x and x in raw for x in aliases):
+                continue
+            if not raw and title and title in url:
+                continue
+            parts.append(escape(url))
+    return "\n".join(parts) if parts else "<i>[нетекстовое сообщение]</i>"
+
+
 async def _send_message_content(
     msg: MaxMessage,
     header_text: str,
@@ -293,15 +317,16 @@ async def _send_message_content(
     meaningful_attaches = [
         a for a in msg.attaches
         if isinstance(a, dict)
-        and a.get("_type") not in ("CONTROL", "WIDGET", "INLINE_KEYBOARD", None)
+        and a.get("_type") not in ("CONTROL", "WIDGET", "INLINE_KEYBOARD", "SHARE", None)
     ]
+    body = _message_body(msg)
 
     first_sent = None
     if meaningful_attaches:
         text_sent = False
         for i, attach in enumerate(meaningful_attaches):
-            if i == 0 and msg.text:
-                cap = f"{header_text}\n{escape(msg.text)}"
+            if i == 0 and body != "<i>[нетекстовое сообщение]</i>":
+                cap = f"{header_text}\n{body}"
                 text_sent = True
             else:
                 cap = header_text
@@ -313,16 +338,15 @@ async def _send_message_content(
                 first_sent = sent
             log.info("Forwarded attach _type=%s → TG", attach.get("_type"))
 
-        if msg.text and not text_sent:
+        if body != "<i>[нетекстовое сообщение]</i>" and not text_sent:
             sent = await sender.send(
-                f"{header_text}\n{escape(msg.text)}",
+                f"{header_text}\n{body}",
                 message_thread_id=thread_id,
                 reply_to_message_id=reply_to_message_id if first_sent is None else None,
             )
             if first_sent is None:
                 first_sent = sent
     else:
-        body = escape(msg.text) if msg.text else "<i>[нетекстовое сообщение]</i>"
         first_sent = await sender.send(
             f"{header_text}\n{body}",
             message_thread_id=thread_id,
@@ -674,6 +698,13 @@ def create_max_client(
                 await _bootstrap_chat_topic(client, sender, resolver, msg.chat_id)
             else:
                 _remember_known_chat(sender, msg.chat_id)
+            return
+
+        # A delayed SHARE preview must not be forwarded as a second message.
+        if msg.message_id and sender.topic_store.tg_for_max_message(
+            msg.chat_id, msg.message_id
+        ) is not None:
+            log.debug("Already forwarded message %s", msg.message_id)
             return
 
         raw_sender = ""
