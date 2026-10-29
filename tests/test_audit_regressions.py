@@ -137,6 +137,29 @@ class FakeResp:
             yield self.data[idx:idx+size]
 
 
+async def test_max_upload_uses_unicode_filename_not_percent_escaped():
+    client=MaxClient("token","device")
+    session=MagicMock()
+    session.closed=False
+    response=MagicMock()
+    response.status=200
+    response.__aenter__=AsyncMock(return_value=response)
+    response.__aexit__=AsyncMock(return_value=None)
+    response.read=AsyncMock(return_value=b"ok")
+    session.post.return_value=response
+    client._session=session
+
+    ok=await client._http_upload(
+        "https://file-ms.oneme.ru/upload", b"image",
+        "Музей хлеба - Каравай.png", "image/png", False,
+    )
+    assert ok is True
+    form=session.post.call_args.kwargs["data"]
+    header=form()._parts[0][0].headers["Content-Disposition"]
+    assert 'filename="Музей хлеба - Каравай.png"' in header
+    assert "%D0%" not in header and "_D0_" not in header
+
+
 async def test_media_private_redirect_blocked():
     c = MaxClient("token", "device")
     session = MagicMock()

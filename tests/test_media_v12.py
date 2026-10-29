@@ -41,6 +41,32 @@ def test_files_from_max_history_keep_true_filename_and_url():
     assert media_size(attach)==1200
 
 
+@pytest.mark.parametrize("raw,expected", [
+    ("_D0_9C_D1_83_D0_B7_D0_B5_D0_B8_CC_86_20_D1_85_D0_BB_D0_B5_D0_B1_D0_B0_20-_20_D0_9A_D0_B0_D1_80_D0_B0_D0_B2_D0_B0_D0_B8_CC_86.png",
+     "Музей хлеба - Каравай.png"),
+    ("Музей хлеба - Каравай.png", "Музей хлеба - Каравай.png"),
+    ("presentation_20_final.png", "presentation_20_final.png"),
+    ("docs/Пример.png", "Пример.png"),
+    ("_D0_9C_2Fsecret.png", "secret.png"),
+    ("a\r\nb.png", "ab.png"),
+])
+def test_media_filename_restores_cyrillic_and_remains_safe(raw,expected):
+    assert media_filename({"fileName":raw})==expected
+
+
+async def test_legacy_max_file_name_is_recovered_when_forwarded_to_telegram(tmp_path):
+    client,sender,state,db=fixture(tmp_path)
+    name="_D0_9C_D1_83_D0_B7_D0_B5_D0_B8_CC_86_20_D1_85_D0_BB_D0_B5_D0_B1_D0_B0.png"
+    msg=message("legacy-name", [{"_type":"FILE","fileName":name,
+        "fileUrl":"https://file-ms.oneme.ru/file"}])
+    client.download_file=AsyncMock(return_value=b"PNG")
+    sender._bot.send_photo=AsyncMock(return_value=SimpleNamespace(message_id=66))
+    await client._on_message_cb(msg)
+    assert sender._bot.send_photo.await_args.kwargs["photo"].filename=="Музей хлеба.png"
+    assert db.job(db.job_key(42,"legacy-name"))["status"]=="SENT"
+    db.close()
+
+
 def test_video_original_over_preview_without_accepting_playlist_or_external_page():
     assert video_url({"mp4Url":"https://cdn.oneme.ru/a.mp4",
                       "thumbnail":"https://cdn.oneme.ru/cover.jpg"})==(

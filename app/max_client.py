@@ -11,6 +11,8 @@ from typing import Any
 
 import aiohttp
 
+from app.max_media import media_filename
+
 log = logging.getLogger(__name__)
 
 DEBUG_DIR = "debug"
@@ -842,8 +844,14 @@ class MaxClient:
             session = aiohttp.ClientSession(headers=_BROWSER_HEADERS)
             close_after = True
         try:
-            form = aiohttp.FormData()
-            form.add_field("file", data, filename=filename, content_type=mimetype)
+            # aiohttp's default percent-encodes non-ASCII filenames in
+            # Content-Disposition, which MAX persists as _D0_... garbage.
+            # Send a safe NFC-normalized UTF-8 filename directly instead.
+            form = aiohttp.FormData(quote_fields=False)
+            form.add_field(
+                "file", data, filename=media_filename({"name": filename}),
+                content_type=mimetype,
+            )
             async with session.post(
                 url, headers=_HTTP_HEADERS, data=form,
                 timeout=aiohttp.ClientTimeout(total=120),

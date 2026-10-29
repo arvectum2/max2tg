@@ -5,6 +5,8 @@ authentication modes. Download URLs are validated by MaxClient.download_file.
 """
 from __future__ import annotations
 
+import re
+import unicodedata
 from urllib.parse import urlsplit
 
 
@@ -53,13 +55,41 @@ def video_preview_url(attach: dict) -> str | None:
                            "preview", "poster")
 
 
+_ESCAPED_FILENAME_BYTES = re.compile(r"(?:_[0-9a-fA-F]{2})+")
+
+
+def _restore_escaped_filename(name: str) -> str:
+    """Restore MAX legacy names where UTF-8 bytes became _HH escapes.
+
+    Only transform when the name has an actual multibyte UTF-8 sequence:
+    ordinary filenames containing literal _20, _AB, etc. stay unchanged.
+    """
+    segments = list(_ESCAPED_FILENAME_BYTES.finditer(name))
+    converted = {}
+    contains_unicode = False
+    for match in segments:
+        try:
+            value = bytes.fromhex(match.group().replace("_", "")).decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        converted[match.start()] = value
+        contains_unicode |= any(ord(ch) >= 128 for ch in value)
+    if not contains_unicode:
+        return name
+    return _ESCAPED_FILENAME_BYTES.sub(
+        lambda match: converted.get(match.start(), match.group()), name,
+    )
+
+
 def media_filename(attach: dict, default: str="file") -> str:
     raw=(attach.get("name") or attach.get("fileName")
          or attach.get("filename") or default)
     if not isinstance(raw,str) or not raw.strip():
         return default
-    name=raw.replace("\\","/").split("/")[-1].strip()
-    # Telegram's displayed name must not contain controls.
+    name=_restore_escaped_filename(raw)
+    name=unicodedata.normalize("NFC", name)
+    name=name.replace("\\","/").split("/")[-1].strip()
+    # MAX and Telegram must not receive path segments or control characters.
     name="".join(ch for ch in name if ord(ch)>=32 and ord(ch)!=127)
     return name[:180] or default
 
