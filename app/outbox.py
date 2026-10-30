@@ -20,6 +20,7 @@ from types import SimpleNamespace
 from typing import Any, Callable, Awaitable
 
 from telegram.error import RetryAfter, TimedOut, NetworkError, BadRequest, Forbidden
+import httpx
 
 from app.max_client import MaxMessage
 
@@ -101,7 +102,22 @@ class DeliveryContext:
             self.store._schedule_retry(self.key, max(1, seconds),
                                        "Telegram rate limit")
             raise DeliveryInterrupted("RETRY", "rate limit; safe to retry") from exc
-        except (TimedOut, NetworkError, TimeoutError) as exc:
+        except NetworkError as exc:
+            # A 502/503/504 from the HTTP CONNECT proxy means no Telegram
+            # request was dispatched. Such a failure is definitely retryable.
+            # Other network failures are ambiguous and MUST remain UNKNOWN.
+            cause = exc.__cause__
+            if (isinstance(cause, httpx.ProxyError)
+                and any(code in str(cause) for code in
+                        ("502 Bad Gateway", "503 Service Unavailable",
+                         "504 Gateway Timeout"))):
+                self.store._update_part(self.key, index, "RETRY")
+                self.store._schedule_retry(self.key, 15, "proxy tunnel rejected")
+                raise DeliveryInterrupted("RETRY", "proxy rejected CONNECT; safe to retry") from exc
+            self.store._update_part(self.key, index, "UNKNOWN")
+            self.store._set_job(self.key, "UNKNOWN", type(exc).__name__)
+            raise DeliveryInterrupted("UNKNOWN", "Telegram delivery outcome uncertain") from exc
+        except (TimedOut, TimeoutError) as exc:
             self.store._update_part(self.key, index, "UNKNOWN")
             self.store._set_job(self.key, "UNKNOWN", type(exc).__name__)
             raise DeliveryInterrupted("UNKNOWN", "Telegram delivery outcome uncertain") from exc

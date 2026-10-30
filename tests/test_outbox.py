@@ -4,7 +4,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from telegram.error import TimedOut, RetryAfter, Forbidden
+from telegram.error import TimedOut, RetryAfter, Forbidden, NetworkError
+import httpx
 
 from app.outbox import OutboxStore
 from app.max_client import MaxMessage
@@ -91,6 +92,40 @@ async def test_network_timeout_never_resends_automatically(tmp_path):
     sender._bot.send_message=AsyncMock(return_value=SimpleNamespace(message_id=9))
     await client._on_message_cb(msg)
     sender._bot.send_message.assert_not_awaited()
+
+
+async def test_proxy_connect_502_is_retried_safely(tmp_path):
+    client,sender,state,db=fixture(tmp_path)
+    cause=httpx.ProxyError("502 Bad Gateway")
+    exc=NetworkError("httpx.ProxyError: 502 Bad Gateway")
+    exc.__cause__=cause
+    sender._bot.send_message=AsyncMock(side_effect=exc)
+    msg=event("proxy-502","Текст")
+    await client._on_message_cb(msg)
+    key=db.job_key(42,"proxy-502")
+    assert db.job(key)["status"]=="RETRY"
+    assert db._part(key,0)["state"]=="RETRY"
+    assert db.job(key)["attempts"]==1
+    db.db.execute("UPDATE jobs SET next_attempt=0 WHERE key=?", (key,))
+    sender._bot.send_message=AsyncMock(return_value=SimpleNamespace(message_id=777))
+    await client._on_message_cb(msg)
+    assert db.job(key)["status"]=="SENT"
+    assert db._part(key,0)["tg_id"]==777
+    sender._bot.send_message.assert_awaited_once()
+    db.close()
+
+
+async def test_proxy_failure_not_evidently_rejected_remains_unknown(tmp_path):
+    client,sender,state,db=fixture(tmp_path)
+    cause=httpx.ProxyError("proxy tunnel reset after CONNECT")
+    exc=NetworkError("httpx.ProxyError: tunnel reset")
+    exc.__cause__=cause
+    sender._bot.send_message=AsyncMock(side_effect=exc)
+    await client._on_message_cb(event("proxy-ambiguous"))
+    key=db.job_key(42,"proxy-ambiguous")
+    assert db.job(key)["status"]=="UNKNOWN"
+    assert db._part(key,0)["state"]=="UNKNOWN"
+    db.close()
 
 
 async def test_restart_with_send_in_progress_becomes_unknown(tmp_path):

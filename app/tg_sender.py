@@ -125,11 +125,20 @@ def _looks_numeric(title: str) -> bool:
 class TelegramSender:
     def __init__(self, token: str, chat_id: str, topic_store: TopicStore,
                  proxy_url: str | None = None):
-        if proxy_url:
-            request = HTTPXRequest(proxy=proxy_url)
-            self._bot = Bot(token=token, request=request)
-        else:
-            self._bot = Bot(token=token)
+        # The local APL proxy occasionally takes over five seconds to reply,
+        # especially when its upstream is reconnecting. The default PTB
+        # read_timeout (5s) turns otherwise deliverable messages into UNKNOWN.
+        # Keep a bounded deadline: unacknowledged sends must not be retried
+        # automatically, because Telegram Bot API has no idempotency key.
+        request = HTTPXRequest(
+            proxy=proxy_url,
+            connect_timeout=15,
+            read_timeout=30,
+            write_timeout=30,
+            pool_timeout=15,
+            connection_pool_size=16,
+        )
+        self._bot = Bot(token=token, request=request)
         self._chat_id = chat_id
         self._topics = topic_store
         self._topic_lock = asyncio.Lock()
