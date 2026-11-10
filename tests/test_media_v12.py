@@ -157,6 +157,8 @@ async def test_photo_album_sends_one_media_group_and_saves_all_receipts(tmp_path
     sender._bot.send_media_group.assert_awaited_once()
     kwargs=sender._bot.send_media_group.await_args.kwargs
     assert len(kwargs["media"])==3
+    assert kwargs["read_timeout"] == 90
+    assert kwargs["write_timeout"] == 120
     assert "Наши фото" in kwargs["media"][0].caption
     assert kwargs["media"][1].caption is None
     row=db._part(db.job_key(42,"album-3"),0)

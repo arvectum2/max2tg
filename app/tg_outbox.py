@@ -9,10 +9,14 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import sqlite3
 import time
+
+
+log = logging.getLogger(__name__)
 
 
 class TelegramOutbound:
@@ -191,10 +195,12 @@ class TelegramOutbound:
                         "UPDATE outbound SET prepared=?,updated=? "
                         "WHERE telegram_chat=? AND telegram_id=?",
                         (prepared,time.time(),str(tg_chat),int(tg_id)))
-                except Exception:
+                except Exception as exc:
                     # File preparation did not issue MAX SEND_MESSAGE.
-                    # Mark FAILED for explicit operator review, no silent
-                    # expensive re-download/re-upload loops.
+                    # Log only the exception class, never attachment tokens,
+                    # private text or user-provided filenames.
+                    log.warning("Telegram media preparation failed: telegram_id=%s, cause=%s",
+                                tg_id, type(exc).__name__)
                     self._mark(tg_chat,tg_id,"FAILED")
                     return "FAILED"
             self.db.execute(

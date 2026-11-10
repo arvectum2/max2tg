@@ -386,7 +386,12 @@ class TelegramSender:
                 )
                 for i,data in enumerate(saved_photos)
             ]
-            return await self._bot.send_media_group(media=media,**options)
+            # A multipart album can take longer than an ordinary text RPC,
+            # especially through a reconnecting proxy. A transport timeout
+            # AFTER dispatch would leave an unretryable UNKNOWN album.
+            return await self._bot.send_media_group(
+                media=media, read_timeout=90, write_timeout=120, **options
+            )
 
         if scope is not None:
             # Persist photo bytes before the first API call. On RetryAfter,
