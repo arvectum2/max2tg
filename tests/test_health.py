@@ -191,3 +191,61 @@ async def test_admin_only_reauth_instructions_without_exposing_sms(tmp_path):
     msg=update.callback_query.message.reply_text.await_args.args[0]
     assert "Chrome" in msg
     db.close()
+
+
+async def test_acknowledged_ledger_unknown_stays_visible_but_silent(tmp_path):
+    h, db, c, sender, a = supervisor(tmp_path)
+    h.started = time.monotonic()-200
+    key = db.enqueue(MaxMessage(chat_id=42,message_id="a",text="secret"))
+    db._set_job(key,"UNKNOWN")
+    assert h.acknowledge_existing(["OUTBOX_UNKNOWN"]) == ["OUTBOX_UNKNOWN"]
+    report=h.snapshot()
+    assert "OUTBOX_UNKNOWN" in report["issues"]
+    assert "OUTBOX_UNKNOWN" in report["acknowledged_issues"]
+    assert "Исторические (уведомления отключены)" in status_text(report)
+    assert "Требует внимания: OUTBOX_UNKNOWN" not in status_text(report)
+    assert "secret" not in (tmp_path/"health-silences.json").read_text()
+    assert "secret" not in (tmp_path/"health.json").read_text() if (tmp_path/"health.json").exists() else True
+    h2=HealthSupervisor(c,sender,db,h.topics,a,str(tmp_path))
+    h2.started=time.monotonic()-200
+    for _ in range(5):
+        await h2.notify(h2.snapshot())
+    sender.bot.send_message.assert_not_awaited()
+    assert (tmp_path/"health-silences.json").stat().st_mode & 0o777 == 0o600
+    db.close()
+
+
+async def test_new_unknown_record_notifies_once_and_remains_in_ledger(tmp_path):
+    h,db,c,s,a=supervisor(tmp_path)
+    h.started=time.monotonic()-200
+    key=db.enqueue(MaxMessage(chat_id=42,message_id="old"))
+    db._set_job(key,"UNKNOWN")
+    h.acknowledge_existing(["OUTBOX_UNKNOWN"])
+    newer=db.enqueue(MaxMessage(chat_id=42,message_id="new"))
+    db._set_job(newer,"UNKNOWN")
+    report=h.snapshot()
+    assert "OUTBOX_UNKNOWN" not in report["acknowledged_issues"]
+    for _ in range(4):
+        await h.notify(report)
+    s.bot.send_message.assert_awaited_once()
+    assert "OUTBOX_UNKNOWN" in h.snapshot()["acknowledged_issues"]
+    assert db.counts()["UNKNOWN"]==2
+    assert h._issue_signature("OUTBOX_UNKNOWN") == h._read_silences()["OUTBOX_UNKNOWN"]
+    h._alerts["OUTBOX_UNKNOWN"]=0
+    for _ in range(4):
+        await h.notify(h.snapshot())
+    assert s.bot.send_message.await_count==1
+    db.close()
+
+
+def test_history_gap_fingerprint_stable_across_reconnects(tmp_path):
+    h,db,c,s,a=supervisor(tmp_path)
+    h.topics.set_ui("catch_up_warnings",{"42":{"reason":"DELIVERY_INCOMPLETE","updated":123}})
+    original=h._issue_signature("HISTORY_GAP")
+    h.acknowledge_existing(["HISTORY_GAP"])
+    h.topics.set_ui("catch_up_warnings",{"42":{"reason":"DELIVERY_INCOMPLETE","updated":999}})
+    assert h._issue_signature("HISTORY_GAP")==original
+    assert "HISTORY_GAP" in h.snapshot()["acknowledged_issues"]
+    h.topics.set_ui("catch_up_warnings",{"42":{"reason":"RPC_ERROR","updated":1000}})
+    assert "HISTORY_GAP" not in h.snapshot()["acknowledged_issues"]
+    db.close()

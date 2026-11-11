@@ -6,6 +6,7 @@ into the health report. launchd remains responsible for process restarts.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -24,6 +25,12 @@ MAX_SOCKET_IDLE_SEC = 240
 SOCKET_REPAIR_COOLDOWN = 300
 TG_REPAIR_COOLDOWN = 120
 ALERT_COOLDOWN = 3600
+# Acknowledged historical incidents are visible in /status, but must not
+# generate hourly notifications. A different set of affected ledger records
+# is treated as a NEW incident and is alerted once.
+ACKNOWLEDGEABLE_ISSUES = frozenset({
+    "TG_OUTBOUND_FAILED", "OUTBOX_UNKNOWN", "MUTATION_BLOCKED", "HISTORY_GAP",
+})
 STARTUP_GRACE_SEC = 120
 OUTBOX_OLD_AGE_SEC = 300
 MIN_DISK_FREE_BYTES = 100 * 1024 * 1024
@@ -63,8 +70,13 @@ def status_text(report: dict | None) -> str:
         f"Диск: {'✅ доступен' if report.get('disk',{}).get('ok') else '⚠️ проблема'}",
     ]
     notes = report.get("issues",[])
-    if notes:
-        lines.append("Требует внимания: " + ", ".join(notes))
+    acknowledged = set(report.get("acknowledged_issues",[]))
+    active = [item for item in notes if item not in acknowledged]
+    historical = [item for item in notes if item in acknowledged]
+    if active:
+        lines.append("Требует внимания: " + ", ".join(active))
+    if historical:
+        lines.append("Исторические (уведомления отключены): " + ", ".join(historical))
     return "\n".join(lines)
 
 
@@ -78,12 +90,14 @@ class HealthSupervisor:
         self.dir = Path(state_dir)
         self.path = self.dir / "health.json"
         self.alert_path = self.dir / "health-alerts.json"
+        self.silence_path = self.dir / "health-silences.json"
         self.started = time.monotonic()
         self._repair_socket_at = 0.0
         self._repair_tg_at = 0.0
         self._tg_repair_attempts = 0
         self._issue_hits: dict[str,int] = {}
         self._alerts = self._read_alerts()
+        self._silenced_issues = self._read_silences()
         self.report = None
 
     def _read_alerts(self) -> dict[str,float]:
@@ -92,6 +106,67 @@ class HealthSupervisor:
             return {str(k):float(v) for k,v in raw.items()}
         except (OSError,ValueError,TypeError):
             return {}
+
+    def _read_silences(self) -> dict[str,str]:
+        try:
+            raw = json.loads(self.silence_path.read_text(encoding="utf-8"))
+            if not isinstance(raw,dict):
+                return {}
+            return {k:v for k,v in raw.items()
+                    if k in ACKNOWLEDGEABLE_ISSUES and isinstance(v,str)
+                    and len(v)==64 and all(c in "0123456789abcdef" for c in v)}
+        except (OSError,ValueError,TypeError):
+            return {}
+
+    def _issue_signature(self, issue: str) -> str | None:
+        """Fingerprint affected operation IDs, not payloads or timestamps.
+
+        A reconnect can change warning timestamps without creating a new
+        incident. Never include those timestamps in notification identity.
+        """
+        if issue == "OUTBOX_UNKNOWN":
+            values = [row[0] for row in self.outbox.db.execute(
+                "SELECT key FROM jobs WHERE status='UNKNOWN' ORDER BY key")]
+        elif issue == "MUTATION_BLOCKED":
+            values = [row[0] for row in self.outbox.db.execute(
+                "SELECT key FROM message_mutations WHERE state='BLOCKED' ORDER BY key")]
+        elif issue == "TG_OUTBOUND_FAILED":
+            tg = getattr(self,"tg_outbound",None)
+            if tg is None:
+                return None
+            values = [list(row) for row in tg.db.execute(
+                "SELECT telegram_chat,telegram_id FROM outbound "
+                "WHERE status='FAILED' ORDER BY telegram_chat,telegram_id")]
+        elif issue == "HISTORY_GAP":
+            warnings = self.topics.get_ui("catch_up_warnings",{}) or {}
+            if not isinstance(warnings,dict):
+                return None
+            values = sorted((str(k), str(v.get("reason","")) if isinstance(v,dict)
+                             else str(v)) for k,v in warnings.items())
+        else:
+            return None
+        if not values:
+            return None
+        raw = json.dumps(values,ensure_ascii=False,separators=(",",":"))
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    def acknowledge_existing(self, issues) -> list[str]:
+        """Silence existing incidents; never alter message ledgers/cursors."""
+        acknowledged = []
+        for issue in issues:
+            if issue not in ACKNOWLEDGEABLE_ISSUES:
+                continue
+            signature = self._issue_signature(issue)
+            if signature:
+                self._silenced_issues[issue] = signature
+                acknowledged.append(issue)
+        if acknowledged:
+            self._write_atomic(self.silence_path,self._silenced_issues)
+        return acknowledged
+
+    def _acknowledged_issues(self, issues) -> list[str]:
+        return [issue for issue in issues if issue in ACKNOWLEDGEABLE_ISSUES
+                and self._silenced_issues.get(issue)==self._issue_signature(issue)]
 
     def _write_atomic(self, path: Path, payload: dict):
         self.dir.mkdir(parents=True,exist_ok=True)
@@ -192,6 +267,7 @@ class HealthSupervisor:
             "history_gaps":history_gaps,
             "disk":{"ok":disk_ok,"free_bytes":free},
             "issues":issues,
+            "acknowledged_issues":self._acknowledged_issues(issues),
         }
 
     async def repair(self, report: dict):
@@ -238,7 +314,9 @@ class HealthSupervisor:
                    "MAX_OFFLINE","MAX_STALLED","QUEUE_DELAY","HISTORY_GAP",
                    "TG_OUTBOUND_UNKNOWN","TG_OUTBOUND_FAILED",
                    "TG_MUTATION_UNKNOWN","TG_MUTATION_FAILED"}
+        acknowledged = set(self._acknowledged_issues(report["issues"]))
         alertable=[key for key in report["issues"] if key in important
+                   and key not in acknowledged
                    and self._issue_hits.get(key,0)>=3
                    and now-self._alerts.get(key,0)>=ALERT_COOLDOWN]
         if not alertable:
@@ -263,6 +341,8 @@ class HealthSupervisor:
         for key in alertable:
             self._alerts[key]=now
         self._write_atomic(self.alert_path,self._alerts)
+        # New historical ledger incidents are reported once, not every hour.
+        self.acknowledge_existing(alertable)
 
     async def monitor(self, interval=HEALTH_CHECK_INTERVAL):
         while True:
