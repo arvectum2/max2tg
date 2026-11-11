@@ -670,6 +670,28 @@ async def _topic_title_for_chat(resolver: ContactResolver, chat_id) -> str:
     return str(title or chat_id)
 
 
+def _topic_title_for_live_message(resolver: ContactResolver, msg: MaxMessage,
+                                  sender_name: str) -> str:
+    """Never name a group/channel after the author of its latest message.
+
+    For groups, only the authoritative MAX chat title is suitable. Missing
+    metadata gets a numeric placeholder that can be safely upgraded later.
+    In DMs, resolve the *peer*, not the author (who may be ourselves).
+    """
+    chat_title = str(resolver.chat_name(msg.chat_id) or "")
+    if resolver.is_dm(msg.chat_id):
+        peer_id = _peer_id_for_dialog(resolver, msg.chat_id)
+        if peer_id is not None:
+            peer_name = resolver.user_name(peer_id)
+            if peer_name and peer_name != str(peer_id):
+                return peer_name
+        if not msg.is_self and sender_name and sender_name != str(msg.sender_id):
+            return sender_name
+    if chat_title and chat_title != str(msg.chat_id) and not chat_title.startswith("DM:"):
+        return chat_title
+    return str(msg.chat_id)
+
+
 def _remember_known_chat(sender: TelegramSender, chat_id) -> None:
     raw = sender.topic_store.get_ui(_KNOWN_MAX_CHATS_UI_KEY, []) or []
     known = {str(value) for value in raw}
@@ -730,6 +752,22 @@ async def _reconcile_snapshot_chats(client: MaxClient, sender: TelegramSender,
         if resolver.chat_types.get(chat_id) in _ACTIVE_CHAT_TYPES
         and (raw or {}).get("status") not in ("LEFT", "CLOSED")
     }
+    # A topic may have an old, mistaken name (e.g. a group named after a
+    # participant). Reconcile authoritative MAX group names on reconnect only
+    # when the owner enabled title synchronization for that chat.
+    for chat_id in current.values():
+        if resolver.chat_types.get(chat_id) not in ("CHAT", "CHANNEL"):
+            continue
+        if sender.topic_store.get_topic(chat_id) is None:
+            continue
+        title = str((resolver.chats_raw.get(chat_id) or {}).get("title") or "").strip()
+        if title and get_chat_prefs(sender.topic_store, chat_id).title_sync:
+            if chat_locks is None:
+                await sender.ensure_topic(chat_id, title)
+            else:
+                async with chat_locks.setdefault(str(chat_id), asyncio.Lock()):
+                    await sender.ensure_topic(chat_id, title)
+
     raw_known = sender.topic_store.get_ui(_KNOWN_MAX_CHATS_UI_KEY)
     if raw_known is None:
         sender.topic_store.set_ui(_KNOWN_MAX_CHATS_UI_KEY, sorted(current))
@@ -1124,22 +1162,7 @@ def create_max_client(
             raw_sender = await resolver.resolve_user(msg.sender_id)
         is_dm = resolver.is_dm(msg.chat_id)
         raw_chat = resolver.chat_name(msg.chat_id)
-
-        # One forum topic per Max chat. Prefer a human title:
-        # - DMs → the peer's name
-        # - Groups/channels with a known title → the chat title
-        # - Runtime-discovered chats with a sender → the sender's name
-        # - Channel posts may have sender=None; use numeric chat ID temporarily
-        #   so ensure_topic can rename it when channel metadata arrives.
-        chat_title_known = raw_chat != str(msg.chat_id) and not raw_chat.startswith("DM:")
-        if is_dm:
-            topic_title = raw_sender or raw_chat
-        elif chat_title_known:
-            topic_title = raw_chat
-        elif raw_sender:
-            topic_title = raw_sender
-        else:
-            topic_title = str(msg.chat_id)
+        topic_title = _topic_title_for_live_message(resolver, msg, raw_sender)
 
         existing_thread = sender.topic_store.get_topic(msg.chat_id)
         thread_id = await sender.ensure_topic(msg.chat_id, topic_title)

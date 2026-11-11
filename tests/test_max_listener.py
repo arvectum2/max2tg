@@ -1,5 +1,6 @@
 """Tests for app/max_listener.py — pure helper functions."""
 
+import asyncio
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -9,6 +10,7 @@ from app.max_listener import (
     _is_max_service_dialog,
     _reconcile_snapshot_chats,
     _refresh_chat_metadata,
+    _topic_title_for_live_message,
 )
 from app.resolver import ContactResolver
 
@@ -226,3 +228,66 @@ class TestChatReconciliation:
         assert resolver.chat_types[2] == "DIALOG"
         assert resolver.chats[2] == "DM:55"
         resolver.resolve_users_batch.assert_awaited_once()
+
+
+class TestAuthoritativeTopicTitles:
+    def test_group_uses_max_title_not_message_author(self):
+        from app.max_client import MaxMessage
+        resolver = ContactResolver()
+        resolver.chats[123] = "Буратино"
+        resolver.chat_types[123] = "CHAT"
+        msg = MaxMessage(chat_id=123, sender_id=50, message_id="1")
+        assert _topic_title_for_live_message(resolver, msg, "Анастасия") == "Буратино"
+
+    def test_group_without_metadata_uses_numeric_placeholder(self):
+        from app.max_client import MaxMessage
+        resolver = ContactResolver()
+        resolver.chat_types[123] = "CHAT"
+        msg = MaxMessage(chat_id=123, sender_id=50, message_id="1")
+        assert _topic_title_for_live_message(resolver, msg, "Анастасия") == "123"
+
+    def test_dm_outgoing_message_uses_peer_not_self(self):
+        from app.max_client import MaxMessage
+        resolver = ContactResolver()
+        resolver._my_id = 1
+        resolver.chats_raw[123] = {"participants": {"1": {}, "50": {}}}
+        resolver.chat_types[123] = "DIALOG"
+        resolver.chats[123] = "DM:50"
+        resolver.users[50] = "Анастасия"
+        msg = MaxMessage(chat_id=123, sender_id=1, is_self=True, message_id="1")
+        assert _topic_title_for_live_message(resolver, msg, "Вы") == "Анастасия"
+
+    async def test_snapshot_repairs_group_title_when_sync_enabled(self, tmp_path):
+        from app.chat_preferences import set_chat_pref
+        from app.topics import TopicStore
+        from app.tg_sender import TelegramSender
+        store = TopicStore(str(tmp_path / "topics.json"))
+        store.set_topic(123, 32, "Анастасия")
+        store.set_ui("known_max_chat_ids", ["123"])
+        set_chat_pref(store, 123, "title_sync", True)
+        sender = TelegramSender.__new__(TelegramSender)
+        sender._topics = store
+        sender._chat_id = "-100222"
+        sender._topic_lock = asyncio.Lock()
+        sender._bot = MagicMock()
+        sender._bot.edit_forum_topic = AsyncMock()
+        resolver = ContactResolver()
+        resolver.upsert_chats([{"id": 123, "type": "CHAT", "status": "ACTIVE", "title": "Буратино"}])
+        assert await _reconcile_snapshot_chats(MagicMock(), sender, resolver) == 0
+        sender._bot.edit_forum_topic.assert_awaited_once_with(
+            chat_id="-100222", message_thread_id=32, name="Буратино")
+        assert store.get_title(123) == "Буратино"
+
+    async def test_manual_name_respected_when_sync_disabled(self, tmp_path):
+        from app.topics import TopicStore
+        store = TopicStore(str(tmp_path / "topics.json"))
+        store.set_topic(123, 32, "Моё имя чата")
+        store.set_ui("known_max_chat_ids", ["123"])
+        sender = MagicMock()
+        sender.topic_store = store
+        sender.ensure_topic = AsyncMock()
+        resolver = ContactResolver()
+        resolver.upsert_chats([{"id": 123, "type": "CHAT", "status": "ACTIVE", "title": "Буратино"}])
+        assert await _reconcile_snapshot_chats(MagicMock(), sender, resolver) == 0
+        sender.ensure_topic.assert_not_awaited()
+        assert store.get_title(123) == "Моё имя чата"
