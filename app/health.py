@@ -72,6 +72,9 @@ def status_text(report: dict | None) -> str:
         f"Задержка очереди: {outbox.get('oldest_due_seconds',0)} с",
         f"Диск: {'✅ доступен' if report.get('disk',{}).get('ok') else '⚠️ проблема'}",
     ]
+    session = report.get("session_monitor")
+    if session and session != "READY":
+        lines.append("Восстановление MAX-сессии: "+str(session))
     notes = report.get("issues",[])
     acknowledged = set(report.get("acknowledged_issues",[]))
     active = [item for item in notes if item not in acknowledged]
@@ -169,7 +172,8 @@ class HealthSupervisor:
 
     def _acknowledged_issues(self, issues) -> list[str]:
         return [issue for issue in issues if issue in ACKNOWLEDGEABLE_ISSUES
-                and self._silenced_issues.get(issue)==self._issue_signature(issue)]
+                and issue in self._silenced_issues
+                and self._silenced_issues[issue]==self._issue_signature(issue)]
 
     def _write_atomic(self, path: Path, payload: dict):
         self.dir.mkdir(parents=True,exist_ok=True)
@@ -239,10 +243,11 @@ class HealthSupervisor:
         issues=[]
         if auth_required: issues.append("REAUTH_REQUIRED")
         if max_state=="STALLED": issues.append("MAX_STALLED")
-        if max_state=="RECONNECTING" and now-self.started>180:
+        if max_state in ("RECONNECTING","CONNECTING") and now-self.started>180:
             issues.append("MAX_OFFLINE")
         if not polling and not paused_expected: issues.append("TELEGRAM_POLLING")
         if not disk_ok: issues.append("STATE_DISK")
+        if getattr(self.topics,"persist_failed",False): issues.append("TOPIC_PERSIST_FAILED")
         if oldest>OUTBOX_OLD_AGE_SEC: issues.append("QUEUE_DELAY")
         tg_mutations=(getattr(self,"tg_mutations",None).counts()
                       if getattr(self,"tg_mutations",None) else {})
@@ -276,9 +281,18 @@ class HealthSupervisor:
         history_gaps = len(pending_history) if isinstance(pending_history,dict) else 0
         if history_gaps: issues.append("HISTORY_GAP")
 
+        session_monitor = "NOT_CHECKED"
+        try:
+            session = json.loads((self.dir/"session-watch.json").read_text())
+            session_monitor = session.get("state","UNKNOWN") if time.time()-session.get("time",0)<180 else "STALE"
+        except (OSError,TypeError,ValueError):
+            pass
+
         return {
             "time":datetime.now(timezone.utc).isoformat(),
+            "session_monitor":session_monitor,
             "uptime_seconds":int(now-self.started),
+            "pid":os.getpid(),
             "max":{"state":max_state,"ws_connected":ws_open,
                    "authorized":authorized,"rx_age_seconds":age},
             "telegram":{"polling":polling,"paused_expected":paused_expected,
@@ -352,7 +366,7 @@ class HealthSupervisor:
                    "MAX_OFFLINE","MAX_STALLED","QUEUE_DELAY","HISTORY_GAP",
                    "TG_OUTBOUND_UNKNOWN","TG_OUTBOUND_FAILED",
                    "TG_MUTATION_UNKNOWN","TG_MUTATION_FAILED",
-                   "TG_INGRESS_STALLED","TG_OUTBOUND_QUEUE_DELAY"}
+                   "TG_INGRESS_STALLED","TG_OUTBOUND_QUEUE_DELAY","TOPIC_PERSIST_FAILED"}
         if stale_poll and "TELEGRAM_POLLING" in report["issues"]:
             self._issue_hits["TELEGRAM_POLLING"] = max(3,self._issue_hits.get("TELEGRAM_POLLING",0))
         if in_grace:

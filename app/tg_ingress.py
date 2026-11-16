@@ -73,7 +73,12 @@ class DurableIngressQueue(asyncio.Queue):
             # PTB advances getUpdates offset only after Queue.put returns.
             # The FULL synchronous outbound SQLite connection commits here
             # before the update can be acknowledged to Telegram.
-            if self.ledger.row(m.chat_id, m.message_id) is None:
+            existing = self.ledger.row(m.chat_id, m.message_id)
+            if existing is not None:
+                # Already handled or pending in outbound ledger. Do not
+                # reconstruct the payload against a changed reply mapping.
+                return
+            if existing is None:
                 self.ledger.db.execute(
                     "INSERT OR IGNORE INTO inbound_updates VALUES (?,?,?,?,?,?,?)",
                     (update.update_id, str(m.chat_id), m.message_id, cid,
@@ -147,6 +152,8 @@ class DurableIngressApplication(Application):
     async def process_update(self, update):
         if not self.update_queue.may_process(update):
             return
-        await super().process_update(update)
-        # A crash before this point leaves the durable staged copy intact.
-        self.update_queue.finish(update)
+        try:
+            await super().process_update(update)
+        finally:
+            # A crash before this point leaves the durable staged copy intact.
+            self.update_queue.finish(update)

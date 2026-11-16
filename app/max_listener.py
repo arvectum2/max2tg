@@ -574,6 +574,7 @@ async def import_recent_history(
     count: int,
     *,
     raw_messages: list[dict] | None = None,
+    continue_on_terminal_gap: bool = False,
 ) -> int:
     """Import ordered history, storing deliveries before their first send."""
     if raw_messages is None:
@@ -616,8 +617,13 @@ async def import_recent_history(
         if completed:
             imported += 1
         else:
-            # Keep chronological ordering and stop at the first failed
-            # delivery. The caller must not advance its pagination cursor.
+            # Retain terminal gaps without replaying uncertain sends, but
+            # allow independent later messages to reach the destination.
+            if continue_on_terminal_gap and isinstance(outbox, OutboxStore):
+                job = outbox.job(outbox.job_key(chat_id, msg.message_id))
+                if job is not None and job["status"] in ("UNKNOWN","FAILED"):
+                    log.warning("Catch-up retained terminal delivery gap chat=%s",chat_id)
+                    continue
             log.warning("History import paused on unconfirmed delivery chat=%s",
                         chat_id)
             break
@@ -944,7 +950,7 @@ async def catch_up_chat_history(
     if candidates:
         imported = await import_recent_history(
             client, sender, resolver, chat_id, thread_id,
-            count=len(candidates), raw_messages=candidates,
+            count=len(candidates), raw_messages=candidates, continue_on_terminal_gap=True,
         )
         # The importer can encounter TG send failures; never advance the
         # durable cursor past missing messages.

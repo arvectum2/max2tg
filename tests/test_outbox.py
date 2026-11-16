@@ -292,3 +292,14 @@ async def test_previous_mapping_is_recorded_in_sqlite_without_resend(tmp_path):
     assert receipt['status']=='SENT'
     assert receipt['tg_primary']==901
     sender._bot.send_message.assert_not_awaited()
+
+@pytest.mark.parametrize("cause",[httpx.ConnectError("connect"),httpx.ConnectTimeout("connect"),httpx.PoolTimeout("pool")])
+async def test_known_pre_dispatch_transport_failure_is_retryable(tmp_path,cause):
+    client,sender,state,db=fixture(tmp_path)
+    exc=NetworkError("transport unavailable")
+    exc.__cause__=cause
+    sender._bot.send_message=AsyncMock(side_effect=exc)
+    await client._on_message_cb(event("pre-dispatch"))
+    key=db.job_key(42,"pre-dispatch")
+    assert db.job(key)["status"]=="RETRY"
+    db.close()

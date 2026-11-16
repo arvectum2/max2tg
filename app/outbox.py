@@ -107,10 +107,11 @@ class DeliveryContext:
             # request was dispatched. Such a failure is definitely retryable.
             # Other network failures are ambiguous and MUST remain UNKNOWN.
             cause = exc.__cause__
-            if (isinstance(cause, httpx.ProxyError)
-                and any(code in str(cause) for code in
-                        ("502 Bad Gateway", "503 Service Unavailable",
-                         "504 Gateway Timeout"))):
+            if (isinstance(cause, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout))
+                or (isinstance(cause, httpx.ProxyError)
+                    and any(code in str(cause) for code in
+                            ("502 Bad Gateway", "503 Service Unavailable",
+                             "504 Gateway Timeout")))):
                 self.store._update_part(self.key, index, "RETRY")
                 self.store._schedule_retry(self.key, 15, "proxy tunnel rejected")
                 raise DeliveryInterrupted("RETRY", "proxy rejected CONNECT; safe to retry") from exc

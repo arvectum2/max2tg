@@ -394,3 +394,24 @@ class TestMaxClientInit:
         assert c._my_id == 123
         release.set()
         await asyncio.sleep(0)
+
+async def test_rpc_reply_arrives_before_send_returns():
+    import json
+    from types import SimpleNamespace
+    c = MaxClient("token","device")
+    async def send(raw):
+        packet = json.loads(raw)
+        await c._handle({"opcode":packet["opcode"],"cmd":1,
+                         "seq":packet["seq"],"payload":{"ok":True}})
+    c._ws = SimpleNamespace(closed=False,send_str=send)
+    assert await c.cmd(OpCode.CHAT_GET,{},timeout=.1) == {"ok":True}
+    assert c._pending == {}
+
+async def test_rpc_disconnect_result_is_not_task_cancellation():
+    from types import SimpleNamespace
+    c = MaxClient("token","device")
+    async def send(raw):
+        next(iter(c._pending.values())).set_result(None)
+    c._ws = SimpleNamespace(closed=False,send_str=send)
+    assert await c.cmd(OpCode.SEND_MESSAGE,{},none_on_timeout=True) is None
+    assert c._pending == {}

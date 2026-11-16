@@ -112,3 +112,19 @@ def test_invalid_cursor_does_not_reset_topics(tmp_path):
     restored.set_history_cursor(42,6000)
     restored.remove(42)
     assert restored.get_history_cursor(42) is None
+
+async def test_old_uncertain_message_does_not_block_new_history(tmp_path):
+    from tests.test_outbox import fixture,event
+    client,sender,state,db=fixture(tmp_path)
+    state.set_history_cursor(42,1000)
+    key=db.enqueue(event("2","msg 2"))
+    db._set_job(key,"UNKNOWN")
+    client.fetch_history=feed([row(1),row(2),row(3)])
+    sender._bot.send_message=AsyncMock(return_value=SimpleNamespace(message_id=553))
+    assert await catch_up_chat_history(client,sender,client.resolver,42,777)==1
+    assert state.tg_for_max_message(42,"3")==553
+    assert state.tg_for_max_message(42,"2") is None
+    assert state.get_history_cursor(42)==1000
+    assert db.job(key)["status"]=="UNKNOWN"
+    sender._bot.send_message.assert_awaited_once()
+    db.close()

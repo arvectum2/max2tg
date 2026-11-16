@@ -157,7 +157,7 @@ class MaxClient:
 
     # ── transport ──────────────────────────────────────────────────
 
-    async def _send(self, opcode: int, payload: dict) -> int:
+    async def _send(self, opcode: int, payload: dict, *, pending=None) -> int:
         if not self._ws or self._ws.closed:
             return -1
         seq = self._seq
@@ -170,8 +170,17 @@ class MaxClient:
         }
         self._seq += 1
         raw = json.dumps(pkt, ensure_ascii=False)
-        log.debug(">>> SEND op=%d seq=%d | %s", opcode, seq, raw[:800])
-        await self._ws.send_str(raw)
+        log.debug(">>> SEND op=%d seq=%d bytes=%d", opcode, seq, len(raw))
+        # Register before awaiting the transport: an immediate response can
+        # arrive before send_str() returns, especially on faster runtimes.
+        if pending is not None:
+            self._pending[seq] = pending
+        try:
+            await self._ws.send_str(raw)
+        except BaseException:
+            if self._pending.get(seq) is pending:
+                self._pending.pop(seq, None)
+            raise
         return seq
 
     async def cmd(
@@ -189,15 +198,19 @@ class MaxClient:
             return None if none_on_timeout else {}
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[dict] = loop.create_future()
-        seq = await self._send(opcode, payload)
-        self._pending[seq] = fut
+        seq = await self._send(opcode, payload, pending=fut)
+        if seq < 0:
+            return None if none_on_timeout else {}
         try:
-            return await asyncio.wait_for(fut, timeout=timeout)
+            result = await asyncio.wait_for(fut, timeout=timeout)
+            return result if result is not None else (None if none_on_timeout else {})
         except asyncio.TimeoutError:
             log.warning("cmd timeout: op=%d seq=%d", opcode, seq)
             return None if none_on_timeout else {}
         finally:
-            self._pending.pop(seq, None)
+            # A reconnect can reuse seq with a different future.
+            if self._pending.get(seq) is fut:
+                self._pending.pop(seq, None)
 
     async def _heartbeat_loop(self):
         while True:
@@ -268,11 +281,13 @@ class MaxClient:
                     self._ws = None
                     for fut in self._pending.values():
                         if not fut.done():
-                            fut.cancel()
+                            # Disconnect is an uncertain RPC outcome, NOT task
+                            # cancellation (which could kill Telegram intake).
+                            fut.set_result(None)
                     self._pending.clear()
                     for fut in self._file_pending.values():
                         if not fut.done():
-                            fut.cancel()
+                            fut.set_result(None)
                     self._file_pending.clear()
 
                 if self._on_disconnect_cb:
@@ -824,7 +839,8 @@ class MaxClient:
             return None
 
         try:
-            await asyncio.wait_for(fut, timeout=timeout)
+            if await asyncio.wait_for(fut, timeout=timeout) is None:
+                return None
         except asyncio.TimeoutError:
             self._file_pending.pop(int(file_id), None)
             log.warning("File upload server processing timed out (fileId=%s)",

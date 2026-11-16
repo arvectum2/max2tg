@@ -22,8 +22,10 @@ def _coerce(key: str) -> Any:
 class TopicStore:
     """JSON-backed bidirectional map: Max chat ID ↔ Telegram forum topic (thread) ID."""
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, *, strict=False):
         self._path = path
+        self._strict = strict
+        self.persist_failed = False
         self._chats: dict[str, dict] = {}    # str(max_chat_id) → {"topic_id": int, "title": str}
         self._by_topic: dict[int, Any] = {}  # topic_id → max_chat_id (original type)
         self._messages: dict[str, dict[str, int]] = {}  # chat_id → max_message_id → tg_message_id
@@ -38,6 +40,12 @@ class TopicStore:
         try:
             with open(self._path, encoding="utf-8") as f:
                 data = json.load(f)
+            if self._strict:
+                if not isinstance(data,dict) or not isinstance(data.get("chats"),dict):
+                    raise ValueError("Invalid topic state")
+                for key in ("messages","ui","sync"):
+                    if not isinstance(data.get(key,{}),dict):
+                        raise ValueError("Invalid topic state section")
             self._chats = data.get("chats", {})
             self._messages = data.get("messages", {})
             self._ui = data.get("ui", {})
@@ -52,6 +60,8 @@ class TopicStore:
             for key, rec in self._chats.items():
                 tid = rec.get("topic_id")
                 if tid is not None:
+                    if self._strict and int(tid) in self._by_topic:
+                        raise ValueError("Ambiguous Telegram topic mapping")
                     self._by_topic[int(tid)] = _coerce(key)
             for chat_key, mapping in self._messages.items():
                 if not isinstance(mapping, dict):
@@ -63,6 +73,8 @@ class TopicStore:
                 len(self._chats), sum(len(v) for v in self._messages.values()), self._path,
             )
         except Exception:
+            if self._strict:
+                raise RuntimeError("Invalid persistent MAX2TG topic state; refusing unsafe startup") from None
             log.exception("Failed to load topic store %s — starting empty", self._path)
             self._chats = {}
             self._by_topic = {}
@@ -91,7 +103,9 @@ class TopicStore:
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp_path, self._path)
+            self.persist_failed = False
         except OSError:
+            self.persist_failed = True
             log.exception("Could not persist topic store %s; keeping in-memory state", self._path)
         finally:
             if tmp_path is not None:

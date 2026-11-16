@@ -1,5 +1,6 @@
 import asyncio
 import concurrent.futures
+import fcntl
 import logging
 import os
 import signal
@@ -81,7 +82,20 @@ async def main():
         log.info("Using Telegram proxy: %s", settings.tg_proxy.split("@")[-1])
 
     os.makedirs(settings.state_dir, exist_ok=True)
-    topic_store = TopicStore(os.path.join(settings.state_dir, "topics.json"))
+    # Prevent two workers from consuming updates and mutating the same ledger.
+    lock_fd = os.open(os.path.join(settings.state_dir,"worker.lock"),
+                      os.O_RDWR|os.O_CREAT,0o600)
+    try:
+        fcntl.flock(lock_fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(lock_fd)
+        raise SystemExit("MAX2TG worker already running for this state directory")
+    if not os.path.exists(os.path.join(settings.state_dir,"topics.json")) and any(
+        os.path.exists(os.path.join(settings.state_dir,name))
+        for name in ("outbox.sqlite3","tg-outbound.sqlite3")):
+        raise SystemExit("Existing message ledger without topic mapping; refusing unsafe startup")
+
+    topic_store = TopicStore(os.path.join(settings.state_dir, "topics.json"), strict=True)
 
     outbox = OutboxStore(os.path.join(settings.state_dir, "outbox.sqlite3"))
     tg_outbound = TelegramOutbound(
@@ -171,9 +185,11 @@ async def main():
     async def tg_outbound_recovery():
         while True:
             await asyncio.sleep(20)
-            if not getattr(client,"_authorized",False):
-                continue
             try:
+                if tg_app is not None:
+                    tg_app.update_queue.replay(tg_app.bot)
+                if not getattr(client,"_authorized",False):
+                    continue
                 await tg_outbound.drain(
                     client,is_allowed=lambda cid:
                     get_chat_prefs(topic_store,cid).sync
@@ -203,6 +219,7 @@ async def main():
         outbox.close()
         tg_outbound.close()
         tg_mutations.close()
+        os.close(lock_fd)
 
 
 if __name__ == "__main__":

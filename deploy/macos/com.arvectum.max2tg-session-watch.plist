@@ -6,8 +6,7 @@
   <string>com.arvectum.max2tg-session-watch</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/opt/homebrew/bin/node</string>
-    <string>/Users/master/bin/max2tg-session-watch.js</string>
+    <string>/Users/master/bin/max2tg-session-monitor.sh</string>
   </array>
   <key>RunAtLoad</key>
   <true/>

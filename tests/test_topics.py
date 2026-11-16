@@ -113,3 +113,17 @@ class TestPersistence:
 
         store = TopicStore(path)
         assert store.get_topic(42) is None
+
+def test_production_topic_store_refuses_corrupt_state(tmp_path):
+    import pytest
+    p=tmp_path/"bad.json"
+    p.write_text("{broken")
+    with pytest.raises(RuntimeError,match="refusing unsafe startup"):
+        TopicStore(str(p),strict=True)
+
+def test_production_topic_store_refuses_ambiguous_routing(tmp_path):
+    import pytest,json
+    p=tmp_path/"bad.json"
+    p.write_text(json.dumps({"chats":{"1":{"topic_id":2},"3":{"topic_id":2}}}))
+    with pytest.raises(RuntimeError,match="refusing unsafe startup"):
+        TopicStore(str(p),strict=True)

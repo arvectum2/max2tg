@@ -2110,8 +2110,8 @@ async def _on_health_callback(update: Update,
             "🔐 <b>Повторный вход в MAX</b>\n\n"
             "Открой на Mac mini профиль Chrome «MAX» и войди в web.max.ru "
             "по SMS. Не пересылай коды авторизации в Telegram.\n\n"
-            "Session-watch проверяет новую сессию и перезапускает "
-            "MAX2TG, если токен обновился."
+            "Автоматическое восстановление сессии недоступно. После входа "
+            "необходимо восстановить авторизацию моста; /status — диагностика."
         )
     else:
         client=context.bot_data.get(MAX_CLIENT_KEY)
