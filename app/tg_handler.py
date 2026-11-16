@@ -2613,10 +2613,16 @@ def build_tg_app(token: str, max_client: MaxClient, supergroup_id: str,
                  admin_user_id: int | None = None,
                  proxy_url: str | None = None) -> Application:
     """Build the Telegram Application that routes topic replies back to Max."""
-    builder = Application.builder().token(token)
+    from app.polling import TrackedPollingRequest
+    polling_request = TrackedPollingRequest(
+        proxy=proxy_url, connection_pool_size=4, pool_timeout=10,
+        connect_timeout=10, read_timeout=15, write_timeout=15,
+    )
+    builder = Application.builder().token(token).get_updates_request(polling_request)
     if proxy_url:
-        builder = builder.proxy(proxy_url).get_updates_proxy(proxy_url)
+        builder = builder.proxy(proxy_url)
     app = builder.build()
+    app.bot_data["polling_request"] = polling_request
     app.bot_data[MAX_CLIENT_KEY] = max_client
     app.bot_data[TOPIC_STORE_KEY] = topic_store
     app.bot_data[ALLOWED_USER_KEY] = int(allowed_user_id) if allowed_user_id else None

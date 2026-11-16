@@ -205,10 +205,15 @@ class HealthSupervisor:
                      self.tg_app.updater and self.tg_app.updater.running)
         if self.tg_app is None:
             polling=True # REPLY_ENABLED=false intentionally disables polling.
+        request = getattr(self.tg_app, "bot_data", {}).get("polling_request") if self.tg_app else None
+        poll_age = round(request.age()) if request is not None else None
+        poll_stale = bool(request is not None and request.stale())
+        poll_verified = request is None or request.last_success is not None
         paused_expected = (
             self.tg_app is not None
             and not bool(getattr(self.client, "_polling_should_run", True))
         )
+        polling = polling and not poll_stale and poll_verified
 
         counts=self.outbox.counts()
         row=self.outbox.db.execute(
@@ -257,7 +262,8 @@ class HealthSupervisor:
             "uptime_seconds":int(now-self.started),
             "max":{"state":max_state,"ws_connected":ws_open,
                    "authorized":authorized,"rx_age_seconds":age},
-            "telegram":{"polling":polling,"paused_expected":paused_expected},
+            "telegram":{"polling":polling,"paused_expected":paused_expected,
+                        "poll_age_seconds":poll_age,"poll_stale":poll_stale},
             "outbox":{"counts":counts,"oldest_due_seconds":oldest},
             "tg_outbound":tg_counts,
             "tg_mutations":tg_mutations,
@@ -283,8 +289,18 @@ class HealthSupervisor:
             except Exception:
                 log.exception("Health: cannot close stale MAX socket")
         tg_down=not report["telegram"]["polling"]
+        if report["telegram"].get("poll_stale") and self.tg_app:
+            # A running-but-dead Updater may hold a stranded HTTP pool.
+            # Recreate the whole worker/transport via the launchd supervisor.
+            restart = getattr(self, "restart_worker", None)
+            if restart is not None and now-self._repair_tg_at>=TG_REPAIR_COOLDOWN:
+                self._repair_tg_at=now
+                log.error("Telegram getUpdates has no successful response; restarting worker")
+                restart()
+                return
         if (tg_down and not report["telegram"].get("paused_expected")
             and self.tg_app and self.tg_app.running and
+            not self.tg_app.updater.running and
             now-self._repair_tg_at>=TG_REPAIR_COOLDOWN
             and self._tg_repair_attempts<3):
             self._repair_tg_at=now

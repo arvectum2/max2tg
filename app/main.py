@@ -2,6 +2,7 @@ import asyncio
 import concurrent.futures
 import logging
 import os
+import signal
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from logging.handlers import RotatingFileHandler
@@ -135,9 +136,17 @@ async def main():
         log.info("Reply to Max disabled (REPLY_ENABLED=false)")
 
     bind_polling_to_max(client,tg_app)
+    if tg_app is not None:
+        try:
+            await tg_app.updater.start_polling(
+                drop_pending_updates=False, allowed_updates=Update.ALL_TYPES,
+            )
+        except Exception:
+            log.exception("Initial Telegram polling failed; health supervisor will retry")
     health = HealthSupervisor(client,sender,outbox,topic_store,
                               tg_app,settings.state_dir)
     client.health = health
+    health.restart_worker = lambda: os.kill(os.getpid(), signal.SIGTERM)
     health.tg_outbound=tg_outbound
     health.tg_mutations=tg_mutations
     health_task = asyncio.create_task(health.monitor(), name="max2tg-health")
@@ -151,7 +160,8 @@ async def main():
                 await tg_outbound.drain(
                     client,is_allowed=lambda cid:
                     get_chat_prefs(topic_store,cid).sync
-                    and topic_store.get_topic(cid) is not None)
+                    and topic_store.get_topic(cid) is not None,
+                    tg_bot=tg_app.bot if tg_app else sender.bot)
             except Exception:
                 log.exception("TG outbound recovery encountered an error")
 
