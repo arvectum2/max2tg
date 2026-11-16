@@ -17,6 +17,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from app.tg_ingress import DurableIngressQueue
+from app.chat_preferences import get_chat_prefs
 
 log = logging.getLogger(__name__)
 
@@ -60,6 +62,7 @@ def status_text(report: dict | None) -> str:
         f"Telegram → MAX: ожидают {tg_out.get('RECEIVED',0)}; "
         f"неопределённые {tg_out.get('UNKNOWN',0)}; "
         f"ошибки {tg_out.get('FAILED',0)}",
+        f"Telegram: необработанный входящий буфер {report.get('tg_ingress_pending',0)}",
         f"TG→MAX правки/реакции: unknown {tg_mut.get('UNKNOWN',0)}, "
         f"failed {tg_mut.get('FAILED',0)}",
         f"Изменения: pending {failures.get('PENDING',0)}, "
@@ -249,6 +252,22 @@ class HealthSupervisor:
         if tg_mutations.get("FAILED",0): issues.append("TG_MUTATION_FAILED")
         if tg_counts.get("UNKNOWN",0): issues.append("TG_OUTBOUND_UNKNOWN")
         if tg_counts.get("FAILED",0): issues.append("TG_OUTBOUND_FAILED")
+        ingress = getattr(self.tg_app,"update_queue",None) if self.tg_app else None
+        pending_ingress = ingress.pending_count() if isinstance(
+            ingress, DurableIngressQueue) else 0
+        if isinstance(ingress, DurableIngressQueue) and ingress.pending_count(older_than=120):
+            issues.append("TG_INGRESS_STALLED")
+        tg_ledger = getattr(self,"tg_outbound",None)
+        if tg_ledger is not None and max_state == "ONLINE":
+            overdue = tg_ledger.db.execute(
+                "SELECT max_chat,payload FROM outbound WHERE status='RECEIVED' AND created<=?",
+                (time.time()-120,),
+            ).fetchall()
+            if any(self.topics.get_topic(r[0]) is not None
+                   and get_chat_prefs(self.topics,r[0]).sync
+                   and ("media" not in json.loads(r[1]) or get_chat_prefs(self.topics,r[0]).media)
+                   for r in overdue):
+                issues.append("TG_OUTBOUND_QUEUE_DELAY")
         if counts.get("UNKNOWN",0): issues.append("OUTBOX_UNKNOWN")
         if counts.get("FAILED",0): issues.append("OUTBOX_FAILED")
         if mutations.get("UNKNOWN",0): issues.append("MUTATION_UNKNOWN")
@@ -266,6 +285,7 @@ class HealthSupervisor:
                         "poll_age_seconds":poll_age,"poll_stale":poll_stale},
             "outbox":{"counts":counts,"oldest_due_seconds":oldest},
             "tg_outbound":tg_counts,
+            "tg_ingress_pending":pending_ingress,
             "tg_mutations":tg_mutations,
             "mutations":mutations,
             "topics":len(self.topics._chats),
@@ -318,7 +338,9 @@ class HealthSupervisor:
             self._tg_repair_attempts=0
 
     async def notify(self, report: dict):
-        if time.monotonic()-self.started<STARTUP_GRACE_SEC:
+        stale_poll = report.get("telegram",{}).get("poll_stale",False)
+        in_grace = time.monotonic()-self.started<STARTUP_GRACE_SEC
+        if in_grace and not stale_poll:
             return
         now=time.time()
         for issue in report["issues"]:
@@ -329,7 +351,12 @@ class HealthSupervisor:
                    "STATE_DISK","TELEGRAM_POLLING","MUTATION_UNKNOWN",
                    "MAX_OFFLINE","MAX_STALLED","QUEUE_DELAY","HISTORY_GAP",
                    "TG_OUTBOUND_UNKNOWN","TG_OUTBOUND_FAILED",
-                   "TG_MUTATION_UNKNOWN","TG_MUTATION_FAILED"}
+                   "TG_MUTATION_UNKNOWN","TG_MUTATION_FAILED",
+                   "TG_INGRESS_STALLED","TG_OUTBOUND_QUEUE_DELAY"}
+        if stale_poll and "TELEGRAM_POLLING" in report["issues"]:
+            self._issue_hits["TELEGRAM_POLLING"] = max(3,self._issue_hits.get("TELEGRAM_POLLING",0))
+        if in_grace:
+            important = {"TELEGRAM_POLLING"}
         acknowledged = set(self._acknowledged_issues(report["issues"]))
         alertable=[key for key in report["issues"] if key in important
                    and key not in acknowledged
@@ -366,8 +393,16 @@ class HealthSupervisor:
                 report=self.snapshot()
                 self.report=report
                 self._write_atomic(self.path,report)
-                await self.repair(report)
-                await self.notify(report)
+                if report["telegram"].get("poll_stale"):
+                    # If only getUpdates is broken, the send endpoint may
+                    # still reach the owner. Bound the warning before restart.
+                    try:
+                        await asyncio.wait_for(self.notify(report),timeout=8)
+                    finally:
+                        await self.repair(report)
+                else:
+                    await self.repair(report)
+                    await self.notify(report)
             except asyncio.CancelledError:
                 raise
             except Exception:

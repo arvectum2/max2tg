@@ -317,3 +317,15 @@ def test_upgrade_existing_text_only_db_adds_prepared_column(tmp_path):
     assert "prepared" in columns
     assert ledger.row(-100,1)["status"]=="RECEIVED"
     ledger.close()
+
+async def test_deferred_delivery_reports_confirmed_result(tmp_path):
+    store,ledger=env(tmp_path)
+    client=mock_client()
+    ledger.enqueue(-10088,25,42,payload())
+    reporter=AsyncMock()
+    assert await ledger.drain(client,is_allowed=lambda _:True,on_result=reporter)=={"SENT":1}
+    reporter.assert_awaited_once()
+    item,state=reporter.await_args.args
+    assert item["telegram_id"]==25 and state=="SENT"
+    assert ledger.row(-10088,25)["status"]=="SENT"
+    ledger.close()

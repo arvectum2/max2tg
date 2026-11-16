@@ -245,11 +245,15 @@ class TelegramOutbound:
             "WHERE telegram_chat=? AND telegram_id=?",
             (state,time.time(),str(tg_chat),int(tg_id)))
 
-    async def drain(self,client,*,is_allowed,limit=20,tg_bot=None):
+    async def drain(self,client,*,is_allowed,limit=20,tg_bot=None,
+                    is_media_allowed=None,on_result=None):
         result={}
         for item in self.pending(limit):
             if not getattr(client,"_authorized",False):
                 break
+            if (is_media_allowed is not None and "media" in json.loads(item["payload"])
+                and not is_media_allowed(item["max_chat"])):
+                continue
             try:
                 outcome=await self.deliver_one(
                     client,item["telegram_chat"],item["telegram_id"],
@@ -257,6 +261,12 @@ class TelegramOutbound:
             except Exception:
                 outcome="UNKNOWN"
             result[outcome]=result.get(outcome,0)+1
+            if on_result is not None and outcome in ("SENT","FAILED","UNKNOWN"):
+                try:
+                    await on_result(item,outcome)
+                except Exception:
+                    log.warning("Could not surface deferred delivery result: telegram_id=%s",
+                                item["telegram_id"])
         return result
 
     def close(self):

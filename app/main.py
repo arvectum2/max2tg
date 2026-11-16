@@ -7,7 +7,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from logging.handlers import RotatingFileHandler
 
-from telegram import BotCommand, Update
+from telegram import BotCommand, Update, ReplyParameters
 
 from app.config import load_settings
 from app.max_listener import create_max_client
@@ -111,7 +111,7 @@ async def main():
                               topic_store, allowed_user_id=settings.tg_allowed_user_id,
                               allowed_user_ids=settings.tg_allowed_user_ids,
                               admin_user_id=settings.tg_admin_user_id,
-                              proxy_url=settings.tg_proxy)
+                              proxy_url=settings.tg_proxy, outbound_ledger=tg_outbound)
         tg_app.bot_data[TG_OUTBOUND_KEY]=tg_outbound
         tg_app.bot_data[TG_MUTATIONS_KEY]=tg_mutations
         await tg_app.initialize()
@@ -125,13 +125,14 @@ async def main():
             BotCommand("chatsettings", "Настройки текущего MAX-чата"),
         ])
         await tg_app.start()
+        tg_app.update_queue.replay(tg_app.bot)
         await ensure_management_panel(
             tg_app.bot, settings.tg_chat_id, topic_store,
         )
         await ensure_quick_menu(
             tg_app.bot, settings.tg_chat_id, topic_store,
         )
-        log.info("Telegram updates will be processed after MAX is authorized")
+        log.info("Telegram updates will be durably staged even while MAX is offline")
     else:
         log.info("Reply to Max disabled (REPLY_ENABLED=false)")
 
@@ -151,6 +152,22 @@ async def main():
     health.tg_mutations=tg_mutations
     health_task = asyncio.create_task(health.monitor(), name="max2tg-health")
 
+    async def surface_deferred_delivery(item,state):
+        bot = tg_app.bot if tg_app else sender.bot
+        chat_id = int(item["telegram_chat"])
+        mid = int(item["telegram_id"])
+        if state == "SENT":
+            await bot.set_message_reaction(chat_id=chat_id,message_id=mid,reaction=["👀"])
+        else:
+            thread = topic_store.get_topic(item["max_chat"])
+            if thread is not None:
+                await bot.send_message(
+                    chat_id=chat_id,message_thread_id=thread,
+                    reply_parameters=ReplyParameters(message_id=mid),
+                    text="⚠️ Отложенная отправка в MAX: "+state+
+                         ". Проверь /issues, прежде чем повторять сообщение.",
+                )
+
     async def tg_outbound_recovery():
         while True:
             await asyncio.sleep(20)
@@ -161,7 +178,9 @@ async def main():
                     client,is_allowed=lambda cid:
                     get_chat_prefs(topic_store,cid).sync
                     and topic_store.get_topic(cid) is not None,
-                    tg_bot=tg_app.bot if tg_app else sender.bot)
+                    tg_bot=tg_app.bot if tg_app else sender.bot,
+                    is_media_allowed=lambda cid:get_chat_prefs(topic_store,cid).media,
+                    on_result=surface_deferred_delivery)
             except Exception:
                 log.exception("TG outbound recovery encountered an error")
 

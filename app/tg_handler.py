@@ -166,7 +166,7 @@ def _resolve_topic_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if message is None:
         return None
     thread_id = message.message_thread_id
-    if thread_id is None or not message.is_topic_message:
+    if thread_id is None:
         return None
     topic_store: TopicStore | None = context.bot_data.get(TOPIC_STORE_KEY)
     max_chat_id = topic_store.chat_for_topic(thread_id) if topic_store else None
@@ -2611,7 +2611,7 @@ def build_tg_app(token: str, max_client: MaxClient, supergroup_id: str,
                  topic_store: TopicStore, allowed_user_id: int | None = None,
                  allowed_user_ids: set[int] | frozenset[int] | None = None,
                  admin_user_id: int | None = None,
-                 proxy_url: str | None = None) -> Application:
+                 proxy_url: str | None = None, outbound_ledger=None) -> Application:
     """Build the Telegram Application that routes topic replies back to Max."""
     from app.polling import TrackedPollingRequest
     polling_request = TrackedPollingRequest(
@@ -2621,6 +2621,15 @@ def build_tg_app(token: str, max_client: MaxClient, supergroup_id: str,
     builder = Application.builder().token(token).get_updates_request(polling_request)
     if proxy_url:
         builder = builder.proxy(proxy_url)
+    if outbound_ledger is not None:
+        from app.tg_ingress import DurableIngressQueue, DurableIngressApplication
+        ids = set(allowed_user_ids or ())
+        if allowed_user_id:
+            ids.add(int(allowed_user_id))
+        if admin_user_id:
+            ids.add(int(admin_user_id))
+        queue = DurableIngressQueue(outbound_ledger, topic_store, supergroup_id, ids)
+        builder = builder.update_queue(queue).application_class(DurableIngressApplication)
     app = builder.build()
     app.bot_data["polling_request"] = polling_request
     app.bot_data[MAX_CLIENT_KEY] = max_client
