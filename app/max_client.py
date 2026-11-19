@@ -12,6 +12,7 @@ from typing import Any
 import aiohttp
 
 from app.max_media import media_filename
+from app.max_wire import encode, decode, profile_contact
 
 log = logging.getLogger(__name__)
 
@@ -108,7 +109,8 @@ class MaxMessage:
 
 
 class MaxClient:
-    WS_URL = "wss://ws-api.oneme.ru/websocket"
+    WS_URL = "wss://api.oneme.ru/websocket"
+    APP_VERSION = "26.11.9"
     HEARTBEAT_SEC = 30
     RECONNECT_SEC = 5
     def __init__(self, token: str, device_id: str, chat_ids: str | None = None, debug: bool = False):
@@ -118,6 +120,7 @@ class MaxClient:
         self.debug = debug
         self._ws: aiohttp.ClientWebSocketResponse | None = None
         self._seq = 0
+        self._binary_transport = False  # switched on by the live connection loop
         self._my_id = None
         self._authorized = False
         self._auth_required = False
@@ -161,6 +164,11 @@ class MaxClient:
         if not self._ws or self._ws.closed:
             return -1
         seq = self._seq
+        if self._binary_transport and seq >= 32767:
+            # The web protocol uses signed 16-bit sequence numbers. Reconnect
+            # before exhausting the sequence space; do not reuse pending IDs.
+            await self._ws.close()
+            return -1
         pkt = {
             "ver": 11,
             "cmd": 0,
@@ -169,14 +177,17 @@ class MaxClient:
             "payload": payload,
         }
         self._seq += 1
-        raw = json.dumps(pkt, ensure_ascii=False)
+        raw = encode(pkt) if self._binary_transport else json.dumps(pkt, ensure_ascii=False)
         log.debug(">>> SEND op=%d seq=%d bytes=%d", opcode, seq, len(raw))
         # Register before awaiting the transport: an immediate response can
         # arrive before send_str() returns, especially on faster runtimes.
         if pending is not None:
             self._pending[seq] = pending
         try:
-            await self._ws.send_str(raw)
+            if self._binary_transport:
+                await self._ws.send_bytes(raw)
+            else:
+                await self._ws.send_str(raw)
         except BaseException:
             if self._pending.get(seq) is pending:
                 self._pending.pop(seq, None)
@@ -230,13 +241,16 @@ class MaxClient:
         if self.debug:
             os.makedirs(DEBUG_DIR, exist_ok=True)
 
-        async with aiohttp.ClientSession(headers=_BROWSER_HEADERS) as session:
+        self._binary_transport = True
+        async with aiohttp.ClientSession(
+            headers=_BROWSER_HEADERS, timeout=aiohttp.ClientTimeout(total=60, connect=10, sock_connect=10)
+        ) as session:
             self._session = session
             while True:
                 try:
                     log.info("Connecting to %s ...", self.WS_URL)
                     async with session.ws_connect(
-                        self.WS_URL, headers=_WS_HEADERS
+                        self.WS_URL, headers=_WS_HEADERS, max_msg_size=32*1024*1024
                     ) as ws:
                         self._ws = ws
                         self._authorized = False
@@ -249,11 +263,14 @@ class MaxClient:
                             OpCode.HANDSHAKE,
                             {
                                 "deviceId": self.device_id,
+                                "clientSessionId": int(time.time() * 1000),
                                 "userAgent": {
                                     "deviceType": "WEB",
                                     "deviceName": "Chrome 131.0.0.0",
+                                    "appVersion": self.APP_VERSION,
+                                    "locale": "ru", "deviceLocale": "ru",
+                                    "pushDeviceType": "WEBPUSH",
                                 },
-                                "appVersion": "26.2.2",
                             },
                         )
 
@@ -262,7 +279,9 @@ class MaxClient:
                         )
 
                         async for msg in ws:
-                            if msg.type == aiohttp.WSMsgType.TEXT:
+                            if msg.type == aiohttp.WSMsgType.BINARY:
+                                await self._handle(decode(msg.data))
+                            elif msg.type == aiohttp.WSMsgType.TEXT:
                                 await self._handle(json.loads(msg.data))
                             elif msg.type in (
                                 aiohttp.WSMsgType.CLOSED,
@@ -325,7 +344,7 @@ class MaxClient:
 
         # server-initiated events — not a reply to one of our requests
         else:
-            payload_preview = json.dumps(payload, ensure_ascii=False)
+            payload_preview = json.dumps(payload, ensure_ascii=False, default=str)
             if len(payload_preview) > 3000:
                 payload_preview = payload_preview[:3000] + "…"
 
@@ -341,9 +360,16 @@ class MaxClient:
                 )
 
             elif op == OpCode.AUTH_SNAPSHOT and cmd == 1:
+                viewer = profile_contact(payload).get("id")
+                if type(viewer) is not int or viewer <= 0:
+                    self._authorized = False
+                    log.error("MAX auth response has no valid viewer; refusing unsafe readiness")
+                    if self._ws is not None:
+                        await self._ws.close()
+                    return
+                self._my_id = viewer
                 self._authorized = True
                 self._auth_required = False
-                self._my_id = payload.get("profile", {}).get("id")
                 log.info("Authorized! my_id=%s", self._my_id)
                 if self.debug:
                     self._dump_json("snapshot.json", payload)

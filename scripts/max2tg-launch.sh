@@ -6,7 +6,7 @@ export STATE_DIR="$HOME/.local/state/max2tg"
 export LOG_DIR="$HOME/Library/Logs/Arvectum/MAX2TG"
 export PYTHONNOUSERSITE=1
 unset PYTHONPATH PYTHONHOME || true
-PY="$HOME/.local/opt/max2tg-runtime/venv-20261116/bin/python"
+PY="$HOME/.local/opt/max2tg-runtime/venv-20261119/bin/python"
 mkdir -p "$STATE_DIR" "$LOG_DIR"
 function state() {
     printf '%s %s\n' "$1" "$$" > "$STATE_DIR/launcher.status.tmp"

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from app.max_wire import profile_contact
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -107,7 +108,7 @@ class ContactResolver:
         self.chat_types.clear()
         self.chats_raw.clear()
 
-        profile = snapshot.get("profile", {})
+        profile = profile_contact(snapshot)
         self._my_id = profile.get("id")
         names = profile.get("names", [])
         if names and self._my_id:
