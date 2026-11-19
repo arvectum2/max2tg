@@ -40,3 +40,21 @@ async def test_nested_profile_and_invalid_ack():
     r=ContactResolver();r.load_snapshot(data);assert r.my_id==42
     await c._handle({"cmd":1,"seq":0,"opcode":19,"payload":{"profile":{}}})
     assert not c._authorized
+
+def test_reply_int64_wire():
+    payload={"chatId":"451568625","message":{"text":"123","link":{"type":"REPLY","messageId":"117642635692424275"},"attaches":[{"_type":"FILE","fileId":"117642635692424276"}]}}
+    actual=decode(encode({"cmd":0,"seq":1,"opcode":64,"payload":payload}))["payload"]
+    assert actual["chatId"]==451568625
+    assert actual["message"]["link"]["messageId"]==117642635692424275
+    assert actual["message"]["attaches"][0]["fileId"]==117642635692424276
+    assert actual["message"]["text"]=="123"
+    assert isinstance(payload["message"]["link"]["messageId"],str)
+
+@pytest.mark.parametrize("opcode",[67,88,178,179])
+def test_rpc_numeric_identifiers(opcode):
+    assert decode(encode({"cmd":0,"seq":2,"opcode":opcode,"payload":{"chatId":"-123","messageId":"117642635692424275"}}))["payload"]=={"chatId":-123,"messageId":117642635692424275}
+
+def test_invalid_id_rejected_before_dispatch():
+    for value in ["bad",str(2**63),True]:
+        with pytest.raises(ValueError):
+            encode({"cmd":0,"seq":1,"opcode":64,"payload":{"message":{"link":{"messageId":value}}}})

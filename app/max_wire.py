@@ -17,8 +17,29 @@ def _ext(code, data):
         return value
     return msgpack.ExtType(code, data)
 
+# JSON/SQLite retain exact decimal IDs; MAX v10 requires int64.
+_INT64_FIELDS = frozenset({"messageId","chatId","postId","fileId","audioId",
+                         "videoId","photoId","userId","senderId","mediaId","cid"})
+_INT64_ARRAYS = frozenset({"messageIds","chatIds","userIds","photoIds"})
+
+def _wire_int64(value):
+    if isinstance(value,str) and value.removeprefix("-").isascii() and value.removeprefix("-").isdigit():
+        value=int(value)
+    if type(value) is not int or not -(1<<63)<=value<(1<<63):
+        raise ValueError("Invalid MAX int64 identifier")
+    return value
+
+def normalize_ids(value):
+    if isinstance(value,dict):
+        return {key: _wire_int64(item) if key in _INT64_FIELDS and item is not None
+                else [_wire_int64(x) for x in item] if key in _INT64_ARRAYS and isinstance(item,(list,tuple))
+                else normalize_ids(item) for key,item in value.items()}
+    if isinstance(value,(list,tuple)):
+        return [normalize_ids(item) for item in value]
+    return value
+
 def encode(packet):
-    body = msgpack.packb(packet["payload"], use_bin_type=True)
+    body = msgpack.packb(normalize_ids(packet["payload"]), use_bin_type=True)
     if len(body) >= MAX_FRAME:
         raise ValueError("MAX frame too large")
     return (HEADER.pack(10, packet["cmd"], packet["seq"], packet["opcode"], 0)
