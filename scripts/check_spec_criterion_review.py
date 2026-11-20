@@ -15,7 +15,7 @@ def validate(data, original, current, board):
     if data.get("schema")!="arvectum.source-criterion-review/1" or data.get("source_commit")!=PIN or data.get("execution_authorized") is not False or data.get("actual_acceptance_verified") is not False:errors.append("scope/authority")
     rows=data.get("rows",[]); ids=[r["id"] for r in rows]; expected={d["id"]:d for d in DEFINITIONS}
     if set(ids)!=set(expected) or len(ids)!=len(set(ids)):errors.append("criterion coverage")
-    tasks=re.findall(r"^- \\[([ xX])\\] (REVIEW-(?:MAX|TA)-[A-Z0-9-]+) \\(((?:MAX|TA)-[A-Z0-9-]+)\\)",board,re.M)
+    tasks=re.findall(r"^- \[([ xX])\] (REVIEW-(?:MAX|TA)-[A-Z0-9-]+) \(((?:MAX|TA)-[A-Z0-9-]+)\)",board,re.M)
     mapping={(t[1],t[2]):t[0].lower()=="x" for t in tasks}
     if len(tasks)!=len(expected) or len(mapping)!=len(expected):errors.append("task coverage")
     for r in rows:
@@ -28,7 +28,7 @@ def validate(data, original, current, board):
         if key not in mapping or mapping[key]!=(state=="verified"):errors.append("task/state "+r["id"])
         if state not in {"open","partial","blocked","verified"} or not str(r.get("next_action","")).strip():errors.append("status "+r["id"])
         if d["native_task_ids"]:
-            ids=set(re.findall(r"^- \\[[ xX]\\] (T\\d+[a-z]?)\\b",original["specs/001-power-quality-evidence-closure/tasks.md"].decode(),re.M))
+            ids=set(re.findall(r"^- \[[ xX]\] (T\d+[a-z]?)\b",original["specs/001-power-quality-evidence-closure/tasks.md"].decode(),re.M))
             if not set(d["native_task_ids"])<=ids:errors.append("native task reference "+r["id"])
         if state=="verified":
             ev=r.get("acceptance_evidence",[])
