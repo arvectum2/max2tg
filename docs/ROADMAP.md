@@ -401,3 +401,8 @@ SaaS prototype → SaaS beta → коммерческий запуск.
 7. После прохождения gate — перенос инфраструктуры на Timeweb Cloud.
 8. Billing/free trial.
 9. Protocol Client как отдельная ветка масштабирования.
+
+
+## Spec Kit — candidate linkage (2026-11-20)
+
+[Specification](../specs/001-reliability-roadmap-traceability/spec.md) · [Plan](../specs/001-reliability-roadmap-traceability/plan.md) · [Integration tasks](../specs/001-reliability-roadmap-traceability/tasks.md). No changes to native task states, test-account constraints, live service or launch scope. Existing roadmap remains authoritative.
