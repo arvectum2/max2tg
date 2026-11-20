@@ -6,7 +6,7 @@ on:
       - 'docs/ROADMAP.md'
       - 'docs/P1_FIELD_ACCEPTANCE.md'
       - 'scripts/check_spec_criterion_review.py'
-      - 'tests/test_spec_criterion_review.py'
+      - 'specs/001-reliability-roadmap-traceability/checks/test_spec_criterion_review.py'
       - '.github/workflows/spec-criterion-review.yml'
 permissions:
   contents: read
@@ -22,4 +22,4 @@ jobs:
         with:
           python-version: '3.12'
       - run: python scripts/check_spec_criterion_review.py
-      - run: python -m unittest discover -s tests -p test_spec_criterion_review.py -v
+      - run: python -m unittest discover -s specs/001-reliability-roadmap-traceability/checks -p test_spec_criterion_review.py -v
