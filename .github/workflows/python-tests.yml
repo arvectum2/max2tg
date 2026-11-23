@@ -1,0 +1,68 @@
+name: MAX2TG Python tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.14", "3.15"]
+
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements-dev.lock
+      - name: Use current reviewed pip installer
+        run: python -m pip install --upgrade pip==26.3
+      - name: Install pinned application and test dependencies
+        run: python -m pip install -r requirements-dev.lock
+      - name: Verify dependency compatibility
+        run: python -m pip check
+      - name: Static check of application and tests
+        run: python -m ruff check --select F app/tg_handler.py app/tg_sender.py app/tg_help.py app/max_search.py app/telegram_entities.py app/telegram_html.py app/health.py scripts/max2tg-preflight.py tests/test_handler_modules.py tests/test_telegram_html_module.py tests/test_runtime_lock_policy.py tests/test_health.py tests/test_polling.py
+      - name: Full unit and contract suite (no production credentials)
+        run: python -m pytest -q
+      - name: Check immutable release runtime before messenger access
+        if: matrix.python-version == '3.15'
+        run: python scripts/max2tg-preflight.py
+
+  node-watch:
+    name: Session watcher syntax (Node 26.13.1 LTS)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "26.13.1"
+      - name: Check watcher syntax, without accessing browser or credentials
+        run: node --check scripts/max2tg-session-watch.js
+
+  docker-image:
+    name: Build isolated Python 3.15 runtime image
+    needs: [tests]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build image (no production secrets or state)
+        run: docker build --pull --tag max2tg:ci .
+      - name: Validate runtime pins inside candidate image
+        run: docker run --rm --entrypoint python max2tg:ci scripts/max2tg-preflight.py

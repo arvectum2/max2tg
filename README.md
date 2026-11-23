@@ -122,7 +122,7 @@
 
 ## Требования
 
-- Python **3.12+** (для локального запуска)
+- Python **3.15.2** (целевой runtime релизного кандидата; тестируется также 3.12/3.14)
 - Docker + docker-compose v2 (для рекомендуемого деплоя)
 - Аккаунт MAX (`web.max.ru`)
 - Супергруппа Telegram с **включёнными темами** (Topics / Forum)
@@ -172,10 +172,17 @@ docker compose logs -f
 ```bash
 python -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+pip install -r requirements.lock  # зафиксированные актуальные runtime-зависимости
 cp .env.example .env  # отредактировать
 python -m app.main
 ```
+
+Для тестов используйте python -m pip install -r requirements-dev.lock,
+затем python -m pytest -q. Обновление зависимостей готовится через
+uv pip compile --upgrade из requirements.txt и requirements-dev.in
+с проверкой совместимости Python 3.12, 3.14 и 3.15.
+Активный сервис macOS остаётся на собственном изолированном runtime
+до утверждённого окна переключения.
 
 ### 5. systemd (Linux)
 

@@ -1,11 +1,9 @@
-import asyncio
 import io
 import logging
 import re
 from html import escape
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, ReplyKeyboardMarkup, Update
-from telegram.constants import MessageEntityType
 from telegram.error import BadRequest
 from telegram.ext import (
     Application,
@@ -29,6 +27,17 @@ from app.chat_preferences import get_chat_prefs
 from app.chat_settings_ui import cmd_chatsettings,callback_chatsettings
 from app.operator_issues import (get_issues,format_issues,
                                  acknowledge_blocked_mutation)
+
+from app.telegram_entities import (
+    _TG_TO_MAX_ELEMENT_TYPE as _TG_TO_MAX_ELEMENT_TYPE,
+    _utf16_to_char_offset as _utf16_to_char_offset,
+    _entities_to_max_elements as _entities_to_max_elements,
+)
+from app.max_search import (
+    _contact_display_name as _contact_display_name,
+    _normalize_global_search_results as _normalize_global_search_results,
+)
+from app.tg_help import HELP_TEXT as HELP_TEXT, _cmd_help as _cmd_help
 
 log = logging.getLogger(__name__)
 
@@ -54,60 +63,6 @@ _HISTORY_LIMIT_UI_KEY = "history_import_limit"
 _HISTORY_LIMIT_DEFAULT = 20
 _HISTORY_SETTING_WAITING_KEY = "awaiting_history_limit"
 _MESSAGE_SEARCH_KEY = "message_find_session"
-
-# Telegram entity type → MAX element type. The MAX names match what the
-# existing codebase used (STRONG) and what MAX renders for the formatting
-# styles surfaced in its UI (bold/italic/strike/underline/code).
-_TG_TO_MAX_ELEMENT_TYPE = {
-    MessageEntityType.BOLD: "STRONG",
-    MessageEntityType.ITALIC: "EMPHASIZED",
-    MessageEntityType.STRIKETHROUGH: "STRIKETHROUGH",
-    MessageEntityType.UNDERLINE: "UNDERLINE",
-    MessageEntityType.CODE: "MONOSPACED",
-    # MAX's WebSocket protocol exposes a smaller element enum than its bot
-    # HTTP API: BLOCKQUOTE / CODE_BLOCK / HIGHLIGHTED / HEADING are all
-    # rejected with "No enum constant". Best fallback for multi-line code
-    # is the same monospace style as inline code. Telegram blockquotes
-    # have no MAX counterpart at all — let them through as plain text
-    # rather than fail the whole send_message.
-    MessageEntityType.PRE: "MONOSPACED",
-}
-
-
-def _utf16_to_char_offset(text: str, utf16_offset: int) -> int:
-    """Convert a UTF-16 code-units offset (what Telegram uses for entity
-    positions) into a Python codepoint index (which MAX appears to use)."""
-    if utf16_offset <= 0 or not text:
-        return 0
-    encoded = text.encode("utf-16-le")
-    truncated = encoded[: utf16_offset * 2]
-    return len(truncated.decode("utf-16-le", errors="ignore"))
-
-
-def _entities_to_max_elements(text: str, entities) -> list:
-    """Map Telegram message entities to MAX `elements` descriptors so basic
-    inline formatting (bold/italic/strike/underline/code/link) survives the
-    Telegram → MAX bridge."""
-    if not entities:
-        return []
-    elements: list[dict] = []
-    for e in entities:
-        start = _utf16_to_char_offset(text, e.offset)
-        end = _utf16_to_char_offset(text, e.offset + e.length)
-        length = end - start
-        if length <= 0:
-            continue
-        max_type = _TG_TO_MAX_ELEMENT_TYPE.get(e.type)
-        if max_type:
-            elements.append({"type": max_type, "from": start, "length": length})
-        elif e.type == MessageEntityType.TEXT_LINK and getattr(e, "url", None):
-            elements.append({
-                "type": "LINK",
-                "from": start,
-                "length": length,
-                "attributes": {"url": e.url},
-            })
-    return elements
 
 
 def _effective_user_id(update: Update) -> int | None:
@@ -1051,86 +1006,6 @@ def _menu_list_markup(resolver, topic_store: TopicStore, page: int = 0,
     return InlineKeyboardMarkup(rows), page, page_count, len(entries)
 
 
-def _contact_display_name(contact: dict) -> str:
-    names = contact.get("names")
-    if isinstance(names, list) and names:
-        first = names[0].get("firstName", "")
-        last = names[0].get("lastName", "")
-        name = f"{first} {last}".strip() or names[0].get("name", "")
-        if name:
-            return str(name)
-    first = contact.get("firstName") or contact.get("first_name") or ""
-    last = contact.get("lastName") or contact.get("last_name") or ""
-    return (f"{first} {last}".strip()
-            or str(contact.get("friendly") or contact.get("displayName")
-                   or contact.get("name") or contact.get("link") or ""))
-
-
-def _normalize_global_search_results(resp: dict | None,
-                                     max_client: MaxClient) -> list[dict]:
-    if not isinstance(resp, dict):
-        return []
-    records: list[dict] = []
-    seen: set[int] = set()
-    for item in resp.get("result") or []:
-        if not isinstance(item, dict):
-            continue
-
-        chat = item.get("chat")
-        if isinstance(chat, dict):
-            chat_id = chat.get("id")
-            try:
-                chat_id = int(chat_id)
-            except (TypeError, ValueError):
-                continue
-            ctype = chat.get("type")
-            if ctype not in ("CHAT", "CHANNEL"):
-                continue
-            if chat_id in seen:
-                continue
-            title = str(chat.get("title") or chat.get("name") or chat_id)
-            records.append({
-                "chat_id": chat_id,
-                "type": ctype,
-                "title": title,
-                "link": chat.get("link") or "",
-                "raw": chat,
-            })
-            seen.add(chat_id)
-            continue
-
-        wrapper = item.get("contact")
-        if not isinstance(wrapper, dict):
-            continue
-        contact = wrapper.get("contact")
-        if not isinstance(contact, dict):
-            contact = wrapper
-        contact_id = contact.get("id") or contact.get("userId")
-        try:
-            contact_id = int(contact_id)
-        except (TypeError, ValueError):
-            continue
-        if max_client._my_id is not None and contact_id == int(max_client._my_id):
-            continue
-        try:
-            chat_id = max_client.dialog_chat_id(contact_id)
-        except (RuntimeError, TypeError, ValueError):
-            continue
-        if chat_id in seen:
-            continue
-        title = _contact_display_name(contact) or str(contact_id)
-        records.append({
-            "chat_id": chat_id,
-            "contact_id": contact_id,
-            "type": "DIALOG",
-            "title": title,
-            "link": contact.get("link") or "",
-            "raw": contact,
-        })
-        seen.add(chat_id)
-
-    return records
-
 
 def _search_results_markup(records: list[dict], topic_store: TopicStore) -> InlineKeyboardMarkup:
     rows = []
@@ -1965,7 +1840,7 @@ async def _on_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         except Exception:
             log.exception("menu bind: create_forum_topic failed")
             await query.edit_message_text(
-                f"⚠️ Не удалось создать Telegram-топик: {escape(str(exc))}",
+                "⚠️ Не удалось создать Telegram-топик. Проверь журнал сервиса.",
                 parse_mode="HTML",
             )
             return
@@ -1996,58 +1871,6 @@ async def _on_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             back_page=back_page,
         ),
     )
-
-
-HELP_TEXT = (
-    "<b>max2tg — мост MAX ↔ Telegram</b>\n\n"
-    "Команды в супергруппе:\n"
-    "• <code>/menu</code> — открыть кнопочное меню управления текущим "
-    "MAX-чатом или выбрать чат по названию из General.\n"
-    "• <code>/search [запрос]</code> — найти в MAX человека, группу или "
-    "канал; без запроса включит режим поиска через General.\n"
-    "• <code>/bind &lt;chat_id или URL&gt; [название]</code> — привязать "
-    "новый топик к чату MAX.\n"
-    "• <code>/add &lt;https://max.ru/join/...&gt;</code> — открыть "
-    "групповую/канальную ссылку MAX, создать топик и поставить карточку.\n"
-    "• <code>/profile</code> — внутри топика: показать профиль собеседника "
-    "из MAX (имя, id, аватар).\n"
-    "• <code>/intro</code> — перепостить и закрепить карточку профиля "
-    "в текущем топике (полезно после смены аватара).\n"
-    "• <code>/del</code> — удалить только Telegram-топик и локальную связь "
-    "(в MAX останешься).\n"
-    "• <code>/leave [chat_id]</code> — выйти из группы/канала MAX; "
-    "без аргумента работает внутри топика, с chat_id — даже из General.\n"
-    "• <code>/help</code> — эта справка.\n\n"
-    "Просто пиши в любом привязанном топике — сообщение уйдёт в "
-    "соответствующий чат MAX. Поддерживается жирный/курсив/зачёркнутый/"
-    "подчёркнутый текст, моноширинный код, цитаты и ссылки. Фото, "
-    "документы и видео тоже передаются. Голосовые приходят как .ogg "
-    "файл (пока MAX не вернул нам опкод нативной загрузки).\n\n"
-    "Если кто-то новый пишет тебе в MAX — топик создастся автоматически "
-    "и в нём сразу появится карточка собеседника."
-)
-
-
-HELP_TEXT += (
-    "\n\n<b>Управление чатами</b>\n"
-    "/chatsettings — внутри темы: синхронизация, уведомления, медиа, "
-    "история, архив и имя темы.\n"
-    "Архив скрывает чат из списка, но не удаляет тему.\n"
-    "/intro — обновить карточку и аватар MAX вручную.\n"
-    "\n<b>История и сообщения</b>\n"
-    "/find слово — искать сообщения в этой теме (в General — во всех).\n"
-    "/findall слово — искать по подключённым MAX-чатам.\n"
-    "/find с:2026-10-01 по:2026-10-23 — поиск по датам (МСК).\n"
-    "/history — в текущей теме вручную загрузить старые сообщения порциями."
-)
-
-
-async def _cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = update.message
-    if message is None:
-        return
-    await message.reply_text(HELP_TEXT, parse_mode="HTML",
-                              disable_web_page_preview=True)
 
 
 async def _cmd_issues(update: Update,context: ContextTypes.DEFAULT_TYPE) -> None:

@@ -1,5 +1,4 @@
 """Continuous Telegram receive path and real transport liveness."""
-import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
