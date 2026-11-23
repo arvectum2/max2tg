@@ -3,7 +3,7 @@
 One Application receives Telegram updates. Each update is authorized and
 durably journaled before being forwarded to its session over authenticated
 local IPC. Worker credentials and session state are not shared in the
-routing registry. The outgoing-bot API is a later integration stage.
+routing registry. Optional central text egress is journaled; worker IPC wiring is later.
 """
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ import logging
 from typing import Awaitable,Callable
 
 from app.telegram_inbox import TelegramInbox
+from app.telegram_egress import TelegramEgress
 from app.telegram_ipc import CapsuleIpcClient
 from app.telegram_control_plane import TelegramControlPlane
 
@@ -20,11 +21,25 @@ log=logging.getLogger(__name__)
 
 class TelegramGatewayEngine:
     def __init__(self,plane:TelegramControlPlane,inbox:TelegramInbox,
-                 deliver:Callable[[str,dict],Awaitable[bool]]|None=None):
+                 deliver:Callable[[str,dict],Awaitable[bool]]|None=None,
+                 *,egress:TelegramEgress|None=None):
         self.plane=plane
         self.inbox=inbox
         self.deliver=deliver or CapsuleIpcClient(plane.capsules).deliver
+        self.egress=egress
         self._locks={}
+
+    def enqueue_egress_text(self,sid:str,source_key:str,text:str) -> str:
+        """Trusted gateway only; resolve Telegram target by active tenant route."""
+        if self.egress is None:
+            raise RuntimeError("Central Telegram egress is not configured")
+        return self.egress.enqueue(sid,source_key,text)
+
+    async def drain_egress(self,bot,limit:int=50)->dict[str,int]:
+        """Explicitly called by single-bot gateway; never starts polling."""
+        if self.egress is None:
+            raise RuntimeError("Central Telegram egress is not configured")
+        return await self.egress.drain(bot,limit)
 
     async def accept(self,raw_update:dict) -> str:
         """No network if route invalid. Owner-only forum dispatch."""
