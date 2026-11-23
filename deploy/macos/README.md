@@ -15,3 +15,12 @@ LaunchAgents start after the owner logs into macOS, not before login. Proxy avai
 
 
 Modernization candidate (2026-11-23): separate branch proposes Python 3.15.2 plus newer locked application dependencies; NOT deployed. The running service still uses Python 3.12.14 and the existing launcher. Do not update the live repository/preflight separately from its tested runtime: on the next restart the strict release guard would refuse the mismatched interpreter. Promotion requires an approved atomic source+runtime switch, verified queue state, a test-account canary and rollback to the existing release.
+
+### External configuration for immutable releases (candidate)
+
+A new, opt-in MAX2TG_DOTENV_PATH can refer to the original owner-only .env
+without copying secrets to a separate immutable source release. See
+docs/MAX2TG_EXTERNAL_CONFIG_CUTOVER_20261123.md. Do not set this value
+or change the launchd wrapper on the running bridge before the agreed
+maintenance window. The old default and MAX2TG_NO_DOTENV=1 isolation
+behavior are preserved.
