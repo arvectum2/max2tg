@@ -23,12 +23,14 @@ jobs:
       PYTHONDONTWRITEBYTECODE: "1"
 
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
           cache-dependency-path: requirements-dev.lock
+      - name: Use current reviewed pip installer
+        run: python -m pip install --upgrade pip==26.3
       - name: Install pinned application and test dependencies
         run: python -m pip install -r requirements-dev.lock
       - name: Verify dependency compatibility
@@ -46,8 +48,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: "26.13.1"
       - name: Check watcher syntax, without accessing browser or credentials
@@ -59,7 +61,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build image (no production secrets or state)
         run: docker build --pull --tag max2tg:ci .
       - name: Validate runtime pins inside candidate image

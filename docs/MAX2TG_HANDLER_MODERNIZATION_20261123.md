@@ -68,8 +68,12 @@ before initiating any messenger connection. Previous preflight was hard-coded
 to 3.12.14 and could not parse uv-generated comment lines.
 
 A previous two-stage Dockerfile moved Debian glibc packages to Alpine musl,
-which is unsafe for Python native wheels. The candidate uses a single pinned
-Python 3.15.2-slim Debian base and only application runtime dependencies.
+which is unsafe for Python native wheels. Initial Linux ARM64 build of
+the candidate failed: lz4 and msgpack require compilation under Python
+3.15.2, but slim lacked GCC. The revised Dockerfile uses the same pinned
+Debian Python 3.15.2-slim image for both builder and runtime stages,
+installs build-essential only in the builder, and copies a validated venv
+into the compiler-free runtime image. Production Docker is untouched.
 Official Docker Hub tag metadata confirmed image exists with amd64 and arm64
 manifests; actual candidate Docker **build has not yet been run**.
 
@@ -111,3 +115,26 @@ then obtain explicit Owner authorization for the cutover.
 Roll back by restoring the exact previous checkout and pinned virtualenv.
 Never blindly replay UNKNOWN messages or reset durable queues. The roadmap's
 isolated P0.5b physical acceptance and SaaS P2.2b/c remain separate work.
+
+## Public GitHub publication blocker
+
+The public GitHub origin/main is 10 commits behind the running main
+checkout. See docs/MAX2TG_PUBLIC_PR_PREPARATION_20261123.md for the
+required separate source review and reconciliation before opening a
+modernization PR. Neither branch is pushed during this preparation.
+
+## Docker ARM64 build, direct smoke evidence and installer currency
+
+The initial Docker ARM64 build failed because lz4 and msgpack needed
+GCC for CPython 3.15.2. An isolated two-stage Debian build (builder
+has build-essential, final runtime has no GCC) subsequently SUCCEEDED
+using pip 26.2.2. Direct smoke checks on the built image passed:
+preflight with no network/read-only filesystem, Linux native ABI
+round-trip for lz4/msgpack, pip check, and absence of GCC. Image was
+268900383 bytes, linux/arm64. The builder and CI are now adjusted
+to use current stable pip 26.3 (released 2026-11-02) explicitly.
+The final image with pip 26.3 was rebuilt successfully on Linux/arm64;
+the image size is 270425148 bytes. Its no-network, read-only preflight,
+native lz4/msgpack ABI, pip check and compiler exclusion all PASS.
+Its image ID is sha256:8fbb9e5780bcac7c9c829d0dc7b3b96920f7d84f2e61f509841dd2cded299e55.
+No production runtime or application dependency was changed.

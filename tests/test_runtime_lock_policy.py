@@ -35,6 +35,12 @@ def test_runtime_gate_tracks_latest_candidate_python_and_container():
     assert (ROOT / ".python-version").read_text().strip() == "3.15"
     dockerfile = (ROOT / "Dockerfile").read_text()
     assert "FROM python:3.15.2-slim" in dockerfile
+    assert dockerfile.count("FROM python:3.15.2-slim") == 2
+    assert "COPY --from=builder /opt/venv /opt/venv" in dockerfile
+    assert "pip==26.3" in dockerfile
+    builder, runtime = dockerfile.split("FROM python:3.15.2-slim")[-2:]
+    assert "build-essential" in builder
+    assert "build-essential" not in runtime
     assert "alpine" not in "\n".join(
         line for line in dockerfile.splitlines()
         if line.lstrip().upper().startswith("FROM ")
