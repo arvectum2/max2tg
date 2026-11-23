@@ -140,3 +140,16 @@ the image size is 270425148 bytes. Its no-network, read-only preflight,
 native lz4/msgpack ABI, pip check and compiler exclusion all PASS.
 Its image ID is sha256:8fbb9e5780bcac7c9c829d0dc7b3b96920f7d84f2e61f509841dd2cded299e55.
 No production runtime or application dependency was changed.
+
+## Hosted CI cold-boot regression and corrective action
+
+GitHub PR #3 initially revealed four Linux runner failures on newly booted
+hosts: the health supervisor initialized last repair monotonic timestamps
+to 0.0, so recovery was incorrectly delayed by the 120- and 300-second
+cooldowns when uptime was short. The fix uses an explicit None sentinel
+for a never-attempted repair and a tested cooldown predicate, preserving
+backoff after the first attempt. Targeted test confirms immediate first
+repair and delayed subsequent repairs. Candidate now passes 635 tests
+on each Python 3.12/3.14/3.15 locally, plus 8 Spec Kit tests. Hosted CI
+will be rerun on the patched commit. This is a source-only reliability
+fix and does not restart the running bridge or touch durable queues.

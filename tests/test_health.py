@@ -1,18 +1,16 @@
 """P0.4 watchdog: real status, bounded recovery and private health reporting."""
-import asyncio
 import json
 import stat
 import time
-from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
-from app.health import HealthSupervisor, status_text, MIN_DISK_FREE_BYTES
+from app.health import HealthSupervisor, status_text, _cooldown_due
 from app.max_client import MaxClient, OpCode, MaxMessage
 from app.outbox import OutboxStore
 from app.topics import TopicStore
 from app.tg_handler import (
-    _cmd_status, _on_health_callback, MAX_CLIENT_KEY, TOPIC_STORE_KEY,
+    _cmd_status, _on_health_callback, MAX_CLIENT_KEY,
     ADMIN_USER_KEY, ALLOWED_USERS_KEY,
 )
 
@@ -32,6 +30,15 @@ def supervisor(tmp_path, *, authorized=True, polling=True):
     tg_app=SimpleNamespace(running=True,updater=updater)
     h=HealthSupervisor(client,sender,outbox,store,tg_app,str(tmp_path))
     return h,outbox,client,sender,tg_app
+
+
+def test_initial_health_repair_is_immediate_on_fresh_host():
+    # Linux CI runners may have uptime below both repair cooldowns.
+    assert _cooldown_due(None, 5.0, 300.0)
+    assert _cooldown_due(None, 5.0, 120.0)
+    assert not _cooldown_due(5.0, 6.0, 300.0)
+    assert not _cooldown_due(5.0, 304.9, 300.0)
+    assert _cooldown_due(5.0, 305.0, 300.0)
 
 
 def test_healthy_report_only_counts_and_hides_content(tmp_path):

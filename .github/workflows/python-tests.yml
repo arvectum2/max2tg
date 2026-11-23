@@ -36,7 +36,7 @@ jobs:
       - name: Verify dependency compatibility
         run: python -m pip check
       - name: Static check of application and tests
-        run: python -m ruff check --select F app/tg_handler.py app/tg_sender.py app/tg_help.py app/max_search.py app/telegram_entities.py app/telegram_html.py scripts/max2tg-preflight.py tests/test_handler_modules.py tests/test_telegram_html_module.py tests/test_runtime_lock_policy.py
+        run: python -m ruff check --select F app/tg_handler.py app/tg_sender.py app/tg_help.py app/max_search.py app/telegram_entities.py app/telegram_html.py app/health.py scripts/max2tg-preflight.py tests/test_handler_modules.py tests/test_telegram_html_module.py tests/test_runtime_lock_policy.py tests/test_health.py tests/test_polling.py
       - name: Full unit and contract suite (no production credentials)
         run: python -m pytest -q
       - name: Check immutable release runtime before messenger access

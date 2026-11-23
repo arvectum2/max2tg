@@ -38,6 +38,11 @@ OUTBOX_OLD_AGE_SEC = 300
 MIN_DISK_FREE_BYTES = 100 * 1024 * 1024
 
 
+def _cooldown_due(last_attempt: float | None, now: float, interval: float) -> bool:
+    """Allow an initial repair immediately, even on a newly booted host."""
+    return last_attempt is None or now - last_attempt >= interval
+
+
 def status_text(report: dict | None) -> str:
     """Human-readable diagnostics without secrets or private message data."""
     if not report:
@@ -98,8 +103,8 @@ class HealthSupervisor:
         self.alert_path = self.dir / "health-alerts.json"
         self.silence_path = self.dir / "health-silences.json"
         self.started = time.monotonic()
-        self._repair_socket_at = 0.0
-        self._repair_tg_at = 0.0
+        self._repair_socket_at: float | None = None
+        self._repair_tg_at: float | None = None
         self._tg_repair_attempts = 0
         self._issue_hits: dict[str,int] = {}
         self._alerts = self._read_alerts()
@@ -315,7 +320,7 @@ class HealthSupervisor:
         state=report["max"]["state"]
         socket=getattr(self.client,"_ws",None)
         if (state=="STALLED" and socket is not None
-            and now-self._repair_socket_at>=SOCKET_REPAIR_COOLDOWN):
+            and _cooldown_due(self._repair_socket_at, now, SOCKET_REPAIR_COOLDOWN)):
             self._repair_socket_at=now
             log.warning("Health: stale MAX socket; requesting reconnect")
             try:
@@ -327,7 +332,7 @@ class HealthSupervisor:
             # A running-but-dead Updater may hold a stranded HTTP pool.
             # Recreate the whole worker/transport via the launchd supervisor.
             restart = getattr(self, "restart_worker", None)
-            if restart is not None and now-self._repair_tg_at>=TG_REPAIR_COOLDOWN:
+            if restart is not None and _cooldown_due(self._repair_tg_at, now, TG_REPAIR_COOLDOWN):
                 self._repair_tg_at=now
                 log.error("Telegram getUpdates has no successful response; restarting worker")
                 restart()
@@ -335,7 +340,7 @@ class HealthSupervisor:
         if (tg_down and not report["telegram"].get("paused_expected")
             and self.tg_app and self.tg_app.running and
             not self.tg_app.updater.running and
-            now-self._repair_tg_at>=TG_REPAIR_COOLDOWN
+            _cooldown_due(self._repair_tg_at, now, TG_REPAIR_COOLDOWN)
             and self._tg_repair_attempts<3):
             self._repair_tg_at=now
             self._tg_repair_attempts+=1
