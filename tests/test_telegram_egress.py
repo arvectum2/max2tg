@@ -328,3 +328,41 @@ def test_ready_batch_limit_and_utf16_boundary(tmp_path):
         ledger.ready(limit=True)
     assert ledger.ready(limit=1) == [(sid, "m:101")]
     close(reg, ledger)
+
+
+@pytest.mark.asyncio
+async def test_bot_reply_from_wrong_chat_is_not_false_ack(tmp_path):
+    reg, _, ledger, ((sid, _, chat), _) = setup(tmp_path)
+    ledger.enqueue(sid, "m:wrong-chat", "text")
+    bot = SimpleNamespace(send_message=AsyncMock(
+        return_value=SimpleNamespace(message_id=501,
+                                     chat=SimpleNamespace(id=chat - 1))
+    ))
+    assert await ledger.send_one(bot, sid, "m:wrong-chat") == "UNKNOWN"
+    assert ledger.row(sid, "m:wrong-chat")["telegram_id"] is None
+    close(reg, ledger)
+
+
+@pytest.mark.asyncio
+async def test_parallel_gateway_recovery_cannot_create_false_sent_ack(tmp_path):
+    reg, plane, ledger, ((sid, _, _), _) = setup(tmp_path)
+    ledger.enqueue(sid, "m:recovered", "pending network reply")
+    started = asyncio.Event()
+    continue_send = asyncio.Event()
+
+    async def held_send(**_kwargs):
+        started.set()
+        await continue_send.wait()
+        return SimpleNamespace(message_id=99)
+
+    bot = SimpleNamespace(send_message=AsyncMock(side_effect=held_send))
+    task = asyncio.create_task(ledger.send_one(bot, sid, "m:recovered"))
+    await asyncio.wait_for(started.wait(), 1)
+    recovered = TelegramEgress(reg.root / "telegram-egress.sqlite3", plane)
+    assert recovered.row(sid, "m:recovered")["status"] == "UNKNOWN"
+    continue_send.set()
+    assert await task == "UNKNOWN"
+    assert ledger.row(sid, "m:recovered")["telegram_id"] is None
+    bot.send_message.assert_awaited_once()
+    recovered.close()
+    close(reg, ledger)

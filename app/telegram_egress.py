@@ -186,14 +186,22 @@ class TelegramEgress:
                 self._uncertain(sid, source_key)
                 return "UNKNOWN"
             message_id = getattr(response, "message_id", None)
-            if type(message_id) is not int or message_id <= 0:
+            response_chat = getattr(response, "chat", None)
+            if (type(message_id) is not int or message_id <= 0
+                or response_chat is not None and
+                getattr(response_chat, "id", None) != int(row["tg_chat_id"])):
                 self._uncertain(sid, source_key)
                 return "UNKNOWN"
-            self.db.execute(
+            updated = self.db.execute(
                 "UPDATE telegram_egress SET status='SENT',telegram_id=?,updated_at=? "
                 "WHERE session_id=? AND source_key=? AND status='SENDING'",
                 (message_id, time.time(), sid, source_key),
             )
+            # Another gateway instance may have restarted and converted a
+            # stale SENDING to UNKNOWN while the Bot API call was in flight.
+            # Never claim SENT unless the durable transition actually landed.
+            if updated.rowcount != 1:
+                return self.row(sid, source_key)["status"]
             return "SENT"
 
     async def drain(self, bot, limit: int = 50) -> dict[str, int]:

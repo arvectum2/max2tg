@@ -13,8 +13,9 @@
   Lost response, cancellation or crash becomes UNKNOWN, never auto-replayed.
 - Gateway optionally exposes enqueue_egress_text / drain_egress; no
   shared bot or workers launched by these methods.
-- 23 isolated tests: two tenants, dedup, mutation, owner/forum revocation,
-  timeout, cancellation, competing senders, restart, metadata bounds,
+- 25 isolated tests: two tenants, dedup, mutation, owner/forum revocation,
+  timeout, cancellation, competing senders, concurrent gateway restart,
+  false Bot API chat acknowledgements, metadata bounds,
   UTF-16, paths, gateway and replay protection.
 
 ## Explicitly NOT implemented
