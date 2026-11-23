@@ -1,9 +1,9 @@
 # MAX2TG — public GitHub PR and CI publication gate
 
 Date: 2026-11-23
-Status: PREPARED LOCALLY; NO PUSH / PR / MERGE / DEPLOY
+Status: HISTORICAL DIVERGENCE RESOLVED; MODERNIZATION PR / CI PENDING; NO DEPLOY
 
-## Remote divergence
+## Historical remote divergence, resolved on 2026-11-23
 
 Canonical GitHub repository: arvectum2/max2tg; publicly visible.
 
@@ -17,23 +17,25 @@ durable intake and delivery recovery. The modernization branch includes
 these 10 commits as ancestry. Opening a PR against the public GitHub main
 immediately would unintentionally include those unrelated changes.
 
-## Proposed sequence, NOT executed
+## Executed publication of the historical changes and remaining review gates
 
-1. Independently review the 10 unpublished main commits for behavior,
-   license/IP, secrets, personal data, public visibility, security and
-   governance. Do not force-push or silently rebase the running checkout.
-2. Explicitly reconcile canonical GitHub main with those reviewed
-   changes. This requires separate approval because the repository
-   is public and the existing changes span production behavior.
-3. Open a separate modernization PR only after reconciliation. Verify
-   the PR diff contains the two scoped refactors and quality-gate changes.
-4. Run hosted GitHub Actions: Python 3.12/3.14/3.15 full test suites,
-   Node 26 watcher syntax and Docker image build+preflight. Capture real
-   run IDs/logs, not just workflow syntax.
-5. Review the precise release candidate and schedule the single
-   approved deployment window with a tested rollback plan.
-6. Do not use live accounts for destructive testing or replay UNKNOWN
-   messages without independently verified delivery evidence.
+1. **PASS**: scanned every unpublished patch and tracked tree for secrets,
+   private keys, credentials, contact literals and suspicious binaries.
+   Manual classification of 15 false-positive credential fields plus
+   four high-entropy pathname matches found no exposed secrets.
+2. **PASS**: safely reconciled 10 local production fixes with eight
+   already-public GitHub commits (Spec Kit) in an isolated worktree.
+   Combined main passed 610 Python tests + eight Spec Kit tests and a
+   source criterion structural check. No production runtime changed.
+3. **PUBLISHED**: GitHub main was fast-forwarded, no force-push,
+   to merge commit 63f88b3fcb9d9a28cc10c947c5d328f53071dec8.
+4. **NEXT**: create an independent modernization PR, verify its diff is
+   only the scoped refactors and CI/toolchain changes, then run hosted
+   Python 3.12/3.14/3.15 tests, Node 26 syntax and Docker build/preflight.
+5. **AFTER TESTS**: review and merge the exact product candidate, but
+   do not deploy/restart until the owner approves one maintenance window.
+6. **STILL OUT OF SCOPE**: live destructive messenger acceptance and
+   blind UNKNOWN message replay.
 
 ## Validated local evidence
 
@@ -44,8 +46,8 @@ immediately would unintentionally include those unrelated changes.
 - Docker BuildKit static check PASS. Initial ARM64 native compilation needed GCC; an isolated two-stage Debian build now PASS, including the current pip 26.3 installer. Final offline/read-only smoke test, native ABI and pip check PASS; runtime lacks GCC.
 - CI workflow uses checkout v7, setup-python v7, setup-node v7.
   Python 3.15.2 appears in GitHub python-versions manifest.
-- No remote branch published, no hosted CI run claimed, and no running
-  production bridge or queues changed.
+- The reconciled historical main is now published. Modernization PR and
+  hosted CI were pending when this evidence was recorded; production remains unchanged.
 
-This is source/release reconciliation evidence, not permission to
-publish historic commits or restart the bridge.
+This records an owner-authorized review and publication of historical commits;
+it does not authorize restarting or deploying the running bridge.

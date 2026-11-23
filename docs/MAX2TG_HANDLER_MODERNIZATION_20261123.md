@@ -116,12 +116,14 @@ Roll back by restoring the exact previous checkout and pinned virtualenv.
 Never blindly replay UNKNOWN messages or reset durable queues. The roadmap's
 isolated P0.5b physical acceptance and SaaS P2.2b/c remain separate work.
 
-## Public GitHub publication blocker
+## Historical GitHub divergence resolved
 
-The public GitHub origin/main is 10 commits behind the running main
-checkout. See docs/MAX2TG_PUBLIC_PR_PREPARATION_20261123.md for the
-required separate source review and reconciliation before opening a
-modernization PR. Neither branch is pushed during this preparation.
+The 10 local reliability commits were scanned for secrets and merged
+with eight existing remote Spec Kit commits. Canonical GitHub main is
+now merge commit 63f88b3fcb9d9a28cc10c947c5d328f53071dec8;
+running local main remains unchanged until the approved deployment.
+See docs/MAX2TG_PUBLIC_PR_PREPARATION_20261123.md for evidence.
+Publish the modernization separately as an independently tested PR.
 
 ## Docker ARM64 build, direct smoke evidence and installer currency
 
