@@ -1,5 +1,7 @@
 import os
+import stat
 from dataclasses import dataclass
+from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -20,11 +22,40 @@ class Settings:
     tg_admin_user_id: int | None = None
 
 
-def load_settings() -> Settings:
-    # Isolated SaaS workers must NEVER load the personal bridge .env from
-    # the checkout, even when a capsule credential is missing.
-    if os.environ.get("MAX2TG_NO_DOTENV") != "1":
+def _load_bridge_dotenv() -> None:
+    """Prefer explicit private config for immutable releases; preserve old default.
+
+    SaaS capsules must not inherit the personal bridge credentials, even if an
+    external dotenv path was accidentally supplied.
+    """
+    if os.environ.get("MAX2TG_NO_DOTENV") == "1":
+        return
+
+    explicit = os.environ.get("MAX2TG_DOTENV_PATH")
+    if not explicit:
         load_dotenv()
+        return
+
+    path = Path(explicit)
+    if not path.is_absolute() or path.is_symlink():
+        raise SystemExit("MAX2TG_DOTENV_PATH must be an absolute regular file")
+
+    try:
+        meta = path.stat()
+    except OSError:
+        raise SystemExit("MAX2TG_DOTENV_PATH not accessible") from None
+
+    if not stat.S_ISREG(meta.st_mode):
+        raise SystemExit("MAX2TG_DOTENV_PATH must be a regular file")
+    if os.name == "posix":
+        if meta.st_mode & 0o077 or meta.st_uid != os.getuid():
+            raise SystemExit("MAX2TG_DOTENV_PATH must be owner-only (0600)")
+
+    load_dotenv(dotenv_path=path, override=False)
+
+
+def load_settings() -> Settings:
+    _load_bridge_dotenv()
 
     required = ["MAX_TOKEN", "MAX_DEVICE_ID", "TG_BOT_TOKEN", "TG_CHAT_ID"]
     missing = [k for k in required if not os.environ.get(k)]
