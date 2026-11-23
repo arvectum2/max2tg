@@ -30,7 +30,7 @@ logs/              # логи, gitignored
 
 WebSocket: `wss://ws-api.oneme.ru/websocket`, `Origin: https://web.max.ru`.
 
-Пакет: `{"ver":11,"cmd":0,"seq":N,"opcode":OP,"payload":{...}}`. Ответ: `cmd=1` (OK) или `cmd=3` (error).
+Текущий транспорт: **бинарный MAX v10** (MessagePack, при необходимости LZ4), см. `app/max_wire.py`. Логический пакет: `{"ver":10,"cmd":0,"seq":N,"opcode":OP,"payload":{...}}`; ответ cmd=1 (OK) или cmd=3 (error). Прежнее описание JSON v11 больше не отражает текущий транспорт.
 
 | Opcode | Назначение |
 |---|---|
