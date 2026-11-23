@@ -9,13 +9,14 @@ import fcntl
 import os
 from pathlib import Path
 import runpy
-import sys
 
 
 def main():
     raw=os.environ.get("MAX2TG_CAPSULE_LOCK")
     if not raw:
         raise SystemExit("Capsule worker requires a per-session lock path")
+    if os.environ.get("MAX2TG_TELEGRAM_MODE") == "shared":
+        raise SystemExit("Shared capsule cannot start dedicated Telegram polling")
     lock_path=Path(raw).absolute()
     if lock_path.is_symlink() or not lock_path.parent.is_dir():
         raise SystemExit("Invalid capsule worker lock")

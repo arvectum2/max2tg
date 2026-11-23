@@ -32,8 +32,10 @@ def build_worker_env(registry: CapsuleRegistry, sid: str,
     parent=os.environ if parent is None else parent
     env={k:v for k,v in parent.items() if k in ENV_WHITELIST}
     layout=registry.capsule_dir(sid)
+    mode=registry.get(sid)["telegram_mode"]
     env.update(trusted)
     env.update({
+        "MAX2TG_TELEGRAM_MODE":mode,
         "STATE_DIR":str(layout/"state"),"LOG_DIR":str(layout/"logs"),
         "MAX2TG_CAPSULE_LOCK":str(layout/"worker.lock"),
         "MAX2TG_BROWSER_PROFILE":str(layout/"browser-profile"),
@@ -42,6 +44,17 @@ def build_worker_env(registry: CapsuleRegistry, sid: str,
         "DEBUG":"false",
         "PYTHONUNBUFFERED":"1",
     })
+    if mode == "shared":
+        # The shared Telegram credential lives ONLY in the gateway.
+        env.pop("TG_BOT_TOKEN", None)
+        env.pop("TG_PROXY", None)
+        env["REPLY_ENABLED"]="false"
+        from app.telegram_egress_ipc import egress_ipc_path
+        from app.telegram_ipc import ipc_key_path
+        env["MAX2TG_SHARED_SESSION_ID"]=sid
+        env["MAX2TG_SHARED_EGRESS_SOCKET"]=str(
+            egress_ipc_path(registry.root))
+        env["MAX2TG_SHARED_IPC_KEY_FILE"]=str(ipc_key_path(registry,sid))
     return env
 
 
@@ -91,6 +104,13 @@ class CapsuleSupervisor:
         self._stopping=False
 
     def _launch(self, sid):
+        # The shared transport exists, but the MAX listener still requires
+        # a dedicated sender adapter. Do not boot app.main without a token
+        # and never let a shared capsule accidentally start bot polling.
+        if self.registry.get(sid)["telegram_mode"] == "shared":
+            self.registry.set_status(sid,"ERROR","SHARED_RUNTIME_NOT_READY")
+            self._retry_after[sid]=self.clock()+60
+            return
         base=self.registry.capsule_dir(sid)
         if lock_held(base/"worker.lock"):
             self.registry.set_status(sid,"RECONNECTING", "WORKER_ALREADY_RUNNING")
