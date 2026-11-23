@@ -1,0 +1,3 @@
+# Plan — preserve reliability work
+
+Reconcile exact local and remote source revisions first; do not push/reset or change service. Inventory 57 marker occurrences at remote pinned revision, including open and partial states, and all unmarked source lines. Map existing incident, delivery, outbox, restart and isolation criteria to native task IDs and exact tests/receipts; unverified facts stay open. Check actual runtime status read-only where authorized. Physical/live test only within separate test environment and approval; do not mix private message contents with Company evidence. Review commercial readiness only after reliability acceptance. Supply read-only links and explicit blockers to Mission Control.

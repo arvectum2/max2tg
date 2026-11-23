@@ -1,0 +1,5 @@
+# Pinned Spec Kit scaffold — candidate
+
+Source: arvectum2/compliance @ e3091d8569db1aa9bafd02238a46495030783491, native Specify 1.2.4 integration none. Source manifest SHA-256 checked against every listed file on Mac mini; upstream MIT license included. Generic scaffold copied byte-for-byte with original executable modes; source timestamps identify the source snapshot, not a new installer run. Prior project-specific constitution excluded and replaced by a local non-authoritative adapter. No agent integration, extension, automatic execution or feature selection enabled.
+
+Project root relative to repository: `.`; current candidate feature: `specs/001-reliability-roadmap-traceability`. Explicit guards: SPECIFY_INIT_DIR points to that project root; SPECIFY_FEATURE_DIRECTORY points to the existing feature; SPECIFY_FEATURE_NO_PERSIST=1 for read-only checks. Existing native sources and approval rules prevail. Review, exact prerequisite checks and criterion-level mapping remain required before canonical admission.

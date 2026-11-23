@@ -1,0 +1,25 @@
+name: Spec criterion source review
+on:
+  pull_request:
+    paths:
+      - 'specs/001-reliability-roadmap-traceability/**'
+      - 'docs/ROADMAP.md'
+      - 'docs/P1_FIELD_ACCEPTANCE.md'
+      - 'scripts/check_spec_criterion_review.py'
+      - 'specs/001-reliability-roadmap-traceability/checks/test_spec_criterion_review.py'
+      - '.github/workflows/spec-criterion-review.yml'
+permissions:
+  contents: read
+jobs:
+  criterion-review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python scripts/check_spec_criterion_review.py
+      - run: python -m unittest discover -s specs/001-reliability-roadmap-traceability/checks -p test_spec_criterion_review.py -v
