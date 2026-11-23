@@ -27,6 +27,8 @@ CREDENTIAL_KEYS = frozenset({
 REQUIRED_KEYS = frozenset({
     "MAX_TOKEN","MAX_DEVICE_ID","TG_BOT_TOKEN","TG_CHAT_ID","TG_ADMIN_USER_ID",
 })
+REQUIRED_SHARED_KEYS = REQUIRED_KEYS - {"TG_BOT_TOKEN"}
+TELEGRAM_MODES = frozenset({"dedicated", "shared"})
 PRIVATE_MODE = 0o700
 
 
@@ -90,6 +92,14 @@ class CapsuleRegistry:
           );
           CREATE INDEX IF NOT EXISTS capsules_owner ON capsules(user_id);
         """)
+        # Schema extension is backward compatible with dedicated P2.1 rows.
+        if "telegram_mode" not in {
+            row["name"] for row in self.db.execute("PRAGMA table_info(capsules)")
+        }:
+            self.db.execute(
+                "ALTER TABLE capsules ADD COLUMN telegram_mode TEXT "
+                "NOT NULL DEFAULT 'dedicated'"
+            )
         for suffix in ("-wal", "-shm"):
             name = self.db_path.with_name(self.db_path.name + suffix)
             if name.exists():
@@ -140,17 +150,26 @@ class CapsuleRegistry:
         return [dict(row) for row in self.db.execute(
             "SELECT * FROM capsules ORDER BY session_id")]
 
-    def configure(self, sid: str, credentials: Mapping[str,str]) -> None:
-        """Install credentials from a trusted operator-supplied mapping.
+    def configure(self, sid: str, credentials: Mapping[str,str],
+                  *, telegram_mode: str = "dedicated") -> None:
+        """Install per-capsule secrets; shared workers MUST NOT see bot token.
 
-        Two capsules cannot accidentally poll the same bot or share a
-        Telegram forum. Existing credentials must be changed while inactive.
+        Dedicated P2.1 mode remains the default. Mode changes require an
+        inactive capsule and an atomic replacement of its private credentials.
         """
         current=self.get(sid)
         if current["desired_active"]:
             raise ValueError("Deactivate capsule before changing credentials")
-        if set(credentials) - CREDENTIAL_KEYS or REQUIRED_KEYS - set(credentials):
+        if telegram_mode not in TELEGRAM_MODES:
+            raise ValueError("Unknown Telegram transport mode")
+        required = (REQUIRED_SHARED_KEYS if telegram_mode == "shared"
+                    else REQUIRED_KEYS)
+        if set(credentials) - CREDENTIAL_KEYS or required - set(credentials):
             raise ValueError("Unknown or missing credential fields")
+        if telegram_mode == "shared" and (
+            {"TG_BOT_TOKEN","TG_PROXY"} & set(credentials)
+        ):
+            raise ValueError("Shared worker must not store Telegram bot or proxy secrets")
         if any(not isinstance(v,str) or not v.strip() or len(v)>4096
                for v in credentials.values()):
             raise ValueError("Credentials must be nonempty strings")
@@ -167,7 +186,8 @@ class CapsuleRegistry:
                     raise ValueError("Invalid allowed user")
             except ValueError as exc:
                 raise ValueError("Invalid allowed user") from exc
-        fp=hashlib.sha256(credentials["TG_BOT_TOKEN"].encode()).hexdigest()
+        fp=(hashlib.sha256(credentials["TG_BOT_TOKEN"].encode()).hexdigest()
+            if telegram_mode == "dedicated" else None)
         conflict=self.db.execute(
             "SELECT session_id FROM capsules WHERE session_id<>? "
             "AND (tg_chat_id=? OR bot_fingerprint=?)",
@@ -192,8 +212,9 @@ class CapsuleRegistry:
         # Persist metadata only after durable credentials replace.
         self.db.execute(
             "UPDATE capsules SET tg_chat_id=?,bot_fingerprint=?,"
-            "status='STOPPED',last_error=NULL,updated_at=? WHERE session_id=?",
-            (str(group_id),fp,time.time(),sid))
+            "telegram_mode=?,status='STOPPED',last_error=NULL,updated_at=? "
+            "WHERE session_id=?",
+            (str(group_id),fp,telegram_mode,time.time(),sid))
 
     def credentials(self, sid: str) -> dict[str,str]:
         self.get(sid)
@@ -202,15 +223,19 @@ class CapsuleRegistry:
         # Ensure no untrusted paths/values are imported as environment knobs.
         with path.open(encoding="utf-8") as f:
             data=json.load(f)
-        if not isinstance(data,dict) or REQUIRED_KEYS-set(data) or (
-            set(data)-CREDENTIAL_KEYS):
+        mode = self.get(sid)["telegram_mode"]
+        required = REQUIRED_SHARED_KEYS if mode == "shared" else REQUIRED_KEYS
+        if (not isinstance(data,dict) or required-set(data)
+            or set(data)-CREDENTIAL_KEYS
+            or mode == "shared" and
+            ({"TG_BOT_TOKEN","TG_PROXY"} & set(data))):
             raise ValueError("Malformed credential file")
         if any(not isinstance(v,str) or not v.strip() for v in data.values()):
             raise ValueError("Malformed credential values")
         return data
 
     def set_active(self, sid: str, active: bool) -> None:
-        row=self.get(sid)
+        self.get(sid)
         if active:
             self.credentials(sid)  # refuse activation without private secrets
         self.db.execute(

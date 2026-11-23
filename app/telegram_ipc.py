@@ -116,6 +116,9 @@ class CapsuleIpcClient:
             if (response.get("update_id")!=update.get("update_id")
                 or response.get("session_id")!=sid):
                 raise ValueError("Unexpected IPC response")
+            if response.get("unavailable") is True:
+                # Worker explicitly confirmed that no MAX request was sent.
+                raise WorkerUnavailable()
             return response.get("ack") is True
         finally:
             writer.close()
@@ -159,6 +162,17 @@ class CapsuleIpcServer:
                       "update_id":update["update_id"],
                       "ack":result is True}
             await _write_frame(writer,_signed(response,self.key))
+        except WorkerUnavailable:
+            # Only the worker handler can assert no MAX request was issued.
+            # Distinct signed reply lets gateway retain RECEIVED for retry.
+            if "update" in locals() and isinstance(update,dict):
+                try:
+                    response={"session_id":self.sid,
+                              "update_id":update["update_id"],
+                              "ack":False,"unavailable":True}
+                    await _write_frame(writer,_signed(response,self.key))
+                except Exception:
+                    pass
         except Exception:
             # No success ack on an unknown execution outcome.
             pass
