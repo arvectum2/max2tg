@@ -4,6 +4,7 @@ on:
     paths:
       - 'specs/001-reliability-roadmap-traceability/**'
       - 'docs/ROADMAP.md'
+      - 'docs/PERSONAL_RELEASE_*.md'
       - 'docs/P1_FIELD_ACCEPTANCE.md'
       - 'scripts/check_spec_criterion_review.py'
       - 'specs/001-reliability-roadmap-traceability/checks/test_spec_criterion_review.py'
