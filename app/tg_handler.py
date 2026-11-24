@@ -18,6 +18,7 @@ from telegram.ext import (
 from app.max_client import MaxClient
 from app.message_sync import REACTION_EMOJI
 from app.health import status_text
+from app.photo_history import cmd_photos
 from app.history_ui import (
     cmd_find, cmd_history, callback_find, callback_history,
 )
@@ -150,7 +151,7 @@ async def _surface_send_result(message, resp) -> None:
         log.debug("Could not set reaction on confirmed message", exc_info=True)
 
 
-def _max_reply_link(message, topic_store: TopicStore, max_chat_id) -> dict | None:
+def _max_reply_link(message, topic_store: TopicStore, max_chat_id, outbound=None) -> dict | None:
     """Translate a Telegram reply into a MAX REPLY link when possible."""
     replied = getattr(message, "reply_to_message", None)
     if replied is None:
@@ -158,6 +159,8 @@ def _max_reply_link(message, topic_store: TopicStore, max_chat_id) -> dict | Non
     max_message_id = topic_store.max_for_tg_message(
         max_chat_id, replied.message_id,
     )
+    if not max_message_id and outbound is not None:
+        max_message_id=outbound.confirmed_album_reply(message.chat_id,replied.message_id,max_chat_id)
     if not max_message_id:
         return None
     return {"type": "REPLY", "messageId": str(max_message_id)}
@@ -194,7 +197,7 @@ async def _on_topic_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     topic_store: TopicStore = context.bot_data[TOPIC_STORE_KEY]
     elements = _entities_to_max_elements(message.text, message.entities)
-    link = _max_reply_link(message, topic_store, max_chat_id)
+    link = _max_reply_link(message, topic_store, max_chat_id,context.bot_data.get(TG_OUTBOUND_KEY))
     outbound=context.bot_data.get(TG_OUTBOUND_KEY)
     if outbound is not None:
         # Durable before MAX RPC. Identical redelivered Telegram updates
@@ -426,11 +429,20 @@ async def _on_topic_media(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             "text":caption,
             "elements":_entities_to_max_elements(caption,message.caption_entities),
             "link":_max_reply_link(message,context.bot_data[TOPIC_STORE_KEY],
-                                   max_chat_id),
+                                   max_chat_id,outbound),
             "media":{"kind":kind,"file_id":file_id,
                      "filename":filename,"mime":str(mime)[:120],"size":size},
         }
         try:
+            group=getattr(message,'media_group_id',None)
+            if isinstance(group,str) and group:
+                state=outbound.enqueue(context.bot_data[SUPERGROUP_KEY],message.message_id,max_chat_id,payload,album=(group,int(update.effective_user.id),int(message.message_thread_id)))
+                if state=='SENT':
+                    try:await message.set_reaction('👀')
+                    except Exception:pass
+                elif state!='RECEIVED':
+                    await message.reply_text('⚠️ Часть альбома: '+state+'. Автоматический повтор запрещён. /issues — диагностика.')
+                return
             state=outbound.enqueue(
                 context.bot_data[SUPERGROUP_KEY],message.message_id,
                 max_chat_id,payload)
@@ -508,7 +520,7 @@ async def _on_topic_media(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if data is None:
             await message.reply_text("⚠️ Не удалось скачать видео из Telegram.")
             return
-        attach = await max_client.upload_file(
+        attach = await max_client.upload_video(
             data, chat_id=max_chat_id,
             filename=message.video.file_name or "video.mp4",
             mimetype=message.video.mime_type or "video/mp4",
@@ -523,7 +535,7 @@ async def _on_topic_media(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     topic_store: TopicStore = context.bot_data[TOPIC_STORE_KEY]
     elements = _entities_to_max_elements(caption, message.caption_entities)
-    link = _max_reply_link(message, topic_store, max_chat_id)
+    link = _max_reply_link(message, topic_store, max_chat_id,context.bot_data.get(TG_OUTBOUND_KEY))
     send_kwargs = {
         "text": caption,
         "elements": elements,
@@ -707,7 +719,7 @@ async def _cmd_bind(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     max_chat_id = _parse_max_chat_id(args[0])
     if max_chat_id is None:
         await message.reply_text(
-            "Не понял chat_id. Пример: <code>/bind -75107924425434</code>",
+            "Не понял chat_id. Пример: <code>/bind -12345678901234</code>",
             parse_mode="HTML",
         )
         return
@@ -1882,10 +1894,18 @@ async def _cmd_issues(update: Update,context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text("Диагностика пока недоступна.")
         return
     tg_outbound=context.bot_data.get(TG_OUTBOUND_KEY)
-    issues=get_issues(sync.outbox,tg_outbound,
+    from app.operator_issues import PAGE_SIZE
+    args=context.args if isinstance(context.args,list) else []
+    try:
+        page=int(args[0]) if args and len(args)==1 else 1
+        if len(args)>1 or not 1<=page<=100000:raise ValueError()
+    except (TypeError,ValueError):
+        await update.message.reply_text("Используй /issues или /issues НОМЕР_СТРАНИЦЫ")
+        return
+    issues=get_issues(sync.outbox,tg_outbound,limit=PAGE_SIZE+1,offset=(page-1)*PAGE_SIZE,
                       tg_mutations=context.bot_data.get(TG_MUTATIONS_KEY))
     await update.message.reply_text(
-        format_issues(issues),parse_mode="HTML",do_quote=False)
+        format_issues(issues[:PAGE_SIZE],page=page,has_next=len(issues)>PAGE_SIZE),parse_mode="HTML",do_quote=False)
 
 
 async def _cmd_issue_ack(update: Update,context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2087,7 +2107,7 @@ async def _cmd_leave(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         max_chat_id = _parse_max_chat_id(args[0])
         if max_chat_id is None:
             await message.reply_text(
-                "Не понял chat_id. Пример: <code>/leave -75107924425434</code>",
+                "Не понял chat_id. Пример: <code>/leave -12345678901234</code>",
                 parse_mode="HTML",
             )
             return
@@ -2476,6 +2496,7 @@ def build_tg_app(token: str, max_client: MaxClient, supergroup_id: str,
                                    cmd_find(update,context,all_chats=True),
                                    filters=chat_filter))
     app.add_handler(CommandHandler("history", cmd_history, filters=chat_filter))
+    app.add_handler(CommandHandler("photos", cmd_photos, filters=chat_filter))
     app.add_handler(CommandHandler("chatsettings", cmd_chatsettings, filters=chat_filter))
     app.add_handler(CommandHandler("bind", _cmd_bind, filters=chat_filter))
     app.add_handler(CommandHandler("add", _cmd_add, filters=chat_filter))

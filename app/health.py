@@ -66,7 +66,7 @@ def status_text(report: dict | None) -> str:
         f"неопределённые {counts.get('UNKNOWN',0)}; ошибки {counts.get('FAILED',0)}",
         f"Telegram → MAX: ожидают {tg_out.get('RECEIVED',0)}; "
         f"неопределённые {tg_out.get('UNKNOWN',0)}; "
-        f"ошибки {tg_out.get('FAILED',0)}",
+        f"ошибки {tg_out.get('FAILED',0)}; заблокированы {tg_out.get('BLOCKED',0)}",
         f"Telegram: необработанный входящий буфер {report.get('tg_ingress_pending',0)}",
         f"TG→MAX правки/реакции: unknown {tg_mut.get('UNKNOWN',0)}, "
         f"failed {tg_mut.get('FAILED',0)}",
@@ -262,6 +262,7 @@ class HealthSupervisor:
         if tg_mutations.get("FAILED",0): issues.append("TG_MUTATION_FAILED")
         if tg_counts.get("UNKNOWN",0): issues.append("TG_OUTBOUND_UNKNOWN")
         if tg_counts.get("FAILED",0): issues.append("TG_OUTBOUND_FAILED")
+        if tg_counts.get("BLOCKED",0): issues.append("TG_OUTBOUND_BLOCKED")
         ingress = getattr(self.tg_app,"update_queue",None) if self.tg_app else None
         pending_ingress = ingress.pending_count() if isinstance(
             ingress, DurableIngressQueue) else 0
@@ -270,7 +271,7 @@ class HealthSupervisor:
         tg_ledger = getattr(self,"tg_outbound",None)
         if tg_ledger is not None and max_state == "ONLINE":
             overdue = tg_ledger.db.execute(
-                "SELECT max_chat,payload FROM outbound WHERE status='RECEIVED' AND created<=?",
+                "SELECT max_chat,payload FROM outbound WHERE (status='RECEIVED' OR album_pending=1) AND created<=?",
                 (time.time()-120,),
             ).fetchall()
             if any(self.topics.get_topic(r[0]) is not None

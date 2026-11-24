@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import json
 import time
 from datetime import datetime
 from html import escape
@@ -7,9 +8,12 @@ from html import escape
 from app.max_client import MaxClient, MaxMessage
 from app.resolver import ContactResolver
 from app.tg_sender import TelegramSender
-from app.outbox import OutboxStore, current_delivery
+from app.outbox import OutboxStore, current_delivery, DeliveryInterrupted
+from app.video_resolver import resolve_video, is_mp4
+from app.voice_media import voice_ogg
 from app.max_formatting import format_max_html
 from app.chat_preferences import get_chat_prefs
+from app.service_events import is_membership_event, is_membership_row, system_notice
 from app.max_media import (
     photo_url, file_url, video_url, video_preview_url, first_media_url,
     media_filename, media_size, duration_seconds,
@@ -80,30 +84,26 @@ async def _send_attach(
     if atype in ("CONTROL", "WIDGET", "INLINE_KEYBOARD"):
         return None
 
-    if atype == "UNSUPPORTED" and attach.get("audioId") is not None:
-        audio_id = attach.get("audioId")
-        token = attach.get("token")
-        duration = attach.get("duration", 0)
-        chat_id = msg.chat_id if msg else None
-        message_id = msg.message_id if msg else None
-        url = None
-        if chat_id is not None and message_id:
-            url = await client.download_audio_url(
-                audio_id, chat_id, message_id, token=token,
-            )
-        if url:
-            data = await _get_media(client, url, ("send_voice", "send_audio"))
-            if data:
-                return await sender.send_voice(
-                    data, caption=header_text, message_thread_id=thread_id,
-                    reply_to_message_id=reply_to_message_id,
-                )
-        dur_s = f" ({duration_seconds(attach)}с)" if duration else ""
-        return await sender.send(
-            f"{header_text}\n🎙 <i>[голосовое сообщение{dur_s} — не удалось скачать]</i>",
-            message_thread_id=thread_id,
-            reply_to_message_id=reply_to_message_id,
-        )
+    if atype == "AUDIO" or (atype == "UNSUPPORTED" and attach.get("audioId") is not None):
+        audio_id=attach.get("audioId")
+        scope=current_delivery()
+        data=scope.cached_media(("send_voice", "send_audio")) if scope else None
+        if data is None:
+            url=first_media_url(attach,"url","fileUrl")
+            if not url and audio_id is not None and msg is not None:
+                url=await client.download_audio_url(audio_id,msg.chat_id,msg.message_id,token=attach.get("token"))
+            if url:
+                source=await client.download_file(url,preserve_url=True)
+                data=await voice_ogg(source)
+        if data:
+            return await sender.send_voice(data,caption=header_text,message_thread_id=thread_id,reply_to_message_id=reply_to_message_id)
+        if audio_id is not None:
+            if scope is not None:
+                job=scope.store.job(scope.key)
+                if job is not None and job['attempts']>=2:
+                    raise DeliveryInterrupted('FAILED','MAX voice unavailable after bounded attempts')
+            return None
+        return await sender.send(f"{header_text}\n<i>[аудио — исходный файл недоступен]</i>",message_thread_id=thread_id,reply_to_message_id=reply_to_message_id)
 
     if atype == "PHOTO":
         url = _extract_photo_url(attach)
@@ -127,6 +127,31 @@ async def _send_attach(
         )
 
     if atype == "VIDEO":
+        if attach.get("videoId") is not None:
+            # Do not confuse a preview with the requested video. A previously
+            # persisted original upload is preferred over expiring MAX URLs.
+            scope = current_delivery()
+            data = scope.cached_media(("send_video",)) if scope else None
+            if not data:
+                original_url = video_url(attach)
+                if original_url:
+                    candidate = await client.download_file(original_url,preserve_url=True)
+                    if is_mp4(candidate):
+                        data = candidate
+                if not data and msg is not None:
+                    data = await resolve_video(client,attach,msg.chat_id,msg.message_id)
+            if is_mp4(data):
+                return await sender.send_video(
+                    data, caption=header_text, filename="video.mp4",
+                    message_thread_id=thread_id,
+                    reply_to_message_id=reply_to_message_id,
+                )
+            log.warning("MAX video original unavailable; no preview sent")
+            if scope is not None:
+                job = scope.store.job(scope.key)
+                if job is not None and job["attempts"] >= 2:
+                    raise DeliveryInterrupted("FAILED", "MAX video original unavailable after bounded attempts")
+            return None
         original_url = video_url(attach)
         if original_url:
             data = await _get_media(
@@ -162,61 +187,58 @@ async def _send_attach(
         name = media_filename(attach)
         size = media_size(attach)
         token_url = _extract_file_url(attach)
-        if token_url:
-            data = await _get_media(
-                client, token_url, ("send_photo", "send_video", "send_document"))
-            if data:
-                kind = _guess_media_kind(name)
-                # Telegram Bot API does not reliably accept GIF/WEBP/BMP
-                # through sendPhoto or MOV/MKV/AVI through sendVideo.
-                # Preserve original bytes and filename as a document instead.
-                ext = name.lower().rsplit(".",1)[-1] if "." in name else ""
-                if ext in ("mp3","m4a","wav","flac","aac","ogg","opus"):
-                    return await sender.send_audio(
-                        data,caption=header_text,filename=name,
-                        message_thread_id=thread_id,
-                        reply_to_message_id=reply_to_message_id,
-                    )
-                if kind == "photo" and ext in ("jpg","jpeg","png"):
-                    return await sender.send_photo(
-                        data, caption=header_text, filename=name,
-                        message_thread_id=thread_id,
-                        reply_to_message_id=reply_to_message_id,
-                    )
-                if kind == "video" and ext=="mp4":
-                    return await sender.send_video(
-                        data, caption=header_text, filename=name,
-                        message_thread_id=thread_id,
-                        reply_to_message_id=reply_to_message_id,
-                    )
-                return await sender.send_document(
+        file_id = attach.get("fileId")
+        scope = current_delivery()
+        data = scope.cached_media(("send_photo", "send_video", "send_document", "send_audio")) if scope else None
+        if data is None and file_id is not None and msg is not None:
+            token_url = await client.download_document_url(file_id,msg.chat_id,msg.message_id)
+            if token_url:
+                data=await client.download_file(token_url,preserve_url=True)
+                if data is not None and size and len(data)!=size:
+                    log.warning("MAX file size mismatch; not forwarding")
+                    data=None
+        elif data is None and token_url and file_id is None:
+            data = await _get_media(client, token_url, ("send_photo", "send_video", "send_document", "send_audio"))
+        if data:
+            kind = _guess_media_kind(name)
+            # Telegram Bot API does not reliably accept GIF/WEBP/BMP
+            # through sendPhoto or MOV/MKV/AVI through sendVideo.
+            # Preserve original bytes and filename as a document instead.
+            ext = name.lower().rsplit(".",1)[-1] if "." in name else ""
+            if ext in ("mp3","m4a","wav","flac","aac","ogg","opus"):
+                return await sender.send_audio(
+                    data,caption=header_text,filename=name,
+                    message_thread_id=thread_id,
+                    reply_to_message_id=reply_to_message_id,
+                )
+            if kind == "photo" and ext in ("jpg","jpeg","png"):
+                return await sender.send_photo(
                     data, caption=header_text, filename=name,
                     message_thread_id=thread_id,
                     reply_to_message_id=reply_to_message_id,
                 )
+            if kind == "video" and ext=="mp4":
+                return await sender.send_video(
+                    data, caption=header_text, filename=name,
+                    message_thread_id=thread_id,
+                    reply_to_message_id=reply_to_message_id,
+                )
+            return await sender.send_document(
+                data, caption=header_text, filename=name,
+                message_thread_id=thread_id,
+                reply_to_message_id=reply_to_message_id,
+            )
+        if file_id is not None:
+            if scope is not None:
+                job=scope.store.job(scope.key)
+                if job is not None and job['attempts']>=2:
+                    raise DeliveryInterrupted('FAILED','MAX document unavailable or flagged unsafe after bounded attempts')
+            return None
         size_str = f" ({_human_size(size)})" if size else ""
         return await sender.send(
             f"{header_text}\n📎 <b>{escape(name)}</b>{size_str}"
             "\n<i>[исходный файл недоступен для скачивания]</i>",
             message_thread_id=thread_id,
-            reply_to_message_id=reply_to_message_id,
-        )
-
-    if atype == "AUDIO":
-        url = first_media_url(attach,"url","fileUrl")
-        if not url and attach.get("audioId") is not None and msg is not None:
-            url = await client.download_audio_url(
-                attach["audioId"], msg.chat_id, msg.message_id,
-                token=attach.get("token"))
-        if url:
-            data = await _get_media(client, url, ("send_voice", "send_audio"))
-            if data:
-                return await sender.send_voice(
-                    data, caption=header_text, message_thread_id=thread_id,
-                    reply_to_message_id=reply_to_message_id,
-                )
-        return await sender.send(
-            f"{header_text}\n<i>[аудио]</i>", message_thread_id=thread_id,
             reply_to_message_id=reply_to_message_id,
         )
 
@@ -332,6 +354,10 @@ def _message_body(msg: MaxMessage) -> str:
                 and isinstance(msg.raw.get("message"), dict) else None)
     parts = [format_max_html(raw, elements)] if raw else []
     for att in msg.attaches:
+        notice=system_notice(att)
+        if notice and notice not in raw:
+            rendered=escape(notice)
+            if rendered not in parts:parts.append(rendered)
         if not isinstance(att, dict) or att.get("_type") != "SHARE":
             continue
         title = str(att.get("title") or "").strip()
@@ -391,6 +417,41 @@ async def _send_message_content(
             cap = (f"{header_text}\n{body}"
                    if not text_sent and body != "<i>[нетекстовое сообщение]</i>"
                    else header_text)
+
+            # Keep native photo/video runs together. Pure photo albums retain
+            # their old byte format and fingerprint for restart compatibility.
+            mixed=[]
+            for other in meaningful_attaches[index:index+10]:
+                if other.get('_type') not in ('PHOTO','VIDEO'):break
+                mixed.append(other)
+            if len(mixed)>=2 and any(a['_type']=='VIDEO' for a in mixed):
+                scope=current_delivery()
+                cached=scope.cached_media(('send_media_group',)) if scope else None
+                if cached is not None:
+                    items=sender._unpack_mixed_album(cached)
+                    if [k for k,_ in items]!=[a['_type'] for a in mixed]:raise DeliveryInterrupted('UNKNOWN','Mixed album source shape changed')
+                else:
+                    items=[];total=0
+                    for item in mixed:
+                        kind=item['_type'];data=None
+                        if kind=='PHOTO':
+                            url=photo_url(item);data=await client.download_file(url) if url else None
+                        else:
+                            url=video_url(item)
+                            if url:
+                                candidate=await client.download_file(url,preserve_url=True)
+                                if is_mp4(candidate):data=candidate
+                            if not data and item.get('videoId') is not None:data=await resolve_video(client,item,msg.chat_id,msg.message_id)
+                            if not is_mp4(data):data=None
+                        if not data:return None
+                        total+=len(data)
+                        if total>45*1024*1024:raise DeliveryInterrupted('FAILED','Mixed album exceeds safe size')
+                        items.append((kind,data))
+                result=await sender.send_mixed_album(items,caption=cap,message_thread_id=thread_id,reply_to_message_id=reply_to_message_id if first_sent is None else None)
+                if result is None:return None
+                if first_sent is None:first_sent=result
+                if cap!=header_text:text_sent=True
+                index+=len(mixed);continue
 
             # Consecutive PHOTO items from one MAX message become a Telegram
             # album, with each batch limited to Telegram's 2..10 rules.
@@ -500,6 +561,8 @@ async def _deliver_history_message(
         raw_sender = await resolver.resolve_user(msg.sender_id)
     is_dm = resolver.is_dm(chat_id)
     raw_chat = resolver.chat_name(chat_id)
+    if raw_chat == str(chat_id):
+        raw_chat = sender.topic_store.get_title(chat_id) or raw_chat
     header_text = _header(msg, escape(raw_sender), escape(raw_chat), is_dm)
     label = _history_time_label(msg.timestamp)
     if label:
@@ -601,9 +664,16 @@ async def import_recent_history(
         msg = client._parse_message({"chatId": chat_id, "message": body})
         if msg is None or not msg.message_id:
             continue
+        if is_membership_event(msg.attaches,msg.text,msg.link):
+            continue
         if sender.topic_store.tg_for_max_message(chat_id, msg.message_id) is not None:
             continue
 
+        # Preserve delivery origin in the existing raw envelope (backward
+        # compatible with older MaxMessage serializers). The first enqueue
+        # owns the rendering mode; never switch a live retry to history.
+        msg.raw = dict(msg.raw)
+        msg.raw["_max2tg_history_delivery"] = True
         async def deliver():
             return await _deliver_history_message(
                 msg, client, sender, resolver, chat_id, thread_id,
@@ -611,6 +681,13 @@ async def import_recent_history(
 
         outbox = getattr(sender, "outbox", None)
         if isinstance(outbox, OutboxStore):
+            existing = outbox.job(outbox.job_key(chat_id,msg.message_id))
+            if existing is not None and existing["status"] in ("RECEIVED","RETRY"):
+                original = MaxMessage(**json.loads(existing["event"]))
+                if not original.raw.get("_max2tg_history_delivery"):
+                    log.info("Manual history waiting for existing live delivery chat=%s",chat_id)
+                    break
+                msg = original
             completed = await outbox.process(msg, deliver)
         else:
             completed = await deliver()
@@ -908,7 +985,7 @@ async def catch_up_chat_history(
             if cursor is None and mapped:
                 found_anchor = True
                 break
-            if not mapped:
+            if not mapped and not is_membership_row(entry):
                 unseen[mid] = entry
         if found_anchor:
             break
@@ -1107,7 +1184,30 @@ def create_max_client(
                 # mark its MAX ID as forwarded. Catch-up can restore it later.
                 log.info("Live MAX forwarding paused for chat=%s",msg.chat_id)
                 return
+            outbox = getattr(sender, "outbox", None)
+            if is_membership_event(msg.attaches,msg.text,msg.link):
+                existing = (outbox.job(outbox.job_key(msg.chat_id,msg.message_id))
+                            if isinstance(outbox, OutboxStore) and msg.message_id else None)
+                if existing is None:
+                    # Preserve self-join topic discovery without forwarding noise.
+                    if sender.topic_store.get_topic(msg.chat_id) is None and msg.is_self:
+                        await _refresh_chat_metadata(client,resolver,msg.chat_id)
+                        await _bootstrap_chat_topic(client,sender,resolver,msg.chat_id)
+                    return
+            if isinstance(outbox, OutboxStore) and msg.message_id:
+                existing = outbox.job(outbox.job_key(msg.chat_id,msg.message_id))
+                if existing is not None and existing["status"] in ("RECEIVED","RETRY"):
+                    original = MaxMessage(**json.loads(existing["event"]))
+                    if original.raw.get("_max2tg_history_delivery"):
+                        msg = original
             async def deliver():
+                if msg.raw.get("_max2tg_history_delivery"):
+                    thread_id = sender.topic_store.get_topic(msg.chat_id)
+                    if thread_id is None:
+                        return False
+                    return await _deliver_history_message(
+                        msg, client, sender, resolver, msg.chat_id, thread_id,
+                    )
                 await _handle_message_serial(msg)
                 mapped_id = (sender.topic_store.tg_for_max_message(
                     msg.chat_id, msg.message_id,
@@ -1168,6 +1268,8 @@ def create_max_client(
             raw_sender = await resolver.resolve_user(msg.sender_id)
         is_dm = resolver.is_dm(msg.chat_id)
         raw_chat = resolver.chat_name(msg.chat_id)
+        if raw_chat == str(msg.chat_id):
+            raw_chat = sender.topic_store.get_title(msg.chat_id) or raw_chat
         topic_title = _topic_title_for_live_message(resolver, msg, raw_sender)
 
         existing_thread = sender.topic_store.get_topic(msg.chat_id)

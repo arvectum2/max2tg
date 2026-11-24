@@ -415,3 +415,15 @@ async def test_rpc_disconnect_result_is_not_task_cancellation():
     c._ws = SimpleNamespace(closed=False,send_str=send)
     assert await c.cmd(OpCode.SEND_MESSAGE,{},none_on_timeout=True) is None
     assert c._pending == {}
+
+
+def test_handshake_media_client_identity_is_complete():
+    import inspect
+    from app.max_client import MaxClient, _USER_AGENT, _BROWSER_HEADERS
+    source = inspect.getsource(MaxClient.run)
+    assert '"headerUserAgent": _USER_AGENT' in source
+    assert '"osVersion": "Windows"' in source
+    assert '"deviceName": "Google Chrome 131.0.0.0"' in source
+    assert _BROWSER_HEADERS['User-Agent'] == _USER_AGENT
+    assert 'Windows NT' in _USER_AGENT
+    assert 'Chrome/131.0.0.0' in _USER_AGENT

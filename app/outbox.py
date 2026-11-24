@@ -80,14 +80,16 @@ class DeliveryContext:
         self.store._update_part(self.key, index, "SENDING")
         try:
             result = await send()
-            if isinstance(result,(list,tuple)):
-                # sendMediaGroup is one Telegram API call but returns one
-                # message per photo. Persist all IDs for later deletion.
-                ids = [int(item.message_id) for item in result
-                       if getattr(item,"message_id",None) is not None]
-                if not ids or len(ids) != len(result):
+            if method == "send_media_group":
+                # Require exactly one distinct positive Telegram ID per
+                # submitted item, not merely per returned response item.
+                expected = meta.get("count")
+                ids = [getattr(item,"message_id",None) for item in result] if isinstance(result,(list,tuple)) else []
+                if (type(expected) is not int or not 2<=expected<=10
+                    or len(ids)!=expected or any(type(i) is not int or i<=0 for i in ids)
+                    or len(set(ids))!=expected):
                     self.store._update_part(self.key,index,"UNKNOWN")
-                    raise DeliveryInterrupted("UNKNOWN","incomplete album acknowledgement")
+                    raise DeliveryInterrupted("UNKNOWN","incomplete or invalid album acknowledgement")
                 self.store._update_part(self.key,index,"SENT",ids[0],ids)
                 return SimpleNamespace(message_id=ids[0], media_group_ids=ids)
             if result is None or getattr(result, "message_id", None) is None:
@@ -102,6 +104,10 @@ class DeliveryContext:
             self.store._schedule_retry(self.key, max(1, seconds),
                                        "Telegram rate limit")
             raise DeliveryInterrupted("RETRY", "rate limit; safe to retry") from exc
+        except (BadRequest, Forbidden) as exc:
+            self.store._update_part(self.key, index, "FAILED")
+            self.store._set_job(self.key, "FAILED", type(exc).__name__)
+            raise DeliveryInterrupted("FAILED", "Telegram rejected request") from exc
         except NetworkError as exc:
             # A 502/503/504 from the HTTP CONNECT proxy means no Telegram
             # request was dispatched. Such a failure is definitely retryable.
@@ -122,10 +128,6 @@ class DeliveryContext:
             self.store._update_part(self.key, index, "UNKNOWN")
             self.store._set_job(self.key, "UNKNOWN", type(exc).__name__)
             raise DeliveryInterrupted("UNKNOWN", "Telegram delivery outcome uncertain") from exc
-        except (BadRequest, Forbidden) as exc:
-            self.store._update_part(self.key, index, "FAILED")
-            self.store._set_job(self.key, "FAILED", type(exc).__name__)
-            raise DeliveryInterrupted("FAILED", "Telegram rejected request") from exc
         except DeliveryInterrupted:
             raise
         except BaseException as exc:

@@ -216,14 +216,22 @@ def set_history_position(store,chat_id,marker: int | None):
     store.set_ui(HISTORY_UI_KEY,positions)
 
 
-async def import_next_page(client,sender,resolver,chat_id,thread_id) -> tuple[int,int,bool]:
-    """Explicitly import one page, persisting progress *after* all acks.
+async def import_next_page(client,sender,resolver,chat_id,thread_id,*,report=None) -> tuple[int,int,bool]:
+    """Import a page; skip only pre-existing terminal ledger gaps.
 
-    On any skipped/ambiguous delivery, leave the timestamp cursor intact so
-    the operator can safely retry without duplicating confirmed TG parts.
+    The manual browse cursor is separate from the recovery cursor. A known
+    UNKNOWN/FAILED job remains quarantined in the durable ledger, but must
+    not permanently block unrelated older messages. New failures still
+    stop the page and preserve the browse cursor.
     """
     from app.max_listener import import_recent_history
+    from app.outbox import OutboxStore
+    from app.service_events import is_membership_row
     store=sender.topic_store
+    db=getattr(sender,"outbox",None)
+    if report is not None:
+        report["terminal_gaps"]=0
+        report["service_skipped"]=0
     lock=getattr(client,"_history_locks",{}).setdefault(str(chat_id),asyncio.Lock())
     async with lock:
         previous=history_position(store,chat_id)
@@ -234,8 +242,21 @@ async def import_next_page(client,sender,resolver,chat_id,thread_id) -> tuple[in
             set_history_position(store,chat_id,0)
             return 0,0,True
         unique={str(r["id"]):r for r in rows}
-        to_send=[r for r in unique.values() if
-                 store.tg_for_max_message(chat_id,r["id"]) is None]
+        to_send=[]
+        terminal_gaps=0
+        for r in unique.values():
+            existing=db.job(db.job_key(chat_id,r["id"])) if isinstance(db,OutboxStore) else None
+            if existing is not None and existing["status"] in ("UNKNOWN","FAILED"):
+                terminal_gaps+=1
+                continue
+            if is_membership_row(r):
+                if report is not None:
+                    report["service_skipped"]+=1
+                continue
+            if store.tg_for_max_message(chat_id,r["id"]) is None:
+                to_send.append(r)
+        if report is not None:
+            report["terminal_gaps"]=terminal_gaps
         if to_send:
             count=await import_recent_history(
                 client,sender,resolver,chat_id,thread_id,len(to_send),

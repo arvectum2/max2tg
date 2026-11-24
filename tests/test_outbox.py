@@ -303,3 +303,19 @@ async def test_known_pre_dispatch_transport_failure_is_retryable(tmp_path,cause)
     key=db.job_key(42,"pre-dispatch")
     assert db.job(key)["status"]=="RETRY"
     db.close()
+
+
+async def test_definite_bad_request_not_misclassified_as_network_unknown(tmp_path):
+    from telegram.error import BadRequest
+    client,sender,state,db=fixture(tmp_path)
+    sender._bot.send_message=AsyncMock(side_effect=BadRequest("invalid request"))
+    msg=event("bad-request")
+    await client._on_message_cb(msg)
+    key=db.job_key(42,"bad-request")
+    assert db.job(key)["status"]=="FAILED"
+    assert db._part(key,0)["state"]=="FAILED"
+    assert state.tg_for_max_message(42,"bad-request") is None
+    assert not db.recoverable()
+    await client._on_message_cb(msg)
+    sender._bot.send_message.assert_awaited_once()
+    db.close()

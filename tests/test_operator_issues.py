@@ -79,10 +79,43 @@ async def test_only_admin_can_review_blocked(tmp_path):
         "SELECT state FROM message_mutations"
     ).fetchone()["state"]=="BLOCKED"
     update.effective_user.id=222
+    context.args=[]
     await _cmd_issues(update,context)
     assert key[:12] in message.reply_text.await_args.args[0]
+    context.args=[key[:12]]
     await _cmd_issue_ack(update,context)
     assert outbox.db.execute(
         "SELECT state FROM message_mutations"
     ).fetchone()["state"]=="REVIEWED"
     outbox.close()
+
+
+def test_delivery_codes_are_unique_and_all_categories_paginate(tmp_path):
+    from app.max_client import MaxMessage
+    from app.tg_outbox import TelegramOutbound
+    topics,outbox,sync,key=fixture(tmp_path)
+    reverse=TelegramOutbound(tmp_path/'tg-outbound.sqlite3',topics)
+    reverse.enqueue(-100,815,42,{'text':'private','elements':[],'link':None});reverse._mark(-100,815,'FAILED')
+    for i in range(20):
+        k=outbox.enqueue(MaxMessage(chat_id=42,message_id=str(123400+i),text='private'))
+        outbox._set_job(k,'UNKNOWN','Telegram delivery outcome uncertain')
+        if i==0:
+            outbox._insert_part(k,0,'send_media_group','digest',{},None);outbox._update_part(k,0,'SENT',123,[123,124,125])
+    rows=[]
+    for off in range(0,24,8):rows+=get_issues(outbox,reverse,limit=8,offset=off)
+    assert len(rows)==22 and len({r['ref'] for r in rows})==22
+    assert any(r['category']=='Telegram→MAX' for r in rows)
+    assert any('подтверждённых частей: 3' in r['cause'] for r in rows)
+    body=format_issues(rows[:8],has_next=True)
+    assert '/issues 2' in body and 'private' not in body and '123400' not in body
+    outbox.close();reverse.close()
+
+
+@pytest.mark.asyncio
+async def test_issue_command_second_page_and_bad_page(tmp_path):
+    from app.max_client import MaxMessage
+    topics,outbox,sync,key=fixture(tmp_path)
+    for i in range(9):outbox._set_job(outbox.enqueue(MaxMessage(chat_id=42,message_id=str(i),text='x')),'UNKNOWN')
+    u=MagicMock();u.effective_user.id=222;u.message.reply_text=AsyncMock();c=MagicMock();c.bot_data={ADMIN_USER_KEY:222,MAX_CLIENT_KEY:MagicMock(message_sync=sync)};c.args=['2']
+    await _cmd_issues(u,c);assert 'Страница 2' in u.message.reply_text.await_args.args[0] and key[:12] in u.message.reply_text.await_args.args[0]
+    c.args=['-1'];await _cmd_issues(u,c);assert 'НОМЕР_СТРАНИЦЫ' in u.message.reply_text.await_args.args[0];outbox.close()

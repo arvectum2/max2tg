@@ -124,7 +124,7 @@ async def test_audio_id_is_resolved_with_real_chat_and_token(tmp_path):
     msg=message("voiceid",[{"_type":"AUDIO","audioId":123,
         "token":"signed","duration":45000}])
     client.download_audio_url=AsyncMock(return_value="https://au.oneme.ru/file.ogg")
-    client.download_file=AsyncMock(return_value=b"OggS" + b"x"*20)
+    client.download_file=AsyncMock(return_value=b"OggS" + b"OpusHead" + b"x"*20)
     sender._bot.send_voice=AsyncMock(return_value=SimpleNamespace(message_id=17))
     await client._on_message_cb(msg)
     client.download_audio_url.assert_awaited_once_with(
@@ -375,4 +375,63 @@ async def test_location_with_zero_coordinates_is_not_dropped(tmp_path):
         {"_type":"LOCATION","lat":0,"lon":0}
     ]))
     assert "0, 0" in sender._bot.send_message.await_args.kwargs["text"]
+    db.close()
+
+async def test_tokenized_file_resolved_and_acknowledged(tmp_path):
+    client,sender,state,db=fixture(tmp_path)
+    client.cmd=AsyncMock(return_value={'url':'https://file-ms.oneme.ru/document','unsafe':False})
+    client.download_file=AsyncMock(return_value=b'sample')
+    sender._bot.send_document=AsyncMock(return_value=SimpleNamespace(message_id=901))
+    m=message('123',[{'_type':'FILE','fileId':44,'name':'original.txt','size':6}])
+    await client._on_message_cb(m)
+    client.cmd.assert_awaited_once_with(88,{'fileId':44,'chatId':42,'messageId':123,'itemType':'REGULAR'},none_on_timeout=True)
+    assert db.job(db.job_key(42,'123'))['status']=='SENT'
+    sender._bot.send_document.assert_awaited_once()
+    assert sender._bot.send_document.await_args.kwargs['document'].filename=='original.txt'
+    sender._bot.send_message.assert_not_called()
+    db.close()
+
+async def test_unsafe_tokenized_file_not_forwarded(tmp_path):
+    client,sender,state,db=fixture(tmp_path)
+    client.cmd=AsyncMock(return_value={'url':'https://file-ms.oneme.ru/document','unsafe':True})
+    client.download_file=AsyncMock()
+    m=message('124',[{'_type':'FILE','fileId':44,'name':'unsafe.txt','size':6,'url':'https://file-ms.oneme.ru/other'}])
+    await client._on_message_cb(m)
+    assert db.job(db.job_key(42,'124'))['status']=='RETRY'
+    client.download_file.assert_not_called();sender._bot.send_document.assert_not_called();sender._bot.send_message.assert_not_called()
+    db.close()
+
+async def test_audio_play_verified_rpc(tmp_path):
+    client,sender,state,db=fixture(tmp_path)
+    client.cmd=AsyncMock(return_value={'opus':'https://au.oneme.ru/audio.ogg'})
+    assert await client.download_audio_url('123','42','789',token='fixture')=='https://au.oneme.ru/audio.ogg'
+    client.cmd.assert_awaited_once_with(301,{'audioId':123,'chatId':42,'messageId':789,'token':'fixture'},none_on_timeout=True)
+    db.close()
+
+
+@pytest.mark.parametrize("ids",[[101],[101,101],[101,102,103],[101,None],[101,0],[101,True],[]])
+async def test_album_inexact_ack_never_marks_sent_or_repeats(tmp_path,ids):
+    client,sender,state,db=fixture(tmp_path)
+    msg=message("album-invalid-ack",[{"_type":"PHOTO","url":f"https://i.oneme.ru/{i}"} for i in range(2)])
+    client.download_file=AsyncMock(return_value=b"photo")
+    sender._bot.send_media_group=AsyncMock(return_value=[SimpleNamespace(message_id=i) for i in ids])
+    await client._on_message_cb(msg)
+    key=db.job_key(42,"album-invalid-ack")
+    assert db.job(key)["status"]=="UNKNOWN"
+    assert db._part(key,0)["state"]=="UNKNOWN"
+    assert state.tg_for_max_message(42,"album-invalid-ack") is None
+    assert not db.recoverable()
+    await client._on_message_cb(msg)
+    sender._bot.send_media_group.assert_awaited_once()
+    db.close()
+
+
+async def test_album_scalar_ack_is_not_full_delivery(tmp_path):
+    client,sender,state,db=fixture(tmp_path)
+    msg=message("album-scalar",[{"_type":"PHOTO","url":f"https://i.oneme.ru/{i}"} for i in range(2)])
+    client.download_file=AsyncMock(return_value=b"photo")
+    sender._bot.send_media_group=AsyncMock(return_value=SimpleNamespace(message_id=101))
+    await client._on_message_cb(msg)
+    assert db.counts()=={"UNKNOWN":1}
+    assert state.tg_for_max_message(42,"album-scalar") is None
     db.close()
