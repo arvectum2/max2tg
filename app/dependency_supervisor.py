@@ -30,12 +30,18 @@ class DependencySupervisor:
         return dict(r)
     def _fingerprint(self,role,c):
         w=self.workers;conf=c['Config'];host=c['HostConfig'];labels=conf['Labels'];cmd=conf['Cmd'];expected='m2tg-proxy-'+role+'-'+w.owner
-        if c['Name']!='/'+expected or labels.get('max2tg.offline')!=w.owner or labels.get('max2tg.dependency')!=role or c['Image']!=w.image or conf['Entrypoint']!=['python'] or cmd[:3]!=['-m','tests.supervised_proxy_fixture',role] or len(cmd)!=(3 if role=='broker' else 4):raise PermissionError('Unexpected dependency identity')
+        if c['Name']!='/'+expected or labels.get('max2tg.offline')!=w.owner or labels.get('max2tg.dependency')!=role or c['Image']!=w.image or conf['Entrypoint']!=['python'] or cmd[:2]!=['-m','tests.supervised_proxy_fixture'] or cmd[2] not in ((role,'gateway-encrypted') if role=='gateway' else (role,)) or len(cmd)!=(3 if role=='broker' else 4):raise PermissionError('Unexpected dependency identity')
         if host['NetworkMode']!='none' or not host['ReadonlyRootfs'] or host['Privileged'] or host['CapAdd'] or 'ALL' not in (host['CapDrop'] or []) or conf['User']!='65532:65532' or host['Memory']!=268435456 or host['PidsLimit']!=64 or host['RestartPolicy']['Name'] not in ('','no') or not any(x in ('no-new-privileges','no-new-privileges:true') for x in host['SecurityOpt'] or []):raise PermissionError('Unexpected dependency sandbox')
         mounts=c['Mounts'];expected_vols={'/net0','/net1','/nettg'} if role=='broker' else {'/registry','/channel0','/channel1','/network'}
+        if role=='gateway' and cmd[2]=='gateway-encrypted':expected_vols|={'/secret','/keys'}
         volumes=[m for m in mounts if m['Type']=='volume'];binds=[m for m in mounts if m['Type']=='bind'];expected_binds={'/src/app':str(w.code/'app'),'/src/tests':str(w.code/'tests')}
         if role=='broker':expected_binds['/cert']=str(self.root/'cert')
         if len(mounts)!=len(volumes)+len(binds) or len(volumes)!=len(expected_vols) or {m['Destination'] for m in volumes}!=expected_vols or len(binds)!=len(expected_binds) or {m['Destination'] for m in binds}!=set(expected_binds) or any(m['Source'] not in (expected_binds[m['Destination']],'/host_mnt'+expected_binds[m['Destination']]) for m in binds) or any(m['RW'] for m in binds):raise PermissionError('Unexpected dependency mounts')
+        if len({m['Name'] for m in volumes})!=len(volumes) or any(m['RW'] for m in volumes if m['Destination'] in ('/secret','/keys')):raise PermissionError('Unsafe dependency secret mounts')
+        if role=='gateway' and cmd[2]=='gateway-encrypted':
+            prefix='m2tg-orch-'+w.owner+'-';expected={'/registry':'registry','/channel0':'channel0','/channel1':'channel1','/network':'nettg','/keys':'botkeys','/secret':'botsecret'}
+            if {m['Destination']:m['Name'] for m in volumes}!={k:prefix+v for k,v in expected.items()}:raise PermissionError('Encrypted gateway role volume mismatch')
+        if role=='broker' and any(m['Name'].endswith(('keys0','keys1','botkeys','botsecret','secret0','secret1')) for m in volumes):raise PermissionError('Broker must not mount secret storage')
         for m in volumes:
             v=self.backend.volume(m['Name'])
             if v.get('Labels',{}).get('max2tg.offline')!=w.owner or v.get('Driver')!='local' or v.get('Options'):raise PermissionError('Foreign dependency volume')

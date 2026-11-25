@@ -20,7 +20,7 @@ def chat(gid):return {'id':gid,'type':'supergroup','title':'Synthetic','is_forum
 def message(gid,mid,text,actor=900):return {'message_id':mid,'date':1700000000,'chat':chat(gid),'from':user(actor),'message_thread_id':77,'text':text,'is_topic_message':True}
 
 async def broker():
-    assert_sandbox();ctx=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER);ctx.load_cert_chain('/cert/cert.pem','/cert/key.pem');control=Path('/nettg')
+    assert_sandbox();assert not any(Path(p).exists() for p in ('/keys','/secret','/registry','/keys0','/keys1','/botkeys','/botsecret'));ctx=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER);ctx.load_cert_chain('/cert/cert.pem','/cert/key.pem');control=Path('/nettg')
     evidence=control/'counts.json';counts=json.loads(evidence.read_text()) if evidence.exists() else {'max':[],'tg':[],'auth':[0,0]};servers=[]
     (control/'cut-a').unlink(missing_ok=True);(control/'cut-confirmed').unlink(missing_ok=True)
     def report():atomic(control/'counts.json',counts)
@@ -84,10 +84,20 @@ async def broker():
         for s in servers:await s.close()
         for r in runners:await r.cleanup()
 
-async def gateway(sessions):
+async def gateway(sessions,encrypted=False):
     assert_sandbox();ctx=ssl.create_default_context(cafile='/registry/test-ca.pem');r=CapsuleRegistry('/registry')
     try:
-        async with isolated_telegram_bot('/network/proxy.sock','123456:synthetic',context=ctx,budget=TelegramBudget(r.db)) as bot:
+        if encrypted:
+            from app.encrypted_credentials import load_encrypted_bot
+            assert sorted(p.name for p in Path('/keys').iterdir())==['bot.key'];assert sorted(p.name for p in Path('/secret').iterdir())==['telegram.enc']
+            token=load_encrypted_bot('/secret',123456,'/keys/bot.key')
+            for p in ('/keys/probe','/secret/probe'):
+                try:Path(p).touch()
+                except OSError:pass
+                else:raise AssertionError('Secret/key mount writable')
+            assert not any(Path(p).exists() for p in ('/keys0','/keys1','/secret0','/secret1'))
+        else:token='123456:synthetic'
+        async with isolated_telegram_bot('/network/proxy.sock',token,context=ctx,budget=TelegramBudget(r.db)) as bot:
             g=SharedGatewayRuntime(r,bot,channels={sid:Path(f'/channel{i}') for i,(sid,_,_) in enumerate(sessions)},external_only=True,managed=True)
             try:
                 for name in ('lifecycle.json','progress.json','paused','pause'):(Path('/registry')/name).unlink(missing_ok=True)
@@ -106,10 +116,19 @@ async def gateway(sessions):
             finally:await g.close()
     finally:r.close()
 
-async def worker(sid):
+async def worker(sid,encrypted=False):
     assert_sandbox();assert not Path('/registry').exists();cfg=json.loads(Path('/state/worker-acl.json').read_text());assert cfg['sid']==sid
     stop=asyncio.Event();asyncio.get_running_loop().add_signal_handler(signal.SIGTERM,stop.set);ctx=ssl.create_default_context(cafile='/state/test-ca.pem')
-    async with isolated_max_client('/network/proxy.sock','/secret',sid,context=ctx) as client:
+    kp=None
+    if encrypted:
+        assert sorted(p.name for p in Path('/keys').iterdir())==['worker.key'];assert sorted(p.name for p in Path('/secret').iterdir())==['max.enc'];kp='/keys/worker.key'
+        assert not any(Path(p).exists() for p in ('/keys0','/keys1','/secret0','/secret1','/botkeys','/botsecret'))
+        for p in ('/keys/probe','/secret/probe'):
+            try:Path(p).touch()
+            except OSError:pass
+            else:raise AssertionError('Secret/key mount writable')
+    elif Path('/keys').exists():raise AssertionError('Unexpected key mount')
+    async with isolated_max_client('/network/proxy.sock','/secret',sid,context=ctx,key_path=kp) as client:
         client.RECONNECT_SEC=0.5 # disposable fixture only
         w=IsolatedWorkerRuntime(sid,'/state','/channel','/state/key',cfg['forum'],cfg['actor'],client);heartbeat=Path('/state/heartbeat');heartbeat.unlink(missing_ok=True)
         task=asyncio.create_task(w.run(stop))
@@ -126,10 +145,18 @@ async def worker(sid):
 if __name__=='__main__':
     mode=sys.argv[1]
     if mode=='init':
-        prepare()
+        encrypted=Path('/botkeys').exists();prepare(encrypted=encrypted)
+        if encrypted:
+            from app.encrypted_storage import create_key
+            from app.encrypted_credentials import install_encrypted_bot
+            for p in ('/botkeys','/botsecret'):Path(p).chmod(0o700)
+            create_key('/botkeys/bot.key','telegram:123456');install_encrypted_bot('/botsecret',123456,'123456:synthetic','/botkeys/bot.key')
+            for p in ('/botkeys','/botsecret'):
+                os.chown(p,65532,65532)
+                for f in Path(p).iterdir():os.chown(f,65532,65532)
         for p in ('/net0','/net1','/nettg'):os.chmod(p,0o700);os.chown(p,65532,65532)
         for p in ('/state0','/state1','/registry'):
             target=Path(p)/'test-ca.pem';target.write_bytes(Path('/cert/cert.pem').read_bytes());target.chmod(0o600);os.chown(target,65532,65532)
     elif mode=='broker':asyncio.run(broker())
-    elif mode=='gateway':asyncio.run(gateway(json.loads(sys.argv[2])))
-    else:asyncio.run(worker(mode))
+    elif mode in ('gateway','gateway-encrypted'):asyncio.run(gateway(json.loads(sys.argv[2]),encrypted=mode=='gateway-encrypted'))
+    else:asyncio.run(worker(mode,encrypted=sys.argv[2:]==['encrypted']))

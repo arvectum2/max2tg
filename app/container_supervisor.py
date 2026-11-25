@@ -47,12 +47,16 @@ class OfflineContainerSupervisor:
             self.lock.close();raise
     def name(self,sid):return 'm2tg-offline-'+self.owner+'-'+sid
     def row(self,sid):return dict(self.db.execute('SELECT * FROM workers WHERE sid=?',(sid,)).fetchone())
-    def register(self,sid,state,channel,secret,*,fixture="heartbeat",network_channel=None):
+    def register(self,sid,state,channel,secret,*,fixture="heartbeat",network_channel=None,key_channel=None):
         if fixture not in FIXTURES:raise ValueError("Only reviewed synthetic fixtures")
         if not isinstance(sid,str) or not HEX.fullmatch(sid):raise ValueError('Invalid session')
         if (fixture=="proxy-bridge")!=(network_channel is not None):raise ValueError("Separate network channel required only for proxy fixture")
-        names=[state,channel,secret]+([network_channel] if network_channel is not None else [])
+        if key_channel is not None and fixture!="proxy-bridge":raise ValueError("Keys require proxy fixture")
+        names=[state,channel,secret]+([network_channel] if network_channel is not None else [])+([key_channel] if key_channel is not None else [])
         if len(set(names))!=len(names) or any(not re.fullmatch(r'm2tg-orch-[a-z0-9-]{1,100}',n) for n in names):raise ValueError('Only separate test volumes')
+        if key_channel is not None:
+            prefix='m2tg-orch-'+self.owner+'-'
+            if not any(names==[prefix+f'{part}{i}' for part in ('state','channel','secret','net','keys')] for i in (0,1)):raise ValueError('Encrypted fixture requires its own exact role volumes')
         for n in names:
             v=self.backend.volume(n)
             if v.get('Labels',{}).get('max2tg.offline')!=self.owner or v.get('Driver')!='local' or v.get('Options'):raise PermissionError('Foreign or unsafe volume')
@@ -72,8 +76,8 @@ class OfflineContainerSupervisor:
         if spec['image']!=self.image or spec['code']!=str(self.code):raise PermissionError('Supervisor configuration changed')
         args=['--pull','never','--name',self.name(sid),'--label','max2tg.offline='+self.owner,'--label','max2tg.sid='+sid,'--label','max2tg.spec='+digest,'--network','none','--read-only','--cap-drop','ALL','--security-opt','no-new-privileges','--user','65532:65532','--memory','256m','--cpus','0.5','--pids-limit','64','--log-driver','local','--log-opt','max-size=1m','--log-opt','max-file=2','--restart','no','--mount',f'type=bind,source={self.code / "tests"},target=/src/tests,readonly','--workdir','/src']
         if spec.get('fixture') in ('bridge','proxy-bridge'):args+=['--mount',f'type=bind,source={self.code / "app"},target=/src/app,readonly']
-        for n,target in zip(spec['volumes'],('state','channel','secret','network')):args+=['--mount',f'type=volume,source={n},target=/{target}'+(',readonly' if target in ('secret','network') else '')]
-        args+=['--health-cmd','python -c "import pathlib,time; assert time.time()-pathlib.Path(\'/state/heartbeat\').stat().st_mtime<5"','--health-interval','1s','--health-timeout','1s','--health-retries','3','--entrypoint','python',self.image,'-m',FIXTURES[spec.get('fixture','heartbeat')],sid]
+        for n,target in zip(spec['volumes'],('state','channel','secret','network','keys')):args+=['--mount',f'type=volume,source={n},target=/{target}'+(',readonly' if target in ('secret','network','keys') else '')]
+        args+=['--health-cmd','python -c "import pathlib,time; assert time.time()-pathlib.Path(\'/state/heartbeat\').stat().st_mtime<5"','--health-interval','1s','--health-timeout','1s','--health-retries','3','--entrypoint','python',self.image,'-m',FIXTURES[spec.get('fixture','heartbeat')],sid]+(['encrypted'] if len(spec['volumes'])==5 else [])
         return args
     def _verify(self,r,c):
         if c is None:return
@@ -81,12 +85,12 @@ class OfflineContainerSupervisor:
         if labels.get('max2tg.offline')!=self.owner or labels.get('max2tg.sid')!=r['sid'] or labels.get('max2tg.spec')!=digest or c['Image']!=self.image or (r['cid'] and c['Id']!=r['cid']):raise PermissionError('Foreign container; do not operate')
         spec=json.loads(r['spec']);host=c['HostConfig'];conf=c['Config']
         mounts={m['Destination']:(m.get('Name'),m['RW']) for m in c['Mounts'] if m['Type']=='volume'}
-        if mounts!=dict(zip(('/state','/channel','/secret','/network'),zip(spec['volumes'],(True,True,False,False)))):raise PermissionError('Unexpected volume mounts')
+        if mounts!=dict(zip(('/state','/channel','/secret','/network','/keys'),zip(spec['volumes'],(True,True,False,False,False)))):raise PermissionError('Unexpected volume mounts')
         binds=[m for m in c['Mounts'] if m['Type']=='bind']
         expected={'/src/tests':str(self.code/'tests')}
         if spec.get('fixture') in ('bridge','proxy-bridge'):expected['/src/app']=str(self.code/'app')
         if len(c['Mounts'])!=len(spec['volumes'])+len(expected) or len(binds)!=len(expected) or {m['Destination']:m['Source'] for m in binds}!=expected or any(m['RW'] for m in binds):raise PermissionError('Unexpected code mount')
-        if host['NetworkMode']!='none' or not host['ReadonlyRootfs'] or host['Privileged'] or host['CapAdd'] or 'ALL' not in (host['CapDrop'] or []) or not any(x in ('no-new-privileges','no-new-privileges:true') for x in (host['SecurityOpt'] or [])) or conf['User']!='65532:65532' or host['Memory']!=268435456 or host['PidsLimit']!=64 or host['NanoCpus']!=500000000 or host['RestartPolicy']['Name'] not in ('no','') or conf['Cmd']!=['-m',FIXTURES[spec.get('fixture','heartbeat')],r['sid']] or conf['Entrypoint']!=['python']:raise PermissionError('Unexpected runtime policy')
+        if host['NetworkMode']!='none' or not host['ReadonlyRootfs'] or host['Privileged'] or host['CapAdd'] or 'ALL' not in (host['CapDrop'] or []) or not any(x in ('no-new-privileges','no-new-privileges:true') for x in (host['SecurityOpt'] or [])) or conf['User']!='65532:65532' or host['Memory']!=268435456 or host['PidsLimit']!=64 or host['NanoCpus']!=500000000 or host['RestartPolicy']['Name'] not in ('no','') or conf['Cmd']!=['-m',FIXTURES[spec.get('fixture','heartbeat')],r['sid']]+(['encrypted'] if len(spec['volumes'])==5 else []) or conf['Entrypoint']!=['python']:raise PermissionError('Unexpected runtime policy')
 
     def tick(self,*,eligible=None):
         for r in list(self.db.execute('SELECT * FROM workers ORDER BY sid')):
