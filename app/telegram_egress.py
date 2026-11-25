@@ -57,6 +57,7 @@ class TelegramEgress:
             );
             CREATE INDEX IF NOT EXISTS egress_ready
                 ON telegram_egress(status,created_at);
+            CREATE INDEX IF NOT EXISTS egress_session_ready ON telegram_egress(status,session_id,created_at,source_key);
         """)
         columns={r['name'] for r in self.db.execute('PRAGMA table_info(telegram_egress)')}
         for name,kind in [('max_chat_id','TEXT'),('thread_id','INTEGER')]:
@@ -134,10 +135,13 @@ class TelegramEgress:
         )
         return "QUEUED"
 
-    def ready(self, limit: int = 50, *, exclude=()) -> list[tuple[str, str]]:
+    def ready(self, limit: int = 50, *, exclude=(),fair=False) -> list[tuple[str, str]]:
         if type(limit) is not int or not 1 <= limit <= 100:
             raise ValueError("Invalid egress batch limit")
         excluded=tuple(sorted(exclude));where=' AND session_id NOT IN ('+','.join('?' for _ in excluded)+')' if excluded else ''
+        if fair:
+            return [(r[0],r[1]) for r in self.db.execute(
+                "SELECT session_id,source_key FROM (SELECT session_id,source_key,created_at,ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY created_at,source_key) AS turn FROM telegram_egress WHERE status='QUEUED' "+where+") ORDER BY turn,created_at,session_id,source_key LIMIT ?",(*excluded,limit))]
         return [
             (r["session_id"], r["source_key"])
             for r in self.db.execute(
@@ -228,9 +232,9 @@ class TelegramEgress:
                 return self.row(sid, source_key)["status"]
             return "SENT"
 
-    async def drain(self, bot, limit: int = 50, *, exclude=()) -> dict[str, int]:
+    async def drain(self, bot, limit: int = 50, *, exclude=(),fair=False) -> dict[str, int]:
         outcomes: dict[str, int] = {}
-        for sid, source_key in self.ready(limit,exclude=exclude):
+        for sid, source_key in self.ready(limit,exclude=exclude,fair=fair):
             outcome = await self.send_one(bot, sid, source_key)
             outcomes[outcome] = outcomes.get(outcome, 0) + 1
         return outcomes

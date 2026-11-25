@@ -86,6 +86,7 @@ class TelegramInbox:
           );
           CREATE INDEX IF NOT EXISTS ingress_status
           ON telegram_ingress(status,updated_at);
+          CREATE INDEX IF NOT EXISTS ingress_session_ready ON telegram_ingress(status,session_id,update_id);
         """)
         # A process killed after a network handoff can have delivered MAX
         # messages. Mark uncertainty explicitly rather than replaying.
@@ -129,10 +130,13 @@ class TelegramInbox:
             (update_id,)).fetchone()
         return dict(current) if current else None
 
-    def ready(self,limit:int=100,*,exclude=()) -> list[int]:
+    def ready(self,limit:int=100,*,exclude=(),fair=False) -> list[int]:
         if not 1<=limit<=100:
             raise ValueError("Invalid batch size")
         excluded=tuple(sorted(exclude));where=' AND session_id NOT IN ('+','.join('?' for _ in excluded)+')' if excluded else ''
+        if fair:
+            return [r[0] for r in self.db.execute(
+                "SELECT update_id FROM (SELECT update_id,ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY update_id) AS turn FROM telegram_ingress WHERE status='RECEIVED' "+where+") ORDER BY turn,update_id LIMIT ?",(*excluded,limit))]
         return [r[0] for r in self.db.execute(
             "SELECT update_id FROM telegram_ingress WHERE status='RECEIVED' "+where+
             " ORDER BY update_id LIMIT ?",(*excluded,limit))]
@@ -154,8 +158,8 @@ class TelegramInbox:
         if session!=row["session_id"]:
             self.db.execute(
                 "UPDATE telegram_ingress SET status='BLOCKED',updated_at=? "
-                "WHERE update_id=?",(time.time(),update_id))
-            return "BLOCKED"
+                "WHERE update_id=? AND status='RECEIVED'",(time.time(),update_id))
+            return self.row(update_id)["status"]
         if self.dispatch_allowed is not None and not self.dispatch_allowed(session):return 'RECEIVED'
         claim=self.db.execute(
             "UPDATE telegram_ingress SET status='INFLIGHT',updated_at=? "
@@ -168,21 +172,21 @@ class TelegramInbox:
             # No request made to worker; retry is unambiguously safe.
             self.db.execute(
                 "UPDATE telegram_ingress SET status='RECEIVED',updated_at=? "
-                "WHERE update_id=?",(time.time(),update_id))
-            return "RECEIVED"
+                "WHERE update_id=? AND status='INFLIGHT'",(time.time(),update_id))
+            return self.row(update_id)["status"]
         except asyncio.CancelledError:
             self.db.execute("UPDATE telegram_ingress SET status='UNKNOWN',updated_at=? WHERE update_id=? AND status='INFLIGHT'",(time.time(),update_id))
             raise
         except Exception:
             self.db.execute(
                 "UPDATE telegram_ingress SET status='UNKNOWN',updated_at=? "
-                "WHERE update_id=?",(time.time(),update_id))
-            return "UNKNOWN"
+                "WHERE update_id=? AND status='INFLIGHT'",(time.time(),update_id))
+            return self.row(update_id)["status"]
         status="ACKED" if confirmed is True else "UNKNOWN"
         self.db.execute(
             "UPDATE telegram_ingress SET status=?,updated_at=? "
-            "WHERE update_id=?",(status,time.time(),update_id))
-        return status
+            "WHERE update_id=? AND status='INFLIGHT'",(status,time.time(),update_id))
+        return self.row(update_id)["status"]
 
     def counts(self):
         return dict(self.db.execute(

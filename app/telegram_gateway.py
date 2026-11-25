@@ -36,11 +36,11 @@ class TelegramGatewayEngine:
             raise RuntimeError("Central Telegram egress is not configured")
         return self.egress.enqueue(sid,source_key,text)
 
-    async def drain_egress(self,bot,limit:int=50,*,exclude=())->dict[str,int]:
+    async def drain_egress(self,bot,limit:int=50,*,exclude=(),fair=False)->dict[str,int]:
         """Explicitly called by single-bot gateway; never starts polling."""
         if self.egress is None:
             raise RuntimeError("Central Telegram egress is not configured")
-        return await self.egress.drain(bot,limit,exclude=exclude)
+        return await self.egress.drain(bot,limit,exclude=exclude,fair=fair)
 
     def _trusted_topic(self,sid,update):
         message=update.get('message') or {}
@@ -64,10 +64,30 @@ class TelegramGatewayEngine:
         async with self._locks.setdefault(session,asyncio.Lock()):
             return await self.inbox.dispatch(update_id,self._deliver_scoped)
 
-    async def drain(self,limit:int=100,*,exclude=())->dict:
+    async def drain(self,limit:int=100,*,exclude=(),concurrency=1,fair=False)->dict:
         """Replay only definitely unsent RECEIVED rows after recovery."""
+        if type(concurrency) is not int or not 1<=concurrency<=8:raise ValueError('Invalid ingress concurrency')
+        if concurrency>1:
+            groups={}
+            for uid in self.inbox.ready(limit,exclude=exclude,fair=fair):
+                groups.setdefault(self.inbox.row(uid)['session_id'],[]).append(uid)
+            gate=asyncio.Semaphore(concurrency);results={}
+            async def deliver_group(sid,ids):
+                async with gate,self._locks.setdefault(sid,asyncio.Lock()):
+                    for uid in ids:
+                        result=await self.inbox.dispatch(uid,self._deliver_scoped)
+                        results[result]=results.get(result,0)+1
+                        if result=='RECEIVED':break
+            tasks=[asyncio.create_task(deliver_group(sid,ids)) for sid,ids in groups.items()]
+            try:
+                if tasks:await asyncio.gather(*tasks)
+            finally:
+                for task in tasks:
+                    if not task.done():task.cancel()
+                if tasks:await asyncio.gather(*tasks,return_exceptions=True)
+            return results
         results={}
-        for update_id in self.inbox.ready(limit,exclude=exclude):
+        for update_id in self.inbox.ready(limit,exclude=exclude,fair=fair):
             row=self.inbox.row(update_id)
             session=row["session_id"]
             async with self._locks.setdefault(session,asyncio.Lock()):
