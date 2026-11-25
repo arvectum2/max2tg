@@ -78,3 +78,5 @@ jobs:
         run: python3 scripts/test-network-tunnel.py --image max2tg:ci
       - name: Verify supervised actual-client bridge and broker outage recovery
         run: python3 scripts/test-supervised-proxy.py --image max2tg:ci
+      - name: Verify encrypted credentials in separate read-only key volumes
+        run: python3 scripts/test-supervised-proxy.py --image max2tg:ci --encrypted

@@ -72,3 +72,16 @@ def test_proxy_fixture_requires_dedicated_readonly_network_volume(tmp_path):
         assert args[args.index('--network')+1]=='none'
         with pytest.raises(ValueError,match='reuse'):s.register(B,'m2tg-orch-b-state','m2tg-orch-b-channel','m2tg-orch-b-secret',fixture='proxy-bridge',network_channel=net)
     finally:s.close()
+
+
+def test_encrypted_worker_exact_private_key_mount(tmp_path):
+    tmp_path.chmod(0o700);b=Backend();s=OfflineContainerSupervisor(tmp_path,IMAGE,CODE,backend=b);b.owner=s.owner
+    prefix='m2tg-orch-'+s.owner+'-';vols=[prefix+part+'0' for part in ('state','channel','secret','net','keys')]
+    try:
+        with pytest.raises(ValueError):s.register(A,*vols[:3],fixture='proxy-bridge',network_channel=vols[3],key_channel=prefix+'botkeys')
+        with pytest.raises(ValueError):s.register(A,*vols[:3],fixture='proxy-bridge',network_channel=vols[3],key_channel=prefix+'keys1')
+        s.register(A,*vols[:3],fixture='proxy-bridge',network_channel=vols[3],key_channel=vols[4]);args=s._args(s.row(A))
+        assert args[-4:]==['-m','tests.supervised_proxy_fixture',A,'encrypted']
+        assert f'type=volume,source={vols[4]},target=/keys,readonly' in args
+        with pytest.raises(ValueError):s.register(B,*vols[:3],fixture='proxy-bridge',network_channel=vols[3],key_channel=vols[4])
+    finally:s.close()

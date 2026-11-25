@@ -13,7 +13,7 @@ from app.worker_secrets import install_worker_secret,load_worker_secret,build_ma
 
 UID=65532
 
-async def _prepare(*,defer_second=False):
+async def _prepare(*,defer_second=False,encrypted=False):
     for name in ('registry','channel0','channel1','state0','state1','secret0','secret1'):
         p=Path('/'+name);assert p.is_dir() and not list(p.iterdir());p.chmod(0o700)
     r=CapsuleRegistry('/registry');onboarding=SharedOnboarding(r);sessions=[]
@@ -25,16 +25,22 @@ async def _prepare(*,defer_second=False):
             async def get_chat_member(self,gid,uid):return SimpleNamespace(user=SimpleNamespace(id=uid),status='creator' if uid==actor else 'administrator',can_manage_topics=True)
             async def get_chat_member_count(self,gid):return 2
         bot=VerifyBot();assert await onboarding.verify_forum(req,bot)=='FORUM_VERIFIED'
-        install_worker_secret(f'/secret{i}',sid,{'session_id':sid,'MAX_TOKEN':f'synthetic-secret-{i}','MAX_DEVICE_ID':f'synthetic-{i}'})
+        values={'session_id':sid,'MAX_TOKEN':f'synthetic-secret-{i}','MAX_DEVICE_ID':f'synthetic-{i}'};kp=None
+        if encrypted:
+            from app.encrypted_storage import create_key
+            from app.encrypted_credentials import install_encrypted_worker
+            d=Path(f'/keys{i}');d.chmod(0o700);kp=d/'worker.key';create_key(kp,'max:'+sid);install_encrypted_worker(f'/secret{i}',sid,values,kp)
+        else:install_worker_secret(f'/secret{i}',sid,values)
         key=onboarding.ipc_key(req).read_bytes();folders=(f'/state{i}',f'/channel{i}',f'/secret{i}')
-        assert prepare_worker(*folders,sid,actor,forum,key)
-        assert prepare_worker(*folders,sid,actor,forum,key) # idempotent local provisioning
-        def check(s,a,f,k):return check_worker(*folders,s,a,f,k.read_bytes())
+        assert prepare_worker(*folders,sid,actor,forum,key,key_path=kp)
+        assert prepare_worker(*folders,sid,actor,forum,key,key_path=kp) # idempotent local provisioning
+        def check(s,a,f,k):return check_worker(*folders,s,a,f,k.read_bytes(),key_path=kp)
         onboarding.confirm_provisioned(req,check=check);assert not r.get(sid)['desired_active']
         if not (defer_second and i==1):
             assert await onboarding.activate(req,bot,check=check)==sid
             onboarding.plane.bind_topic(sid,42,77,actor)
         sessions.append([sid,actor,forum])
+        if encrypted:os.chown(kp,UID,UID);os.chown(kp.parent,UID,UID)
     (r.root/'synthetic-bot-secret').write_text('not-a-real-token');(r.root/'synthetic-bot-secret').chmod(0o600)
     r.close()
     for name in ('registry','channel0','channel1','state0','state1','secret0','secret1'):
@@ -43,7 +49,7 @@ async def _prepare(*,defer_second=False):
     print(json.dumps(sessions),flush=True)
 
 
-def prepare(*,defer_second=False):asyncio.run(_prepare(defer_second=defer_second))
+def prepare(*,defer_second=False,encrypted=False):asyncio.run(_prepare(defer_second=defer_second,encrypted=encrypted))
 
 
 def assert_sandbox():

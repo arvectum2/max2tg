@@ -8,19 +8,19 @@ from app.lifecycle_reconcile import LifecycleReconciler
 from app.dependency_supervisor import DependencySupervisor
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--image',required=True);args=p.parse_args();d=DockerBackend();code=Path(__file__).resolve().parents[1];image=d.call('image','inspect','--format','{{.Id}}',args.image)
+    p=argparse.ArgumentParser();p.add_argument('--image',required=True);p.add_argument('--encrypted',action='store_true');args=p.parse_args();d=DockerBackend();code=Path(__file__).resolve().parents[1];image=d.call('image','inspect','--format','{{.Id}}',args.image)
     with tempfile.TemporaryDirectory(prefix='m2tg-proxy-e2e-') as td:
         root=Path(td).resolve();root.chmod(0o700);cert=root/'cert';cert.mkdir();subprocess.run(['openssl','req','-x509','-newkey','rsa:2048','-nodes','-days','1','-subj','/CN=synthetic','-addext','subjectAltName=DNS:api.oneme.ru,DNS:api.telegram.org','-keyout',str(cert/'key.pem'),'-out',str(cert/'cert.pem')],check=True,capture_output=True);(cert/'key.pem').chmod(0o644)
         s=OfflineContainerSupervisor(root,image,code);owner=s.owner;vol={};names=[];rec=None;gateway=None;ids=[];dep=None;manage_dependencies=True
         def run(name,mode,mounts,*extra,init=False,certificate=False):
             names.append(name);a=['run','--name',name,'--pull','never','--label',f'max2tg.offline={owner}','--network','none','--read-only','--security-opt','no-new-privileges','--memory','256m','--pids-limit','64','--mount',f'type=bind,source={code / "app"},target=/src/app,readonly','--mount',f'type=bind,source={code / "tests"},target=/src/tests,readonly','--workdir','/src']
             if not init:
-                a+=['--user','65532:65532','--cap-drop','ALL','--label',f'max2tg.dependency={mode}','--restart','no']
+                a+=['--user','65532:65532','--cap-drop','ALL','--label',f'max2tg.dependency={"gateway" if mode=="gateway-encrypted" else mode}','--restart','no']
                 health='/nettg/broker-health.json' if mode=='broker' else '/registry/gateway-health.json'
                 # PID 1 and current container start time: old file cannot satisfy readiness.
                 probe=f"import json,time,pathlib,os; h=json.loads(pathlib.Path({health!r}).read_text()); assert h['pid']==1 and 0<=time.time()-h['at']<5; assert h['at']>=time.time()-float(pathlib.Path('/proc/uptime').read_text().split()[0])+int(pathlib.Path('/proc/1/stat').read_text().split()[21])/os.sysconf('SC_CLK_TCK')-0.2"
                 a+=['--health-cmd','python -c '+__import__('shlex').quote(probe),'--health-interval','1s','--health-timeout','1s','--health-retries','3']
-            for k,target in mounts:a+=['--mount',f'type=volume,source={vol[k]},target=/{target}']
+            for k,target in mounts:a+=['--mount',f'type=volume,source={vol[k]},target=/{target}'+(',readonly' if not init and target in ('secret','keys') else '')]
             if certificate:a+=['--mount',f'type=bind,source={cert},target=/cert,readonly']
             return d.call(*(a if init else ['create',*a[1:]]),'--entrypoint','python',image,'-m','tests.supervised_proxy_fixture',mode,*extra)
         def read(cid,path):return json.loads(d.call('exec',cid,'python','-c',f'from pathlib import Path;print(Path({path!r}).read_text() if Path({path!r}).exists() else "null")'))
@@ -37,13 +37,13 @@ def main():
                 time.sleep(.2)
             raise RuntimeError('Condition not met: '+str([dict(x) for x in s.db.execute('SELECT sid,status FROM workers')])+' dependencies '+str([dep.row(x) for x in ('broker','gateway')] if dep else []))
         try:
-            for k in ('registry','channel0','channel1','state0','state1','secret0','secret1','net0','net1','nettg'):vol[k]=d.call('volume','create','--label',f'max2tg.offline={owner}',f'm2tg-orch-{owner}-{k}')
+            for k in ('registry','channel0','channel1','state0','state1','secret0','secret1','net0','net1','nettg')+(('keys0','keys1','botkeys','botsecret') if args.encrypted else ()):vol[k]=d.call('volume','create','--label',f'max2tg.offline={owner}',f'm2tg-orch-{owner}-{k}')
             sessions=json.loads(run('m2tg-proxy-init-'+owner,'init',[(k,k) for k in vol],init=True,certificate=True));ids=[x[0] for x in sessions];a,b=ids
             broker=run('m2tg-proxy-broker-'+owner,'broker',[(k,k) for k in ('net0','net1','nettg')],certificate=True)
-            gateway=run('m2tg-proxy-gateway-'+owner,'gateway',[(k,k) for k in ('registry','channel0','channel1')]+[('nettg','network')],json.dumps(sessions))
+            gateway=run('m2tg-proxy-gateway-'+owner,'gateway-encrypted' if args.encrypted else 'gateway',[(k,k) for k in ('registry','channel0','channel1')]+[('nettg','network')]+([('botkeys','keys'),('botsecret','secret')] if args.encrypted else []),json.dumps(sessions))
             dep=DependencySupervisor(root,s);dep.register('broker');dep.register('gateway');dep.desired('broker',True);dep.desired('gateway',True)
             wait(lambda:all(dep.row(x)['status']=='HEALTHY' for x in ('broker','gateway')),timeout=25)
-            for i,sid in enumerate(ids):s.register(sid,vol[f'state{i}'],vol[f'channel{i}'],vol[f'secret{i}'],fixture='proxy-bridge',network_channel=vol[f'net{i}']);names.append(s.name(sid))
+            for i,sid in enumerate(ids):s.register(sid,vol[f'state{i}'],vol[f'channel{i}'],vol[f'secret{i}'],fixture='proxy-bridge',network_channel=vol[f'net{i}'],key_channel=vol[f'keys{i}'] if args.encrypted else None);names.append(s.name(sid))
             rec=LifecycleReconciler(s)
             def progress():return read(gateway,'/registry/progress.json') or {}
             def counts():return read(gateway,'/network/counts.json') or {}
@@ -81,7 +81,8 @@ def main():
             rec=None;manage_dependencies=False
             for sid in ids:s.desired(sid,False)
             wait(lambda:all(s.row(x)['status']=='STOPPED' for x in ids));touch(gateway,'/registry/stop');assert d.call('wait',gateway)=='0';touch(broker,'/nettg/stop-broker');assert d.call('wait',broker)=='0'
-        except Exception:
+        except Exception as exc:
+            if isinstance(exc,subprocess.CalledProcessError):print(exc.stdout,exc.stderr,flush=True)
             for name in names:
                 try:print(name,d.call('logs','--tail','20',name), d.call('inspect','--format','{{json .State.Health}}',name),flush=True)
                 except Exception:pass
