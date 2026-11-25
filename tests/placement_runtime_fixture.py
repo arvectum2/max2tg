@@ -84,7 +84,7 @@ if __name__=='__main__':
     mode=sys.argv[1]
     if mode=='init':asyncio.run(prepare())
     elif mode=='broker':
-        sessions=json.loads(sys.argv[2]);asyncio.run(broker(['/network/'+sid for sid,_,_ in sessions]+['/network/telegram'],long_poll='long-poll' in sys.argv[3:],mixed='mixed' in sys.argv[3:],cycles=3 if 'soak' in sys.argv[3:] else 1,delay=.15 if 'delay150' in sys.argv[3:] else 0))
+        sessions=json.loads(sys.argv[2]);asyncio.run(broker(['/network/'+sid for sid,_,_ in sessions]+['/network/telegram'],long_poll='long-poll' in sys.argv[3:],mixed='mixed' in sys.argv[3:],cycles=3 if 'soak' in sys.argv[3:] else 1,delay=.15 if 'delay150' in sys.argv[3:] else 0,fault='balanced-fault' in sys.argv[3:]))
     elif mode=='gateway':asyncio.run(placed_gateway(json.loads(sys.argv[2]),'profile' in sys.argv[3:],'wal' in sys.argv[3:],'balanced' in sys.argv[3:]))
     elif mode=='worker':asyncio.run(placed_worker(sys.argv[2],'profile' in sys.argv[3:],'wal' in sys.argv[3:]))
     else:raise SystemExit(78)
