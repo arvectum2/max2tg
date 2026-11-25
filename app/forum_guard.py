@@ -3,13 +3,48 @@
 No persisted positive lease survives restart. Explicit violations revoke;
 transport uncertainty holds, never turns an uncertain send into a retry.
 """
-import asyncio,time
+import asyncio,time,math
+from datetime import timedelta
+from telegram.error import RetryAfter
 from app.shared_onboarding import SharedOnboarding,inspect_forum,ForumPolicyViolation
 
+class VerificationCooldown(Exception):
+    pass
+
+class PacedVerificationBot:
+    """Pace verification reads only; no retries inside a request."""
+    def __init__(self,bot,*,rate=20,clock=time.monotonic,sleep=asyncio.sleep):
+        if not 0<rate<=100:raise ValueError('Invalid verification rate')
+        self.bot=bot;self.interval=1/rate;self.clock=clock;self.sleep=sleep
+        self.lock=asyncio.Lock();self.next_slot=0;self.cooldown=0
+
+    async def call(self,name,*args):
+        async with self.lock:
+            now=self.clock()
+            if now<self.cooldown:raise VerificationCooldown()
+            await self.sleep(max(0,self.next_slot-now))
+            now=self.clock()
+            if now<self.cooldown:raise VerificationCooldown()
+            self.next_slot=now+self.interval
+        try:return await getattr(self.bot,name)(*args)
+        except RetryAfter as exc:
+            delay=exc.retry_after
+            if isinstance(delay,timedelta):delay=delay.total_seconds()
+            if type(delay) not in (int,float) or not math.isfinite(delay) or delay<0:delay=60
+            self.cooldown=max(self.cooldown,self.clock()+max(1,delay))
+            raise VerificationCooldown() from None
+
+    async def get_me(self):return await self.call('get_me')
+    async def get_chat(self,*args):return await self.call('get_chat',*args)
+    async def get_chat_member(self,*args):return await self.call('get_chat_member',*args)
+    async def get_chat_member_count(self,*args):return await self.call('get_chat_member_count',*args)
+
 class ForumGuard:
-    def __init__(self,registry,bot,*,ttl=30,clock=time.monotonic):
+    def __init__(self,registry,bot,*,ttl=30,clock=time.monotonic,concurrency=4,rate=20):
         if not 1<=ttl<=60:raise ValueError('Invalid forum check interval')
-        self.onboarding=SharedOnboarding(registry);self.bot=bot;self.ttl=ttl;self.clock=clock
+        if type(concurrency) is not int or not 1<=concurrency<=16:raise ValueError("Invalid verification concurrency")
+        self.onboarding=SharedOnboarding(registry);self.bot=PacedVerificationBot(bot,rate=rate);self.ttl=ttl;self.clock=clock;self.concurrency=concurrency
+        self.failures={}
         self.valid={};self.next_check={};self.generation={};self.status={};self.lock=asyncio.Lock()
 
     def allowed(self,sid):return self.clock()<self.valid.get(sid,-1)
@@ -49,25 +84,38 @@ class ForumGuard:
     def held_sessions(self):
         return {r[0] for r in self.onboarding.db.execute("SELECT o.sid FROM shared_onboarding o JOIN capsules c ON c.session_id=o.sid JOIN tg_routes r ON r.session_id=o.sid WHERE o.stage='ACTIVE' AND c.desired_active=1 AND r.status='ACTIVE'") if not self.allowed(r[0])}
 
+    async def _check(self,row):
+        sid=row['sid'];now=self.clock();gen=self.generation.get(sid,0)
+        def current():return self.generation.get(sid,0)==gen and self.onboarding.row(row['request_id'])['stage']=='ACTIVE'
+        try:
+            bid=await asyncio.wait_for(inspect_forum(row,self.bot),timeout=8)
+            if str(bid)!=row['bot_id']:raise ForumPolicyViolation('Bot identity changed')
+        except ForumPolicyViolation:
+            if current():
+                self.valid.pop(sid,None);self.onboarding.revoke(row['request_id']);self.status[sid]='REVOKED';self.next_check.pop(sid,None)
+        except VerificationCooldown:
+            if current():
+                self.valid.pop(sid,None);self.status[sid]='RATE_LIMITED';self.next_check[sid]=self.clock()+max(1,self.bot.cooldown-self.bot.clock())
+        except Exception:
+            if current():
+                self.valid.pop(sid,None);self.status[sid]='UNAVAILABLE';n=self.failures.get(sid,0)+1;self.failures[sid]=n;self.next_check[sid]=self.clock()+min(60,5*2**min(n-1,4))
+        else:
+            if current():
+                self.failures.pop(sid,None);self.valid[sid]=now+self.ttl
+                self.next_check[sid]=now+self.ttl*0.7;self.status[sid]='VERIFIED'
+
     async def refresh(self,active):
+        """One fair, bounded wave. Unchecked sessions never get a lease."""
         async with self.lock:
             for sid in set(self.valid)-set(active):self.valid.pop(sid,None)
-            rows=[dict(r) for r in self.onboarding.db.execute("SELECT * FROM shared_onboarding WHERE stage='ACTIVE'") if r['sid'] in active]
-            for row in rows:
-                sid=row['sid'];now=self.clock()
-                if now<self.next_check.get(sid,-1):continue
-                gen=self.generation.get(sid,0);self.valid.pop(sid,None)
-                try:
-                    bid=await asyncio.wait_for(inspect_forum(row,self.bot),timeout=8)
-                    if str(bid)!=row['bot_id']:raise ForumPolicyViolation('Bot identity changed')
-                except ForumPolicyViolation:
-                    self.onboarding.revoke(row['request_id']);self.status[sid]='REVOKED';self.next_check.pop(sid,None);continue
-                except (OSError,TimeoutError):
-                    self.status[sid]='UNAVAILABLE';self.next_check[sid]=self.clock()+5;continue
-                except Exception:
-                    # API-specific failures (including forbidden/429) lack a
-                    # complete membership snapshot; hold instead of guessing.
-                    self.status[sid]='UNAVAILABLE';self.next_check[sid]=self.clock()+5;continue
-                if self.generation.get(sid,0)!=gen or self.onboarding.row(row['request_id'])['stage']!='ACTIVE':continue
-                # Age measured from start, not completion of the multi-call read.
-                self.valid[sid]=now+self.ttl;self.next_check[sid]=now+self.ttl;self.status[sid]='VERIFIED'
+            now=self.clock()
+            if self.bot.clock()<self.bot.cooldown:return
+            rows=[dict(r) for r in self.onboarding.db.execute("SELECT * FROM shared_onboarding WHERE stage='ACTIVE'") if r['sid'] in active and now>=self.next_check.get(r['sid'],-1)]
+            rows.sort(key=lambda r:(self.next_check.get(r['sid'],-1),r['sid']))
+            tasks=[asyncio.create_task(self._check(row)) for row in rows[:self.concurrency]]
+            try:
+                if tasks:await asyncio.gather(*tasks)
+            finally:
+                for task in tasks:
+                    if not task.done():task.cancel()
+                if tasks:await asyncio.gather(*tasks,return_exceptions=True)
