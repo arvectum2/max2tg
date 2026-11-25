@@ -53,11 +53,45 @@ class CapsuleEgressOutbox:
             if name not in columns:self.db.execute(f'ALTER TABLE worker_telegram_intents ADD COLUMN {name} TEXT')
         # Legacy pending rows have no proof of non-submission. Conservative migration.
         if 'submission_attempted' not in columns:self.db.execute('ALTER TABLE worker_telegram_intents ADD COLUMN submission_attempted INTEGER NOT NULL DEFAULT 1')
+        self._init_receipt_index()
         for suffix in ("-wal", "-shm"):
             extra = self.path.with_name(self.path.name + suffix)
             if extra.exists():
                 os.chmod(extra, 0o600)
         self._lock = asyncio.Lock()
+
+    def _init_receipt_index(self):
+        # Single owner runtime lock; one transactional migration. Unlike rowid
+        # or wall clock, sequence advances when an older intent becomes SENT.
+        cols={r['name'] for r in self.db.execute('PRAGMA table_info(worker_telegram_intents)')}
+        migration="" if 'receipt_seq' in cols else """
+            ALTER TABLE worker_telegram_intents ADD COLUMN receipt_seq INTEGER NOT NULL DEFAULT 0;
+            UPDATE worker_telegram_intents SET receipt_seq=rowid WHERE status='SENT';
+        """
+        self.db.executescript("BEGIN IMMEDIATE;"+migration+"""
+            CREATE TABLE IF NOT EXISTS worker_receipt_clock(singleton INTEGER PRIMARY KEY CHECK(singleton=1),seq INTEGER NOT NULL);
+            INSERT OR IGNORE INTO worker_receipt_clock SELECT 1,COALESCE(MAX(receipt_seq),0) FROM worker_telegram_intents;
+            CREATE UNIQUE INDEX IF NOT EXISTS worker_receipt_seq ON worker_telegram_intents(receipt_seq) WHERE receipt_seq>0;
+            CREATE INDEX IF NOT EXISTS worker_receipt_chat ON worker_telegram_intents(max_chat_id,receipt_seq DESC) WHERE status='SENT' AND receipt_seq>0;
+            CREATE INDEX IF NOT EXISTS worker_intent_pending ON worker_telegram_intents(updated_at,source_key) WHERE status IN('PENDING','ACCEPTED');
+            CREATE TRIGGER IF NOT EXISTS worker_receipt_insert AFTER INSERT ON worker_telegram_intents WHEN NEW.status='SENT' BEGIN
+                UPDATE worker_receipt_clock SET seq=seq+1 WHERE singleton=1;
+                UPDATE worker_telegram_intents SET receipt_seq=(SELECT seq FROM worker_receipt_clock WHERE singleton=1) WHERE source_key=NEW.source_key;
+            END;
+            CREATE TRIGGER IF NOT EXISTS worker_receipt_confirm AFTER UPDATE OF status ON worker_telegram_intents WHEN NEW.status='SENT' AND OLD.status!='SENT' BEGIN
+                UPDATE worker_receipt_clock SET seq=seq+1 WHERE singleton=1;
+                UPDATE worker_telegram_intents SET receipt_seq=(SELECT seq FROM worker_receipt_clock WHERE singleton=1) WHERE source_key=NEW.source_key;
+            END;
+            COMMIT;
+        """)
+
+    def receipt_position(self):
+        return self.db.execute('SELECT seq FROM worker_receipt_clock WHERE singleton=1').fetchone()[0]
+
+    def recent_receipts(self,cid,after=0,limit=1000):
+        if type(after) is not int or after<0 or type(limit) is not int or not 1<=limit<=1000:raise ValueError('Invalid receipt range')
+        rows=self.db.execute("SELECT max_chat_id,max_message_id,telegram_id FROM worker_telegram_intents WHERE status='SENT' AND receipt_seq>0 AND max_chat_id=? AND receipt_seq>? ORDER BY receipt_seq DESC LIMIT ?",(str(cid),after,limit)).fetchall()
+        return reversed(rows)
 
     def row(self, key: str) -> dict | None:
         row = self.db.execute(

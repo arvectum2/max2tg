@@ -14,6 +14,7 @@ class SharedCapsuleTextListener:
     def __init__(self,client,topics,ingress_ledger,egress,ipc):
         if egress.sid!=ipc.sid:raise ValueError('Mismatched capsule identity')
         self.client=client;self.topics=topics;self.ingress_ledger=ingress_ledger;self.egress=egress;self.ipc=ipc
+        self._receipt_store=None;self._receipt_bindings={};self._receipt_position=0
 
     def attach(self):
         self.client.on_message(self.on_message)
@@ -35,15 +36,21 @@ class SharedCapsuleTextListener:
         except ValueError:return 'BLOCKED'
 
     def repair_receipts(self):
-        # Ledger is authoritative; JSON mappings are only a derived index.
-        repaired=0
-        for r in self.egress.db.execute("SELECT max_chat_id,max_message_id,telegram_id FROM worker_telegram_intents WHERE status='SENT' AND max_chat_id IS NOT NULL"):
-            cid,mid,tid=r
-            if type(tid) is not int or tid<=0 or self.topics.get_topic(cid) is None:continue
-            old=self.topics.tg_for_max_message(cid,mid);other=self.topics.max_for_tg_message(cid,tid)
-            if old is not None and old!=tid or other is not None and other!=mid:raise RuntimeError('Conflicting confirmed mapping')
-            if old is None:self.topics.set_message(cid,mid,tid);repaired+=1
-        if self.topics.persist_failed:raise RuntimeError('Topic index persistence failed')
+        # Only the latest bounded per-chat projection is useful in TopicStore.
+        # In-memory watermark is rebuilt on restart or rebinding; it is never
+        # trusted across a restored DB or independent topic store replacement.
+        bindings=self.topics.receipt_bindings();position=self.egress.receipt_position()
+        same=self._receipt_store is self.topics and position>=self._receipt_position
+        old_bindings=self._receipt_bindings if same else {}
+        if same and position==self._receipt_position and bindings==old_bindings:
+            if self.topics.persist_failed:raise RuntimeError('Topic index persistence failed')
+            return 0
+        def rows():
+            for cid,topic in sorted(bindings.items()):
+                after=self._receipt_position if same and old_bindings.get(cid)==topic else 0
+                if after<position:yield from self.egress.recent_receipts(cid,after)
+        repaired=self.topics.apply_confirmed_receipts(rows())
+        self._receipt_store=self.topics;self._receipt_bindings=bindings;self._receipt_position=position
         return repaired
 
     async def drain(self):
