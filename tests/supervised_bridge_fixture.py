@@ -48,7 +48,7 @@ class Max:
 
 async def worker(sid):
     assert_sandbox();assert not Path('/registry').exists()
-    cfg=json.loads(Path('/state/test-acl.json').read_text());assert cfg['sid']==sid;actor=cfg['actor'];forum=cfg['forum']
+    cfg=json.loads(Path('/state/worker-acl.json').read_text());assert cfg['sid']==sid;actor=cfg['actor'];forum=cfg['forum']
     def factory(*,token,device_id,debug):
         assert token==f'synthetic-secret-{actor-100}' and device_id==f'synthetic-{actor-100}' and debug is False;return Max(actor)
     w=IsolatedWorkerRuntime(sid,'/state','/channel','/state/key',forum,actor,build_max_client('/secret',sid,factory=factory));stop=asyncio.Event();asyncio.get_running_loop().add_signal_handler(signal.SIGTERM,stop.set)
@@ -69,8 +69,6 @@ if __name__=='__main__':
         buf=io.StringIO()
         with contextlib.redirect_stdout(buf):prepare()
         sessions=json.loads(buf.getvalue())
-        for i,(sid,actor,forum) in enumerate(sessions):
-            p=Path(f'/state{i}/test-acl.json');p.write_text(json.dumps({'sid':sid,'actor':actor,'forum':forum}));p.chmod(0o600);os.chown(p,65532,65532)
         print(json.dumps(sessions))
     elif sys.argv[1]=='gateway':asyncio.run(gateway(json.loads(sys.argv[2])))
     else:asyncio.run(worker(sys.argv[1]))

@@ -77,6 +77,9 @@ class SharedGatewayRuntime:
         if self.started:raise RuntimeError('Already started')
         me=await self.bot.get_me();bid=getattr(me,'id',None)
         if type(bid) is not int or bid<=0:raise ValueError('Bot identity unavailable')
+        if self.plane.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='shared_onboarding'").fetchone():
+            for entry in self.plane.db.execute("SELECT o.bot_id FROM shared_onboarding o JOIN capsules c ON c.session_id=o.sid WHERE o.stage='ACTIVE' AND c.desired_active=1"):
+                if entry[0]!=str(bid):raise PermissionError('Active onboarding belongs to a different bot')
         row=self.inbox.db.execute('SELECT bot_id FROM polling_checkpoint WHERE singleton=1').fetchone()
         if row and row[0]!=bid:raise PermissionError('Different bot cannot reuse polling checkpoint')
         self.inbox.db.execute('INSERT OR IGNORE INTO polling_checkpoint VALUES(1,?,0)',(bid,))

@@ -4,8 +4,8 @@ import asyncio,json,os,sys,time,socket,fcntl,struct
 from pathlib import Path
 from types import SimpleNamespace
 from app.capsule_registry import CapsuleRegistry
-from app.telegram_control_plane import TelegramControlPlane
-from app.telegram_ipc import ensure_ipc_key
+from app.shared_onboarding import SharedOnboarding
+from app.worker_provision import prepare_worker,check_worker
 from app.shared_gateway_runtime import SharedGatewayRuntime
 from app.isolated_worker_runtime import IsolatedWorkerRuntime
 from app.max_client import MaxMessage
@@ -13,16 +13,26 @@ from app.worker_secrets import install_worker_secret,load_worker_secret,build_ma
 
 UID=65532
 
-def prepare():
+async def _prepare():
     for name in ('registry','channel0','channel1','state0','state1','secret0','secret1'):
         p=Path('/'+name);assert p.is_dir() and not list(p.iterdir());p.chmod(0o700)
-    r=CapsuleRegistry('/registry');plane=TelegramControlPlane(r);sessions=[]
+    r=CapsuleRegistry('/registry');onboarding=SharedOnboarding(r);sessions=[]
     for i in range(2):
-        actor=100+i;forum=-10000-i;owner=r.create_account();sid=r.create_capsule(owner)
+        actor=100+i;forum=-10000-i;req=f'{i+1:024x}';sid=onboarding.reserve(req,actor,forum)
+        class VerifyBot:
+            async def get_me(self):return SimpleNamespace(id=900)
+            async def get_chat(self,gid):return SimpleNamespace(id=gid,type='supergroup',is_forum=True)
+            async def get_chat_member(self,gid,uid):return SimpleNamespace(user=SimpleNamespace(id=uid),status='creator' if uid==actor else 'administrator',can_manage_topics=True)
+            async def get_chat_member_count(self,gid):return 2
+        bot=VerifyBot();assert await onboarding.verify_forum(req,bot)=='FORUM_VERIFIED'
         install_worker_secret(f'/secret{i}',sid,{'session_id':sid,'MAX_TOKEN':f'synthetic-secret-{i}','MAX_DEVICE_ID':f'synthetic-{i}'})
-        r.configure_external_shared(sid,forum);r.set_active(sid,True)
-        plane.claim_owner(actor,plane.generate_claim(owner));plane.bind_forum(sid,forum,actor);plane.confirm_forum(forum,is_private_forum=True,owner_is_member=True,bot_is_admin=True);plane.bind_topic(sid,42,77,actor)
-        state=Path(f'/state{i}');key=state/'key';key.write_bytes(ensure_ipc_key(r,sid).read_bytes());key.chmod(0o600)
+        key=onboarding.ipc_key(req).read_bytes();folders=(f'/state{i}',f'/channel{i}',f'/secret{i}')
+        assert prepare_worker(*folders,sid,actor,forum,key)
+        assert prepare_worker(*folders,sid,actor,forum,key) # idempotent local provisioning
+        def check(s,a,f,k):return check_worker(*folders,s,a,f,k.read_bytes())
+        onboarding.confirm_provisioned(req,check=check);assert not r.get(sid)['desired_active']
+        assert await onboarding.activate(req,bot,check=check)==sid
+        onboarding.plane.bind_topic(sid,42,77,actor)
         sessions.append([sid,actor,forum])
     (r.root/'synthetic-bot-secret').write_text('not-a-real-token');(r.root/'synthetic-bot-secret').chmod(0o600)
     r.close()
@@ -30,6 +40,9 @@ def prepare():
         p=Path('/'+name);os.chown(p,UID,UID)
         for q in p.rglob('*'):os.chown(q,UID,UID)
     print(json.dumps(sessions),flush=True)
+
+
+def prepare():asyncio.run(_prepare())
 
 
 def assert_sandbox():
