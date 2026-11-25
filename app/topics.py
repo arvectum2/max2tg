@@ -165,8 +165,11 @@ class TopicStore:
 
     def set_message(self, max_chat_id: Any, max_message_id: Any, tg_message_id: int) -> None:
         """Remember one MAX ↔ Telegram message pair for native replies."""
+        if self._remember_message(max_chat_id,max_message_id,tg_message_id):self._save()
+
+    def _remember_message(self,max_chat_id,max_message_id,tg_message_id):
         if max_message_id in (None, "") or tg_message_id is None:
-            return
+            return False
         chat_key = str(max_chat_id)
         max_key = str(max_message_id)
         mapping = self._messages.setdefault(chat_key, {})
@@ -181,7 +184,23 @@ class TopicStore:
             oldest_max_id = next(iter(mapping))
             oldest_tg_id = mapping.pop(oldest_max_id)
             self._by_tg_message.pop((chat_key, int(oldest_tg_id)), None)
-        self._save()
+        return True
+
+    def receipt_bindings(self):
+        return {cid:self.get_topic(cid) for cid in self._chats if self.get_topic(cid) is not None}
+
+    def apply_confirmed_receipts(self,rows):
+        """Repair bounded derived index; save once, never overwrite conflicts."""
+        repaired=0
+        for cid,mid,tid in rows:
+            if type(tid) is not int or tid<=0 or self.get_topic(cid) is None:continue
+            if not isinstance(mid,str) or not mid:raise RuntimeError('Invalid confirmed mapping')
+            old=self.tg_for_max_message(cid,mid);other=self.max_for_tg_message(cid,tid)
+            if old is not None and old!=tid or other is not None and other!=mid:raise RuntimeError('Conflicting confirmed mapping')
+            if old is None:self._remember_message(cid,mid,tid);repaired+=1
+        if repaired:self._save()
+        if self.persist_failed:raise RuntimeError('Topic index persistence failed')
+        return repaired
 
     def tg_for_max_message(self, max_chat_id: Any, max_message_id: Any) -> int | None:
         mapping = self._messages.get(str(max_chat_id), {})
