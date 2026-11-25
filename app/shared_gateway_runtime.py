@@ -26,7 +26,9 @@ async def remove_dead_socket(path):
     writer.close();await writer.wait_closed();raise RuntimeError('IPC listener already active')
 
 class SharedGatewayRuntime:
-    def __init__(self,registry,bot,*,channels=None,external_only=False):
+    def __init__(self,registry,bot,*,channels=None,external_only=False,managed=False):
+        if managed and (channels is None or not external_only):raise ValueError("Managed mode requires external dedicated channels")
+        self.managed=managed;self._opened=set();self.bot_id=None
         self.registry=registry;self.bot=bot;self.lock=RuntimeLock(registry.root/'shared-gateway.lock')
         self.inbox=None;self.egress=None;self.server=None;self.servers=[];self.started=False;self._poll_lock=asyncio.Lock();self._drain_lock=asyncio.Lock()
         try:
@@ -45,6 +47,7 @@ class SharedGatewayRuntime:
                 self.channels={}
                 for sid,folder in channels.items():
                     if registry.get(sid)['telegram_mode']!='shared':raise ValueError('Shared channel required')
+                    if managed and registry.get(sid)['credential_mode']!='external':raise PermissionError('Managed channel requires external capsule')
                     if registry.get(sid)['credential_mode']=='external':
                         legacy=registry.capsule_dir(sid)/'credentials.json'
                         if legacy.exists() or legacy.is_symlink():raise PermissionError('External capsule contains legacy credentials')
@@ -83,9 +86,39 @@ class SharedGatewayRuntime:
         row=self.inbox.db.execute('SELECT bot_id FROM polling_checkpoint WHERE singleton=1').fetchone()
         if row and row[0]!=bid:raise PermissionError('Different bot cannot reuse polling checkpoint')
         self.inbox.db.execute('INSERT OR IGNORE INTO polling_checkpoint VALUES(1,?,0)',(bid,))
-        for server in self.servers:
-            await remove_dead_socket(server.path);await server.start()
-        self.started=True
+        self.bot_id=bid
+        if self.managed:
+            self.started=True
+            try:await self.reconcile_channels()
+            except BaseException:self.started=False;raise
+        else:
+            for server in self.servers:
+                await remove_dead_socket(server.path);await server.start()
+            self.started=True
+
+    def _desired_channels(self):
+        rows=self.plane.db.execute("SELECT o.sid,o.stage,o.bot_id,c.desired_active,c.credential_mode,r.status FROM shared_onboarding o JOIN capsules c ON c.session_id=o.sid LEFT JOIN tg_routes r ON r.session_id=o.sid").fetchall()
+        active={r['sid'] for r in rows if r['stage']=='ACTIVE' and r['desired_active']==1 and r['credential_mode']=='external' and r['status']=='ACTIVE' and r['bot_id']==str(self.bot_id)}
+        return active
+
+    async def reconcile_channels(self):
+        """Only pre-mounted channels; never mounts paths or accepts tenant input."""
+        if not self.managed or not self.started:raise RuntimeError('Managed gateway not started')
+        async with self._drain_lock:
+            active=self._desired_channels()
+            for server in self.servers:
+                sid=server.bound_sid
+                if sid not in active and sid in self._opened:
+                    await server.stop();self._opened.discard(sid)
+                elif sid in active and sid not in self._opened:
+                    await remove_dead_socket(server.path);await server.start();self._opened.add(sid)
+            return self.lifecycle_snapshot()
+
+    def lifecycle_snapshot(self):
+        if not self.managed or not self.started:raise RuntimeError('Managed gateway not started')
+        active=self._desired_channels()
+        return {'at':time.time(),'sessions':{sid:{'active':sid in active,'ready':sid in active and sid in self._opened} for sid in self.channels}}
+
 
     def _offset(self):return self.inbox.db.execute('SELECT next_offset FROM polling_checkpoint WHERE singleton=1').fetchone()[0]
 
@@ -131,6 +164,7 @@ class SharedGatewayRuntime:
                 await asyncio.sleep(.05)
         async def drains():
             while not stop.is_set():
+                if self.managed:await self.reconcile_channels()
                 await self.drain_once()
                 try:await asyncio.wait_for(stop.wait(),1)
                 except asyncio.TimeoutError:pass
@@ -148,7 +182,7 @@ class SharedGatewayRuntime:
     async def close(self):
         async with self._poll_lock,self._drain_lock:
             for server in self.servers:await server.stop()
-            self.started=False
+            self.started=False;self._opened.clear()
             if self.inbox:self.inbox.close();self.inbox=None
             if self.egress:self.egress.close();self.egress=None
             self.lock.close()

@@ -86,7 +86,7 @@ class OfflineContainerSupervisor:
         if len(c['Mounts'])!=3+len(expected) or len(binds)!=len(expected) or {m['Destination']:m['Source'] for m in binds}!=expected or any(m['RW'] for m in binds):raise PermissionError('Unexpected code mount')
         if host['NetworkMode']!='none' or not host['ReadonlyRootfs'] or host['Privileged'] or host['CapAdd'] or 'ALL' not in (host['CapDrop'] or []) or not any(x in ('no-new-privileges','no-new-privileges:true') for x in (host['SecurityOpt'] or [])) or conf['User']!='65532:65532' or host['Memory']!=268435456 or host['PidsLimit']!=64 or host['NanoCpus']!=500000000 or host['RestartPolicy']['Name'] not in ('no','') or conf['Cmd']!=['-m',('tests.supervised_bridge_fixture' if spec.get('fixture')=='bridge' else 'tests.supervised_container_fixture'),r['sid']] or conf['Entrypoint']!=['python']:raise PermissionError('Unexpected runtime policy')
 
-    def tick(self):
+    def tick(self,*,eligible=None):
         for r in list(self.db.execute('SELECT * FROM workers ORDER BY sid')):
             r=dict(r);sid=r['sid'];state='ERROR'
             try:
@@ -98,6 +98,7 @@ class OfflineContainerSupervisor:
                     else:state='STOPPED'
                 elif c and c['State']['Running']:
                     health=c['State'].get('Health',{}).get('Status');state='HEALTHY' if health=='healthy' else 'UNHEALTHY' if health=='unhealthy' else 'STARTING'
+                elif eligible is not None and sid not in eligible:state='WAITING_CHANNEL'
                 elif r['attempts']>=self.MAX_ATTEMPTS:state='QUARANTINED'
                 elif self.clock()<r['retry']:state='BACKOFF'
                 else:
