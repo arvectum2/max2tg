@@ -46,14 +46,15 @@ class OfflineContainerSupervisor:
             self.lock.close();raise
     def name(self,sid):return 'm2tg-offline-'+self.owner+'-'+sid
     def row(self,sid):return dict(self.db.execute('SELECT * FROM workers WHERE sid=?',(sid,)).fetchone())
-    def register(self,sid,state,channel,secret):
+    def register(self,sid,state,channel,secret,*,fixture="heartbeat"):
+        if fixture not in ("heartbeat","bridge"):raise ValueError("Only reviewed synthetic fixtures")
         if not isinstance(sid,str) or not HEX.fullmatch(sid):raise ValueError('Invalid session')
         names=[state,channel,secret]
         if len(set(names))!=3 or any(not re.fullmatch(r'm2tg-orch-[a-z0-9-]{1,100}',n) for n in names):raise ValueError('Only separate test volumes')
         for n in names:
             v=self.backend.volume(n)
             if v.get('Labels',{}).get('max2tg.offline')!=self.owner or v.get('Driver')!='local' or v.get('Options'):raise PermissionError('Foreign or unsafe volume')
-        spec=json.dumps({'image':self.image,'code':str(self.code),'volumes':names},sort_keys=True)
+        spec=json.dumps({'image':self.image,'code':str(self.code),'volumes':names,**({'fixture':'bridge'} if fixture=='bridge' else {})},sort_keys=True)
         for r in self.db.execute('SELECT sid,spec FROM workers'):
             if r['sid']==sid:
                 if r['spec']!=spec:raise ValueError('Immutable worker spec')
@@ -68,8 +69,9 @@ class OfflineContainerSupervisor:
         spec=json.loads(r['spec']);sid=r['sid'];digest=hashlib.sha256(r['spec'].encode()).hexdigest()
         if spec['image']!=self.image or spec['code']!=str(self.code):raise PermissionError('Supervisor configuration changed')
         args=['--pull','never','--name',self.name(sid),'--label','max2tg.offline='+self.owner,'--label','max2tg.sid='+sid,'--label','max2tg.spec='+digest,'--network','none','--read-only','--cap-drop','ALL','--security-opt','no-new-privileges','--user','65532:65532','--memory','256m','--cpus','0.5','--pids-limit','64','--log-driver','local','--log-opt','max-size=1m','--log-opt','max-file=2','--restart','no','--mount',f'type=bind,source={self.code / "tests"},target=/src/tests,readonly','--workdir','/src']
+        if spec.get('fixture')=='bridge':args+=['--mount',f'type=bind,source={self.code / "app"},target=/src/app,readonly']
         for n,target in zip(spec['volumes'],('state','channel','secret')):args+=['--mount',f'type=volume,source={n},target=/{target}'+(',readonly' if target=='secret' else '')]
-        args+=['--health-cmd','python -c "import pathlib,time; assert time.time()-pathlib.Path(\'/state/heartbeat\').stat().st_mtime<5"','--health-interval','1s','--health-timeout','1s','--health-retries','3','--entrypoint','python',self.image,'-m','tests.supervised_container_fixture',sid]
+        args+=['--health-cmd','python -c "import pathlib,time; assert time.time()-pathlib.Path(\'/state/heartbeat\').stat().st_mtime<5"','--health-interval','1s','--health-timeout','1s','--health-retries','3','--entrypoint','python',self.image,'-m',('tests.supervised_bridge_fixture' if spec.get('fixture')=='bridge' else 'tests.supervised_container_fixture'),sid]
         return args
     def _verify(self,r,c):
         if c is None:return
@@ -79,8 +81,10 @@ class OfflineContainerSupervisor:
         mounts={m['Destination']:(m.get('Name'),m['RW']) for m in c['Mounts'] if m['Type']=='volume'}
         if mounts!=dict(zip(('/state','/channel','/secret'),zip(spec['volumes'],(True,True,False)))):raise PermissionError('Unexpected volume mounts')
         binds=[m for m in c['Mounts'] if m['Type']=='bind']
-        if len(c['Mounts'])!=4 or len(binds)!=1 or binds[0]['Destination']!='/src/tests' or binds[0]['RW'] or binds[0]['Source']!=str(self.code/'tests'):raise PermissionError('Unexpected code mount')
-        if host['NetworkMode']!='none' or not host['ReadonlyRootfs'] or host['Privileged'] or host['CapAdd'] or 'ALL' not in (host['CapDrop'] or []) or not any(x in ('no-new-privileges','no-new-privileges:true') for x in (host['SecurityOpt'] or [])) or conf['User']!='65532:65532' or host['Memory']!=268435456 or host['PidsLimit']!=64 or host['NanoCpus']!=500000000 or host['RestartPolicy']['Name'] not in ('no','') or conf['Cmd']!=['-m','tests.supervised_container_fixture',r['sid']] or conf['Entrypoint']!=['python']:raise PermissionError('Unexpected runtime policy')
+        expected={'/src/tests':str(self.code/'tests')}
+        if spec.get('fixture')=='bridge':expected['/src/app']=str(self.code/'app')
+        if len(c['Mounts'])!=3+len(expected) or len(binds)!=len(expected) or {m['Destination']:m['Source'] for m in binds}!=expected or any(m['RW'] for m in binds):raise PermissionError('Unexpected code mount')
+        if host['NetworkMode']!='none' or not host['ReadonlyRootfs'] or host['Privileged'] or host['CapAdd'] or 'ALL' not in (host['CapDrop'] or []) or not any(x in ('no-new-privileges','no-new-privileges:true') for x in (host['SecurityOpt'] or [])) or conf['User']!='65532:65532' or host['Memory']!=268435456 or host['PidsLimit']!=64 or host['NanoCpus']!=500000000 or host['RestartPolicy']['Name'] not in ('no','') or conf['Cmd']!=['-m',('tests.supervised_bridge_fixture' if spec.get('fixture')=='bridge' else 'tests.supervised_container_fixture'),r['sid']] or conf['Entrypoint']!=['python']:raise PermissionError('Unexpected runtime policy')
 
     def tick(self):
         for r in list(self.db.execute('SELECT * FROM workers ORDER BY sid')):

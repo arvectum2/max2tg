@@ -72,3 +72,5 @@ jobs:
         run: python3 scripts/test-isolated-containers.py --image max2tg:ci
       - name: Verify durable supervisor lifecycle with disposable containers
         run: python3 scripts/test-container-supervisor.py --image max2tg:ci
+      - name: Verify supervised end-to-end delivery and worker crash recovery
+        run: python3 scripts/test-supervised-bridge.py --image max2tg:ci
