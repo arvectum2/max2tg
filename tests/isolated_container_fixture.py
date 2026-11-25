@@ -13,11 +13,13 @@ from app.worker_secrets import install_worker_secret,load_worker_secret,build_ma
 
 UID=65532
 
-async def _prepare(*,defer_second=False,encrypted=False):
-    for name in ('registry','channel0','channel1','state0','state1','secret0','secret1'):
+async def _prepare(*,defer_second=False,encrypted=False,tenants=2):
+    assert tenants in (2,4,8,16)
+    dirs=['registry']+[f'{part}{i}' for i in range(tenants) for part in ('channel','state','secret')]
+    for name in dirs:
         p=Path('/'+name);assert p.is_dir() and not list(p.iterdir());p.chmod(0o700)
     r=CapsuleRegistry('/registry');onboarding=SharedOnboarding(r);sessions=[]
-    for i in range(2):
+    for i in range(tenants):
         actor=100+i;forum=-10000-i;req=f'{i+1:024x}';sid=onboarding.reserve(req,actor,forum)
         class VerifyBot:
             async def get_me(self):return SimpleNamespace(id=900)
@@ -43,13 +45,13 @@ async def _prepare(*,defer_second=False,encrypted=False):
         if encrypted:os.chown(kp,UID,UID);os.chown(kp.parent,UID,UID)
     (r.root/'synthetic-bot-secret').write_text('not-a-real-token');(r.root/'synthetic-bot-secret').chmod(0o600)
     r.close()
-    for name in ('registry','channel0','channel1','state0','state1','secret0','secret1'):
+    for name in dirs:
         p=Path('/'+name);os.chown(p,UID,UID)
         for q in p.rglob('*'):os.chown(q,UID,UID)
     print(json.dumps(sessions),flush=True)
 
 
-def prepare(*,defer_second=False,encrypted=False):asyncio.run(_prepare(defer_second=defer_second,encrypted=encrypted))
+def prepare(*,defer_second=False,encrypted=False,tenants=2):asyncio.run(_prepare(defer_second=defer_second,encrypted=encrypted,tenants=tenants))
 
 
 def assert_sandbox():

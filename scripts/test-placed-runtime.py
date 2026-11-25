@@ -7,7 +7,9 @@ from app.deployment_plan import build_plan,_verify_stopped,validate_bind_sources
 from app.container_supervisor import DockerBackend
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--image',required=True);p.add_argument('--native-volumes',action='store_true');p.add_argument('--load',type=int,choices=range(1,26));a=p.parse_args();d=DockerBackend();code=Path(__file__).resolve().parents[1];image=d.call('image','inspect','--format','{{.Id}}',a.image);owner=secrets.token_hex(12);label='max2tg.placement='+owner
+    p=argparse.ArgumentParser();p.add_argument('--image',required=True);p.add_argument('--native-volumes',action='store_true');p.add_argument('--load',type=int,choices=range(1,26));p.add_argument('--tenants',type=int,choices=(2,4,8,16),default=2);a=p.parse_args();
+    if a.tenants!=2 and (not a.native_volumes or not a.load):p.error('Larger cohorts require native volumes and bounded load mode')
+    d=DockerBackend();code=Path(__file__).resolve().parents[1];image=d.call('image','inspect','--format','{{.Id}}',a.image);owner=secrets.token_hex(12);label='max2tg.placement='+owner
     with tempfile.TemporaryDirectory(prefix='runtime-',dir=code) as td:
         root=Path(td).resolve();fixture=root/'fixture';fixture.mkdir(mode=0o700);cert=root/'cert';cert.mkdir();subprocess.run(['openssl','req','-x509','-newkey','rsa:2048','-nodes','-days','1','-subj','/CN=synthetic','-addext','subjectAltName=DNS:api.oneme.ru,DNS:api.telegram.org','-keyout',str(cert/'key.pem'),'-out',str(cert/'cert.pem')],check=True,capture_output=True);(cert/'key.pem').chmod(0o644)
         plan=None;ids={};vol={};initname='m2tg-placement-'+owner+'-init'
@@ -27,13 +29,13 @@ def main():
             args=setup_args();module='tests.placement_runtime_fixture'
             if a.native_volumes:
                 module='tests.supervised_proxy_fixture'
-                for n in ('registry','channel0','channel1','state0','state1','secret0','secret1','net0','net1','nettg','keys0','keys1','botkeys','botsecret'):
+                for n in ['registry','nettg','botkeys','botsecret']+[f'{part}{i}' for i in range(a.tenants) for part in ('channel','state','secret','net','keys')]:
                     vol[n]=d.call('volume','create','--label',label,'m2tg-placement-'+owner+'-'+n)
                     v=d.volume(vol[n]);assert v.get('Labels',{}).get('max2tg.placement')==owner and v['Driver']=='local' and not v.get('Options')
                 args=args[:-3]+[z for n,v in vol.items() for z in ('--mount',f'type=volume,source={v},target=/{n}')]+args[-3:]
-            d.call('run','-d','--name',initname,*args,'-m',module,'init');wait(lambda:d.inspect(initname)['State']['Status']=='exited',timeout=75)
+            d.call('run','-d','--name',initname,*args,'-m',module,'init',*([str(a.tenants)] if a.native_volumes else []));wait(lambda:d.inspect(initname)['State']['Status']=='exited',timeout=75)
             assert d.inspect(initname)['State']['ExitCode']==0,d.call('logs',initname)
-            sessions=json.loads(d.call('logs',initname))
+            sessions=json.loads(d.call('logs',initname));assert len(sessions)==a.tenants
             sids=[x[0] for x in sessions];plan=build_plan(owner,image,sids,data=fixture/'data',keys=fixture/'keys',backup=fixture/'backup')
             if a.native_volumes:
                 mapping={fixture/'data'/'registry':'registry',fixture/'data'/'gateway-secret':'botsecret',fixture/'keys'/'gateway':'botkeys',fixture/'data'/'network'/'telegram':'nettg'}
@@ -60,32 +62,34 @@ def main():
             def counts():return read(broker,'/network/telegram/counts.json') or {}
             def ledger(cid,path,table,column='status'):
                 return json.loads(exec_py(cid,f'import sqlite3,json;d=sqlite3.connect("file:{path}?mode=ro",uri=True);print(json.dumps(dict(d.execute("SELECT {column},count(*) FROM {table} GROUP BY {column}"))))'))
-            def receipts(n):return ledger(gateway,'/registry/inbox.sqlite3','telegram_ingress')=={'ACKED':n} and ledger(gateway,'/registry/telegram-egress.sqlite3','telegram_egress')=={'SENT':2}
+            def receipts(n):return ledger(gateway,'/registry/inbox.sqlite3','telegram_ingress')=={'ACKED':n} and ledger(gateway,'/registry/telegram-egress.sqlite3','telegram_egress')=={'SENT':a.tenants}
             def ready():return exec_py(gateway,'from pathlib import Path;print(all((p/"egress.sock").is_socket() for p in Path("/channels").iterdir()))')=='True'
             def touch(name):exec_py(broker,f'from pathlib import Path;Path("/network/telegram/{name}").touch()')
             def start_broker():
                 at=time.time();d.start(broker);wait(lambda:(read(broker,'/network/telegram/broker-health.json') or {}).get('at',0)>=at)
             start_broker();d.start(gateway);wait(ready)
             for cid in workers:d.start(cid)
-            touch('phase1');wait(lambda:receipts(2) and len(counts().get('tg',[]))==2 and len(counts().get('max',[]))==2,timeout=30)
-            print('Actual run_isolated_gateway/worker: 2+2 confirmed on '+('native volume' if a.native_volumes else 'bind')+' placement',flush=True)
+            touch('phase1');wait(lambda:receipts(a.tenants) and len(counts().get('tg',[]))==a.tenants and len(counts().get('max',[]))==a.tenants,timeout=45)
+            print(f'Actual run_isolated_gateway/worker: {a.tenants}+{a.tenants} confirmed on '+('native volume' if a.native_volumes else 'bind')+' placement',flush=True)
             if a.load:
-                from app.load_metrics import summarize_load
+                from app.load_metrics import summarize_load,_mib
                 samples=[]
                 def sample():
-                    raw=d.call('stats','--no-stream','--format','{{json .}}',*ids.values());rows=[json.loads(x) for x in raw.splitlines()];samples.append({'resources':rows,'inbox':ledger(gateway,'/registry/inbox.sqlite3','telegram_ingress'),'egress':ledger(gateway,'/registry/telegram-egress.sqlite3','telegram_egress')})
+                    raw=d.call('stats','--no-stream','--format','{{json .}}',*ids.values());rows=[json.loads(x) for x in raw.splitlines()];
+                    if sum(_mib(x['MemUsage'].split('/')[0]) for x in rows)>1024 or sum(float(x['CPUPerc'].rstrip('%')) for x in rows)>250:raise RuntimeError('Synthetic load resource stop limit exceeded')
+                    samples.append({'resources':rows,'inbox':ledger(gateway,'/registry/inbox.sqlite3','telegram_ingress'),'egress':ledger(gateway,'/registry/telegram-egress.sqlite3','telegram_egress')})
                 sample();baseline=samples.pop()
                 begin=time.monotonic();exec_py(broker,f'from pathlib import Path;Path("/network/telegram/load-count").write_text({str(a.load)!r})')
-                target=2+2*a.load;deadline=begin+60
+                target=a.tenants*(1+a.load);deadline=begin+60
                 while True:
                     sample();last=samples[-1]
                     if last['inbox']=={'ACKED':target} and last['egress']=={'SENT':target}:break
                     if time.monotonic()>deadline:raise RuntimeError('Load did not drain')
-                expected_max=[[i,f'incoming-{i}-0'] for i in range(2)]+[[i,f'load-in-{i}-{j}'] for i in range(2) for j in range(a.load)]
-                expected_tg=[[-10000-i,f'outgoing-{i}'] for i in range(2)]+[[-10000-i,f'load-out-{i}-{j}'] for i in range(2) for j in range(a.load)]
+                expected_max=[[i,f'incoming-{i}-0'] for i in range(a.tenants)]+[[i,f'load-in-{i}-{j}'] for i in range(a.tenants) for j in range(a.load)]
+                expected_tg=[[-10000-i,f'outgoing-{i}'] for i in range(a.tenants)]+[[-10000-i,f'load-out-{i}-{j}'] for i in range(a.tenants) for j in range(a.load)]
                 result=counts();assert sorted(result['max'])==sorted(expected_max) and sorted(result['tg'])==sorted(expected_tg)
                 wait(lambda:all(ledger(cid,'/state/to-telegram.sqlite3','worker_telegram_intents')=={'SENT':a.load+1} for cid in workers),timeout=15)
-                print('LOAD RESULT '+json.dumps(summarize_load(a.load,baseline,samples,result['load_effects'],time.monotonic()-begin),sort_keys=True),flush=True)
+                print('LOAD RESULT '+json.dumps(summarize_load(a.load,baseline,samples,result['load_effects'],time.monotonic()-begin,tenants=a.tenants),sort_keys=True),flush=True)
                 return
             worker_starts={sid:d.inspect(plan['services']['worker-'+sid]['container_name'])['State']['StartedAt'] for sid in sids}
             # Broker-only crash: real gateway polling must stay alive, hold

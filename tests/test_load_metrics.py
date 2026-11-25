@@ -18,3 +18,12 @@ def test_burst_measurements_and_sampled_pending():
         with pytest.raises(ValueError):summarize_load(1,sample(),[sample()],malformed,4)
     bad=deepcopy(sample());bad['resources'].pop()
     with pytest.raises(ValueError):summarize_load(1,sample(),[bad],effects,4)
+
+
+def test_larger_cohort_requires_all_workers_and_effects():
+    n=4;baseline=sample();baseline['resources'] += [dict(baseline['resources'][-1],Name='m2tg-placement-'+('d'*24)+'-worker-'+(x*24)) for x in ('c','e')]
+    effects=[[f'load-{d}-{i}-0',float(i+1)] for d in ('in','out') for i in range(n)]
+    result=summarize_load(1,baseline,[deepcopy(baseline)],effects,5,tenants=n)
+    assert result['messages']==8 and result['tenants']==4 and len(result['resources'])==6
+    with pytest.raises(ValueError):summarize_load(1,baseline,[sample()],effects,5,tenants=n)
+    with pytest.raises(ValueError):summarize_load(1,baseline,[baseline],effects,5,tenants=8)

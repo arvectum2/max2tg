@@ -88,3 +88,5 @@ jobs:
         run: python3 scripts/test-placed-runtime.py --image max2tg:ci
       - name: Measure bounded synthetic two-tenant text burst
         run: python3 scripts/test-placed-runtime.py --image max2tg:ci --native-volumes --load 20
+      - name: Verify four-tenant bounded text burst
+        run: python3 scripts/test-placed-runtime.py --image max2tg:ci --native-volumes --load 20 --tenants 4
