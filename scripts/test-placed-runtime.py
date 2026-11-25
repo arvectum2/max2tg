@@ -7,7 +7,7 @@ from app.deployment_plan import build_plan,_verify_stopped,validate_bind_sources
 from app.container_supervisor import DockerBackend
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--image',required=True);p.add_argument('--native-volumes',action='store_true');a=p.parse_args();d=DockerBackend();code=Path(__file__).resolve().parents[1];image=d.call('image','inspect','--format','{{.Id}}',a.image);owner=secrets.token_hex(12);label='max2tg.placement='+owner
+    p=argparse.ArgumentParser();p.add_argument('--image',required=True);p.add_argument('--native-volumes',action='store_true');p.add_argument('--load',type=int,choices=range(1,26));a=p.parse_args();d=DockerBackend();code=Path(__file__).resolve().parents[1];image=d.call('image','inspect','--format','{{.Id}}',a.image);owner=secrets.token_hex(12);label='max2tg.placement='+owner
     with tempfile.TemporaryDirectory(prefix='runtime-',dir=code) as td:
         root=Path(td).resolve();fixture=root/'fixture';fixture.mkdir(mode=0o700);cert=root/'cert';cert.mkdir();subprocess.run(['openssl','req','-x509','-newkey','rsa:2048','-nodes','-days','1','-subj','/CN=synthetic','-addext','subjectAltName=DNS:api.oneme.ru,DNS:api.telegram.org','-keyout',str(cert/'key.pem'),'-out',str(cert/'cert.pem')],check=True,capture_output=True);(cert/'key.pem').chmod(0o644)
         plan=None;ids={};vol={};initname='m2tg-placement-'+owner+'-init'
@@ -69,6 +69,24 @@ def main():
             for cid in workers:d.start(cid)
             touch('phase1');wait(lambda:receipts(2) and len(counts().get('tg',[]))==2 and len(counts().get('max',[]))==2,timeout=30)
             print('Actual run_isolated_gateway/worker: 2+2 confirmed on '+('native volume' if a.native_volumes else 'bind')+' placement',flush=True)
+            if a.load:
+                from app.load_metrics import summarize_load
+                samples=[]
+                def sample():
+                    raw=d.call('stats','--no-stream','--format','{{json .}}',*ids.values());rows=[json.loads(x) for x in raw.splitlines()];samples.append({'resources':rows,'inbox':ledger(gateway,'/registry/inbox.sqlite3','telegram_ingress'),'egress':ledger(gateway,'/registry/telegram-egress.sqlite3','telegram_egress')})
+                sample();baseline=samples.pop()
+                begin=time.monotonic();exec_py(broker,f'from pathlib import Path;Path("/network/telegram/load-count").write_text({str(a.load)!r})')
+                target=2+2*a.load;deadline=begin+60
+                while True:
+                    sample();last=samples[-1]
+                    if last['inbox']=={'ACKED':target} and last['egress']=={'SENT':target}:break
+                    if time.monotonic()>deadline:raise RuntimeError('Load did not drain')
+                expected_max=[[i,f'incoming-{i}-0'] for i in range(2)]+[[i,f'load-in-{i}-{j}'] for i in range(2) for j in range(a.load)]
+                expected_tg=[[-10000-i,f'outgoing-{i}'] for i in range(2)]+[[-10000-i,f'load-out-{i}-{j}'] for i in range(2) for j in range(a.load)]
+                result=counts();assert sorted(result['max'])==sorted(expected_max) and sorted(result['tg'])==sorted(expected_tg)
+                wait(lambda:all(ledger(cid,'/state/to-telegram.sqlite3','worker_telegram_intents')=={'SENT':a.load+1} for cid in workers),timeout=15)
+                print('LOAD RESULT '+json.dumps(summarize_load(a.load,baseline,samples,result['load_effects'],time.monotonic()-begin),sort_keys=True),flush=True)
+                return
             worker_starts={sid:d.inspect(plan['services']['worker-'+sid]['container_name'])['State']['StartedAt'] for sid in sids}
             # Broker-only crash: real gateway polling must stay alive, hold
             # delivery until a successful poll and refreshed forum evidence.
@@ -107,6 +125,7 @@ def main():
                 for v in vol.values():
                     if d.volume(v).get('Labels',{}).get('max2tg.placement')==owner:d.call('volume','rm',v)
                 assert not d.call('volume','ls','-q','--filter','label='+label)
+                if a.load:print('LOAD CLEANUP PASS',flush=True)
             else:subprocess.run(['docker','run','--rm',*setup_args(),'-c','import shutil;from pathlib import Path;[(shutil.rmtree(p) if p.is_dir() else p.unlink()) for p in Path("/fixture").iterdir()]'],check=True,capture_output=True,timeout=60)
     print('PLACED RUNTIME PASS; disposable resources removed',flush=True)
 if __name__=='__main__':main()
