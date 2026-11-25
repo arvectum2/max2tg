@@ -67,6 +67,7 @@ def capture_delivery_state(registry,workers,output,anchor:RecoveryAnchor,*,name,
     with ExitStack() as stack:
         a=RuntimeLock(anchor.root/'backup.lock');stack.callback(a.close)
         _lock(stack,root,'shared-gateway.lock')
+        _lock(stack,root,'shared-provisioning.lock')
         for sid in sorted(states):_lock(stack,states[sid],'worker.lock')
         with closing(sqlite3.connect(_file(root,'capsules.sqlite3').as_uri()+'?mode=ro',uri=True)) as db:
             rows=db.execute('SELECT session_id,telegram_mode,credential_mode,tg_chat_id FROM capsules').fetchall()

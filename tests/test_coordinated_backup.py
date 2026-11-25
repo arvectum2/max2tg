@@ -1,5 +1,5 @@
 """Real stopped gateway/worker state, synthetic messenger boundaries."""
-import sqlite3,tempfile
+import sqlite3,tempfile,shutil
 from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace as NS
@@ -13,7 +13,9 @@ from app.shared_gateway_runtime import SharedGatewayRuntime
 from app.isolated_worker_runtime import IsolatedWorkerRuntime
 from app.max_client import MaxMessage
 from app.recovery_manifest import RecoveryAnchor
-from app.coordinated_backup import capture_delivery_state,materialize_verified
+from app.coordinated_backup import capture_delivery_state,materialize_verified,GATEWAY,WORKER
+from app.restored_start_gate import launch_verified_restore
+from app.runtime_lock import RuntimeLock
 from tests.test_shared_onboarding import bot
 from tests.test_shared_gateway_ipc import FakeMaxClient,_telegram_update
 
@@ -56,6 +58,10 @@ async def test_capture_and_materialize_real_stopped_runtime(tmp_path):
             for w in workers:await w.close()
             registry.close()
         assert not list(output.iterdir())
+        provision=RuntimeLock(registry.root/'shared-provisioning.lock',shared=True)
+        try:
+            with pytest.raises(BlockingIOError):capture('snapshot-provisioning')
+        finally:provision.close()
         with pytest.raises(PermissionError,match='every external capsule'):capture('snapshot-partial',workers={sessions[0][0]:states[sessions[0][0]]})
         assert not list(output.iterdir())
         target,record=capture('snapshot-001');assert len(record['manifest'])==11
@@ -66,7 +72,43 @@ async def test_capture_and_materialize_real_stopped_runtime(tmp_path):
         for sid,_,_ in sessions:
             with closing(sqlite3.connect((restored/f'{sid}-to-telegram.sqlite3').as_uri()+'?mode=ro&immutable=1',uri=True)) as db:assert db.execute("SELECT telegram_id FROM worker_telegram_intents WHERE status='SENT'").fetchone()[0]==777
         with pytest.raises(FileExistsError):materialize_verified(target,restores,anchor,name='snapshot-restore')
-        anchor.mark_dirty()
+        # Actual reconstructed runtime layout, independent retained secrets/keys.
+        newroot=base/'newregistry';newroot.mkdir(mode=0o700);(newroot/'tenants').mkdir(mode=0o700)
+        for n in GATEWAY:shutil.copy2(restored/f'gateway-{n}',newroot/n)
+        for n in ('shared-gateway.lock','shared-provisioning.lock'):(newroot/n).touch(mode=0o600)
+        layout={}
+        for i,(sid,actor,forum) in enumerate(sessions):
+            state=base/f'newstate{i}';channel=base/f'newchannel{i}';secret=base/f'newsecret{i}'
+            for p in (state,channel,secret):p.mkdir(mode=0o700)
+            for n in WORKER:shutil.copy2(restored/f'{sid}-{n}',state/n)
+            (state/'worker.lock').touch(mode=0o600);shutil.copy2(states[sid]/'key',state/'key')
+            capsule=newroot/'tenants'/sid;capsule.mkdir(mode=0o700);shutil.copy2(state/'key',capsule/'telegram-ipc.key')
+            shutil.copy2(base/f'secret{i}'/'max.json',secret/'max.json');layout[sid]=(state,channel,secret)
+        async def start():
+            assert anchor._load()['dirty']
+            rr=CapsuleRegistry(newroot);gg=SharedGatewayRuntime(rr,b,channels={sid:p[1] for sid,p in layout.items()},external_only=True);ww=[]
+            try:
+                await gg.start()
+                for sid,actor,forum in sessions:
+                    state,channel,_=layout[sid];w=IsolatedWorkerRuntime(sid,state,channel,state/'key',forum,actor,Max());ww.append(w);await w.start()
+                    await w.on_message(MaxMessage(chat_id=42,message_id='123',text='synthetic outgoing'));await w.drain_once()
+                await gg.drain_once();assert gg.egress.counts()=={'SENT':2};assert gg.inbox.counts()=={'ACKED':2};return 'started'
+            finally:
+                for w in ww:await w.close()
+                await gg.close();rr.close()
+        unexpected=AsyncMock(side_effect=AssertionError('Must not start'))
+        k=layout[sessions[0][0]][0]/'key';original=k.read_bytes();k.write_bytes(b'z'*32)
+        with pytest.raises(PermissionError,match='IPC key mismatch'):await launch_verified_restore(anchor,newroot,layout,start=unexpected)
+        k.write_bytes(original)
+        sidecar=newroot/'inbox.sqlite3-wal';sidecar.touch(mode=0o600)
+        with pytest.raises(PermissionError,match='sidecar'):await launch_verified_restore(anchor,newroot,layout,start=unexpected)
+        sidecar.unlink()
+        corrupt=newroot/'inbox.sqlite3';original=corrupt.read_bytes();corrupt.write_bytes(original+b'x')
+        with pytest.raises(PermissionError,match='differs'):await launch_verified_restore(anchor,newroot,layout,start=unexpected)
+        corrupt.write_bytes(original);unexpected.assert_not_awaited();assert not anchor._load()['dirty']
+        assert await launch_verified_restore(anchor,newroot,layout,start=start)=='started'
+        with pytest.raises(PermissionError,match='Dirty anchor'):await launch_verified_restore(anchor,newroot,layout,start=unexpected)
+        unexpected.assert_not_awaited()
         with pytest.raises(PermissionError,match='Dirty epoch'):capture('snapshot-dirty')
         assert not (output/'snapshot-dirty').exists()
         with pytest.raises(PermissionError):materialize_verified(target,restores,anchor,name='snapshot-denied')

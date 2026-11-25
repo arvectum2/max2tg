@@ -103,3 +103,24 @@ def test_local_worker_provision_resume_and_key_conflict(tmp_path):
     assert (state/'key').read_bytes()==key
     with pytest.raises(PermissionError,match='conflict'):prepare_worker(*folders,sid,202,FORUM,key)
     with pytest.raises(ValueError,match='Overlapping'):prepare_worker(state,state,secret,sid,ACTOR,FORUM,key)
+
+
+@pytest.mark.asyncio
+async def test_provisioning_write_fence_holds_across_await(tmp_path):
+    import asyncio
+    from app.runtime_lock import RuntimeLock
+    r=CapsuleRegistry(tmp_path/'registry');o=SharedOnboarding(r);b=bot();sid=o.reserve(REQ,ACTOR,FORUM);entered=asyncio.Event();release=asyncio.Event()
+    async def count(*args):entered.set();await release.wait();return 2
+    b.get_chat_member_count.side_effect=count
+    try:
+        t=asyncio.create_task(o.verify_forum(REQ,b));await asyncio.wait_for(entered.wait(),2)
+        with pytest.raises(BlockingIOError):RuntimeLock(r.root/'shared-provisioning.lock')
+        release.set();assert await t=='FORUM_VERIFIED'
+        lock=RuntimeLock(r.root/'shared-provisioning.lock')
+        try:
+            with pytest.raises(BlockingIOError):o.reserve('b'*24,202,-100002)
+            with pytest.raises(BlockingIOError):o.revoke(REQ)
+            with pytest.raises(BlockingIOError):await o.verify_forum(REQ,b)
+        finally:lock.close()
+        assert r.get(sid)['desired_active']==0 and len(r.list_capsules())==1
+    finally:r.close()
