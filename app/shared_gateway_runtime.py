@@ -107,9 +107,8 @@ class SharedGatewayRuntime:
     async def reconcile_channels(self):
         """Only pre-mounted channels; never mounts paths or accepts tenant input."""
         if not self.managed or not self.started:raise RuntimeError('Managed gateway not started')
+        await self.guard.refresh(self._desired_channels())
         async with self._drain_lock:
-            active=self._desired_channels()
-            await self.guard.refresh(active)
             active={sid for sid in self._desired_channels() if self.guard.allowed(sid)}
             for server in self.servers:
                 sid=server.bound_sid
@@ -173,14 +172,19 @@ class SharedGatewayRuntime:
                 await asyncio.sleep(.05)
         async def drains():
             while not stop.is_set():
-                if self.managed:await self.reconcile_channels()
                 await self.drain_once()
                 try:await asyncio.wait_for(stop.wait(),1)
+                except asyncio.TimeoutError:pass
+        async def checks():
+            while not stop.is_set():
+                await self.reconcile_channels()
+                try:await asyncio.wait_for(stop.wait(),.2)
                 except asyncio.TimeoutError:pass
         tasks=[]
         try:
             await self.start()
             tasks=[asyncio.create_task(polls()),asyncio.create_task(drains()),asyncio.create_task(stop.wait())]
+            if self.managed:tasks.append(asyncio.create_task(checks()))
             done,_=await asyncio.wait(tasks,return_when=asyncio.FIRST_COMPLETED)
             for task in done:await task
         finally:
