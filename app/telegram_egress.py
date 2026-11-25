@@ -171,71 +171,96 @@ class TelegramEgress:
         call and is therefore UNKNOWN; never automatically retry it.
         """
         async with self._lock:
-            row = self.row(sid, source_key)
-            if row is None:
-                return "MISSING"
-            if row["status"] != "QUEUED":
-                return row["status"]
-            if (self.topic_scoped and row["max_chat_id"] is None) or self._route(sid) != row["tg_chat_id"] or (row["max_chat_id"] is not None and self.plane.topic_route(sid,row["max_chat_id"])!=(row["tg_chat_id"],row["thread_id"])):
-                self.db.execute(
-                    "UPDATE telegram_egress SET status='BLOCKED',updated_at=? "
-                    "WHERE session_id=? AND source_key=? AND status='QUEUED'",
-                    (time.time(), sid, source_key),
-                )
-                return "BLOCKED"
-            if self.dispatch_allowed is not None and not self.dispatch_allowed(sid):return 'QUEUED'
-            # The compare-and-swap prevents sending the same event from
-            # competing egress instances sharing the same SQLite file.
-            claim = self.db.execute(
-                "UPDATE telegram_egress SET status='SENDING',updated_at=? "
+            return await self._send_one(bot,sid,source_key)
+
+    async def _send_one(self,bot,sid,source_key):
+        # Caller owns the ledger's exclusive drain lock. Parallel batches
+        # must assign each session to exactly one task.
+        row = self.row(sid, source_key)
+        if row is None:
+            return "MISSING"
+        if row["status"] != "QUEUED":
+            return row["status"]
+        if (self.topic_scoped and row["max_chat_id"] is None) or self._route(sid) != row["tg_chat_id"] or (row["max_chat_id"] is not None and self.plane.topic_route(sid,row["max_chat_id"])!=(row["tg_chat_id"],row["thread_id"])):
+            self.db.execute(
+                "UPDATE telegram_egress SET status='BLOCKED',updated_at=? "
                 "WHERE session_id=? AND source_key=? AND status='QUEUED'",
                 (time.time(), sid, source_key),
             )
-            if claim.rowcount != 1:
-                return self.row(sid, source_key)["status"]
-            def still_allowed():
-                return (self.dispatch_allowed is None or self.dispatch_allowed(sid)) and self._route(sid)==row['tg_chat_id'] and (row['max_chat_id'] is None or self.plane.topic_route(sid,row['max_chat_id'])==(row['tg_chat_id'],row['thread_id']))
-            age(self.profile,"egress.pending_age",row["created_at"])
-            try:
-                with measure(self.profile,"egress.send_total"):
-                    response = await bot.send_message(
-                        chat_id=int(row["tg_chat_id"]),
-                        text=row["text"],
-                        parse_mode=None,
-                        **({'before':still_allowed} if isinstance(bot,BudgetedBot) else {}),
-                        **({"message_thread_id":row["thread_id"]} if row["thread_id"] is not None else {}),
-                    )
-            except ApiDeferred:
-                # Only the local budget proves that no API invocation occurred.
-                self.db.execute("UPDATE telegram_egress SET status='QUEUED',updated_at=? WHERE session_id=? AND source_key=? AND status='SENDING'",(time.time(),sid,source_key))
-                return self.row(sid,source_key)['status']
-            except asyncio.CancelledError:
-                self._uncertain(sid, source_key)
-                raise
-            except Exception:
-                self._uncertain(sid, source_key)
-                return "UNKNOWN"
-            message_id = getattr(response, "message_id", None)
-            response_chat = getattr(response, "chat", None)
-            if (type(message_id) is not int or message_id <= 0
-                or response_chat is not None and
-                getattr(response_chat, "id", None) != int(row["tg_chat_id"])
-                or row["thread_id"] is not None and (getattr(response_chat,"id",None)!=int(row["tg_chat_id"]) or getattr(response,"message_thread_id",None)!=row["thread_id"])):
-                self._uncertain(sid, source_key)
-                return "UNKNOWN"
-            updated = self.db.execute(
-                "UPDATE telegram_egress SET status='SENT',telegram_id=?,updated_at=? "
-                "WHERE session_id=? AND source_key=? AND status='SENDING'",
-                (message_id, time.time(), sid, source_key),
-            )
-            # Another gateway instance may have restarted and converted a
-            # stale SENDING to UNKNOWN while the Bot API call was in flight.
-            # Never claim SENT unless the durable transition actually landed.
-            if updated.rowcount != 1:
-                return self.row(sid, source_key)["status"]
-            return "SENT"
+            return "BLOCKED"
+        if self.dispatch_allowed is not None and not self.dispatch_allowed(sid):return 'QUEUED'
+        # The compare-and-swap prevents sending the same event from
+        # competing egress instances sharing the same SQLite file.
+        claim = self.db.execute(
+            "UPDATE telegram_egress SET status='SENDING',updated_at=? "
+            "WHERE session_id=? AND source_key=? AND status='QUEUED'",
+            (time.time(), sid, source_key),
+        )
+        if claim.rowcount != 1:
+            return self.row(sid, source_key)["status"]
+        def still_allowed():
+            return (self.dispatch_allowed is None or self.dispatch_allowed(sid)) and self._route(sid)==row['tg_chat_id'] and (row['max_chat_id'] is None or self.plane.topic_route(sid,row['max_chat_id'])==(row['tg_chat_id'],row['thread_id']))
+        age(self.profile,"egress.pending_age",row["created_at"])
+        try:
+            with measure(self.profile,"egress.send_total"):
+                response = await bot.send_message(
+                    chat_id=int(row["tg_chat_id"]),
+                    text=row["text"],
+                    parse_mode=None,
+                    **({'before':still_allowed} if isinstance(bot,BudgetedBot) else {}),
+                    **({"message_thread_id":row["thread_id"]} if row["thread_id"] is not None else {}),
+                )
+        except ApiDeferred:
+            # Only the local budget proves that no API invocation occurred.
+            self.db.execute("UPDATE telegram_egress SET status='QUEUED',updated_at=? WHERE session_id=? AND source_key=? AND status='SENDING'",(time.time(),sid,source_key))
+            return self.row(sid,source_key)['status']
+        except asyncio.CancelledError:
+            self._uncertain(sid, source_key)
+            raise
+        except Exception:
+            self._uncertain(sid, source_key)
+            return "UNKNOWN"
+        message_id = getattr(response, "message_id", None)
+        response_chat = getattr(response, "chat", None)
+        if (type(message_id) is not int or message_id <= 0
+            or response_chat is not None and
+            getattr(response_chat, "id", None) != int(row["tg_chat_id"])
+            or row["thread_id"] is not None and (getattr(response_chat,"id",None)!=int(row["tg_chat_id"]) or getattr(response,"message_thread_id",None)!=row["thread_id"])):
+            self._uncertain(sid, source_key)
+            return "UNKNOWN"
+        updated = self.db.execute(
+            "UPDATE telegram_egress SET status='SENT',telegram_id=?,updated_at=? "
+            "WHERE session_id=? AND source_key=? AND status='SENDING'",
+            (message_id, time.time(), sid, source_key),
+        )
+        # Another gateway instance may have restarted and converted a
+        # stale SENDING to UNKNOWN while the Bot API call was in flight.
+        # Never claim SENT unless the durable transition actually landed.
+        if updated.rowcount != 1:
+            return self.row(sid, source_key)["status"]
+        return "SENT"
 
-    async def drain(self, bot, limit: int = 50, *, exclude=(),fair=False) -> dict[str, int]:
+    async def drain(self, bot, limit: int = 50, *, exclude=(),fair=False,concurrency=1) -> dict[str, int]:
+        if type(concurrency) is not int or not 1<=concurrency<=4:raise ValueError('Invalid sender concurrency')
+        if concurrency>1:
+            if not isinstance(bot,BudgetedBot) or not self.topic_scoped or self.dispatch_allowed is None:raise ValueError('Parallel sending requires scoped budget and authorization')
+            async with self._lock:
+                groups={}
+                for sid,key in self.ready(limit,exclude=exclude,fair=fair):groups.setdefault(sid,[]).append(key)
+                gate=asyncio.Semaphore(concurrency);outcomes={}
+                async def deliver(sid,keys):
+                    async with gate:
+                        for key in keys:
+                            result=await self._send_one(bot,sid,key)
+                            outcomes[result]=outcomes.get(result,0)+1
+                            if result=='QUEUED':break
+                tasks=[asyncio.create_task(deliver(sid,keys)) for sid,keys in groups.items()]
+                try:
+                    if tasks:await asyncio.gather(*tasks)
+                finally:
+                    for task in tasks:task.cancel()
+                    if tasks:await asyncio.gather(*tasks,return_exceptions=True)
+                return outcomes
         outcomes: dict[str, int] = {}
         for sid, source_key in self.ready(limit,exclude=exclude,fair=fair):
             outcome = await self.send_one(bot, sid, source_key)

@@ -380,3 +380,33 @@ async def test_fair_egress_preserves_each_tenant_order(tmp_path):
         assert await ledger.drain(SimpleNamespace(send_message=send),4,fair=True)=={'SENT':4}
         assert calls==[(ca,'a0'),(cb,'b0'),(ca,'a1'),(cb,'b1')]
     finally:close(reg,ledger)
+
+
+@pytest.mark.asyncio
+async def test_parallel_scoped_drain_cancellation_and_order(tmp_path):
+    from app.telegram_budget import TelegramBudget,BudgetedBot
+    reg,plane,ledger,((a,actor,ca),(b,actor2,cb))=setup(tmp_path)
+    ledger.topic_scoped=True;ledger.dispatch_allowed=lambda sid:True
+    plane.bind_topic(a,42,77,actor);plane.bind_topic(b,42,77,actor2)
+    for sid,prefix in ((a,'a'),(b,'b')):
+        for i in range(2):ledger.enqueue(sid,f'{prefix}{i}',f'{prefix}{i}',max_chat_id=42)
+    entered=asyncio.Event();other_done=asyncio.Event();calls=[]
+    async def send(**kw):
+        calls.append((kw['chat_id'],kw['text']))
+        if kw['text']=='a0':entered.set();await asyncio.Event().wait()
+        if kw['text']=='b1':other_done.set()
+        return SimpleNamespace(message_id=len(calls),chat=SimpleNamespace(id=kw['chat_id']),message_thread_id=77)
+    bot=BudgetedBot(SimpleNamespace(send_message=send),TelegramBudget(reg.db))
+    task=asyncio.create_task(ledger.drain(bot,4,fair=True,concurrency=2))
+    try:
+        await asyncio.wait_for(entered.wait(),2);await asyncio.wait_for(other_done.wait(),2)
+        assert calls==[(ca,'a0'),(cb,'b0'),(cb,'b1')]
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):await task
+        assert ledger.row(a,'a0')['status']=='UNKNOWN' and ledger.row(a,'a1')['status']=='QUEUED'
+        assert ledger.row(b,'b0')['status']==ledger.row(b,'b1')['status']=='SENT'
+        assert await ledger.send_one(bot,a,'a0')=='UNKNOWN' and len(calls)==3
+        assert await ledger.drain(bot,4,fair=True,concurrency=2)=={'SENT':1}
+        assert calls[-1]==(ca,'a1')
+    finally:
+        task.cancel();await asyncio.gather(task,return_exceptions=True);close(reg,ledger)
