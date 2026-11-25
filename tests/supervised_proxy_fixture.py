@@ -1,5 +1,5 @@
 """Actual clients + actual bridge runtimes, synthetic TLS endpoints only."""
-import asyncio,ssl,json,os,sys,signal
+import asyncio,ssl,json,os,sys,signal,time
 from pathlib import Path
 from aiohttp import web,WSMsgType
 from telegram.error import NetworkError
@@ -68,6 +68,7 @@ async def broker():
             servers.append(TunnelServer('max-text' if i<2 else 'telegram',path,connector=connect));await servers[-1].start()
         report();atomic(control/'broker-boot.json',{'boot':sum(counts['auth'])});print('READY',flush=True)
         while not (control/'stop-broker').exists():
+            atomic(control/'broker-health.json',{'pid':os.getpid(),'at':time.time()})
             if (control/'cut-a').exists() and servers[0].server:await servers[0].close();(control/'cut-confirmed').touch()
             if (control/'restore-a').exists() and not servers[0].server and (control/'cut-confirmed').exists():
                 (control/'cut-a').unlink(missing_ok=True);await servers[0].start();(control/'restore-a').unlink()
@@ -86,6 +87,7 @@ async def gateway(sessions):
                 await g.start();print('READY',flush=True)
                 while not Path('/registry/stop').exists():
                     atomic('/registry/lifecycle.json',await g.reconcile_channels())
+                    atomic('/registry/gateway-health.json',{'pid':os.getpid(),'at':time.time()})
                     try:await g.poll_once()
                     except NetworkError:pass
                     await g.drain_once()
