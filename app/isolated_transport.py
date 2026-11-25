@@ -4,13 +4,15 @@ No default personal-client change, no production entrypoint. Caller must
 provide a dedicated broker socket and a network-isolated container.
 """
 from contextlib import asynccontextmanager,AsyncExitStack
-import ssl
+import ssl,asyncio
 import aiohttp
 from telegram import Bot
 from telegram.request import HTTPXRequest
 from app.egress_tunnel import LoopbackProxy
 from app.max_client import MaxClient
 from app.worker_secrets import load_worker_secret
+from app.telegram_budget import TelegramBudget,BudgetedBot,ApiDeferred
+from telegram.error import RetryAfter
 
 
 def verified_context(context=None):
@@ -43,7 +45,7 @@ async def isolated_max_client(socket_path,secret_dir,sid,*,context=None):
 
 
 @asynccontextmanager
-async def isolated_telegram_bot(socket_path,token,*,context=None):
+async def isolated_telegram_bot(socket_path,token,*,context=None,budget=None):
     ctx=verified_context(context);proxy=LoopbackProxy(socket_path);requests=[]
     async with AsyncExitStack() as stack:
         stack.push_async_callback(proxy.close)
@@ -53,8 +55,15 @@ async def isolated_telegram_bot(socket_path,token,*,context=None):
             requests.append(req);stack.push_async_callback(req.shutdown)
         bot=Bot(token,request=requests[0],get_updates_request=requests[1])
         # initialize validates identity through the same tunnel; no direct fallback.
-        await bot.initialize();stack.push_async_callback(bot.shutdown)
-        yield bot
+        if budget is None:await bot.initialize()
+        else:
+            # Initialization performs a read-only getMe; honor persisted cooldown
+            # before making it, without consuming the dependency crash budget.
+            while True:
+                try:await budget.call(bot.initialize);break
+                except (ApiDeferred,RetryAfter):await asyncio.sleep(max(.05,min(1,budget.remaining)))
+        stack.push_async_callback(bot.shutdown)
+        yield BudgetedBot(bot,budget) if budget is not None else bot
 
 
 async def run_isolated_worker(stop,*,socket_path,secret_dir,sid,state,channel,key_file,forum,actor,context=None):
@@ -68,6 +77,6 @@ async def run_isolated_worker(stop,*,socket_path,secret_dir,sid,state,channel,ke
 async def run_isolated_gateway(stop,*,socket_path,token,registry,channels,context=None):
     """Trusted composition; no public entrypoint or production supervisor."""
     from app.shared_gateway_runtime import SharedGatewayRuntime
-    async with isolated_telegram_bot(socket_path,token,context=context) as bot:
+    async with isolated_telegram_bot(socket_path,token,context=context,budget=TelegramBudget(registry.db)) as bot:
         runtime=SharedGatewayRuntime(registry,bot,channels=channels,external_only=True,managed=True)
         await runtime.run(stop)

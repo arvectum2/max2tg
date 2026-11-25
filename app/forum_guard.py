@@ -6,6 +6,7 @@ transport uncertainty holds, never turns an uncertain send into a retry.
 import asyncio,time,math
 from datetime import timedelta
 from telegram.error import RetryAfter
+from app.telegram_budget import BudgetedBot,ApiDeferred
 from app.shared_onboarding import SharedOnboarding,inspect_forum,ForumPolicyViolation
 
 class VerificationCooldown(Exception):
@@ -43,7 +44,7 @@ class ForumGuard:
     def __init__(self,registry,bot,*,ttl=30,clock=time.monotonic,concurrency=4,rate=20):
         if not 1<=ttl<=60:raise ValueError('Invalid forum check interval')
         if type(concurrency) is not int or not 1<=concurrency<=16:raise ValueError("Invalid verification concurrency")
-        self.onboarding=SharedOnboarding(registry);self.bot=PacedVerificationBot(bot,rate=rate);self.ttl=ttl;self.clock=clock;self.concurrency=concurrency
+        self.onboarding=SharedOnboarding(registry);self.bot=bot if isinstance(bot,BudgetedBot) else PacedVerificationBot(bot,rate=rate);self.ttl=ttl;self.clock=clock;self.concurrency=concurrency
         self.failures={}
         self.valid={};self.next_check={};self.generation={};self.status={};self.lock=asyncio.Lock()
 
@@ -93,9 +94,9 @@ class ForumGuard:
         except ForumPolicyViolation:
             if current():
                 self.valid.pop(sid,None);self.onboarding.revoke(row['request_id']);self.status[sid]='REVOKED';self.next_check.pop(sid,None)
-        except VerificationCooldown:
+        except (VerificationCooldown,ApiDeferred,RetryAfter):
             if current():
-                self.valid.pop(sid,None);self.status[sid]='RATE_LIMITED';self.next_check[sid]=self.clock()+max(1,self.bot.cooldown-self.bot.clock())
+                self.valid.pop(sid,None);self.status[sid]='RATE_LIMITED';self.next_check[sid]=self.clock()+max(1,self._remaining())
         except Exception:
             if current():
                 self.valid.pop(sid,None);self.status[sid]='UNAVAILABLE';n=self.failures.get(sid,0)+1;self.failures[sid]=n;self.next_check[sid]=self.clock()+min(60,5*2**min(n-1,4))
@@ -104,12 +105,16 @@ class ForumGuard:
                 self.failures.pop(sid,None);self.valid[sid]=now+self.ttl
                 self.next_check[sid]=now+self.ttl*0.7;self.status[sid]='VERIFIED'
 
+    def _remaining(self):
+        if isinstance(self.bot,BudgetedBot):return self.bot.budget.remaining
+        return max(0,self.bot.cooldown-self.bot.clock())
+
     async def refresh(self,active):
         """One fair, bounded wave. Unchecked sessions never get a lease."""
         async with self.lock:
             for sid in set(self.valid)-set(active):self.valid.pop(sid,None)
             now=self.clock()
-            if self.bot.clock()<self.bot.cooldown:return
+            if self._remaining():return
             rows=[dict(r) for r in self.onboarding.db.execute("SELECT * FROM shared_onboarding WHERE stage='ACTIVE'") if r['sid'] in active and now>=self.next_check.get(r['sid'],-1)]
             rows.sort(key=lambda r:(self.next_check.get(r['sid'],-1),r['sid']))
             tasks=[asyncio.create_task(self._check(row)) for row in rows[:self.concurrency]]

@@ -14,6 +14,7 @@ import re
 import sqlite3
 import time
 
+from app.telegram_budget import BudgetedBot,ApiDeferred
 from app.telegram_control_plane import TelegramControlPlane
 
 SOURCE_KEY = re.compile(r"^[A-Za-z0-9:_./-]{1,128}$")
@@ -187,13 +188,20 @@ class TelegramEgress:
             )
             if claim.rowcount != 1:
                 return self.row(sid, source_key)["status"]
+            def still_allowed():
+                return (self.dispatch_allowed is None or self.dispatch_allowed(sid)) and self._route(sid)==row['tg_chat_id'] and (row['max_chat_id'] is None or self.plane.topic_route(sid,row['max_chat_id'])==(row['tg_chat_id'],row['thread_id']))
             try:
                 response = await bot.send_message(
                     chat_id=int(row["tg_chat_id"]),
                     text=row["text"],
                     parse_mode=None,
+                    **({'before':still_allowed} if isinstance(bot,BudgetedBot) else {}),
                     **({"message_thread_id":row["thread_id"]} if row["thread_id"] is not None else {}),
                 )
+            except ApiDeferred:
+                # Only the local budget proves that no API invocation occurred.
+                self.db.execute("UPDATE telegram_egress SET status='QUEUED',updated_at=? WHERE session_id=? AND source_key=? AND status='SENDING'",(time.time(),sid,source_key))
+                return self.row(sid,source_key)['status']
             except asyncio.CancelledError:
                 self._uncertain(sid, source_key)
                 raise

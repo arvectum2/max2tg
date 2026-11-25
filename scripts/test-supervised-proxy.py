@@ -68,6 +68,16 @@ def main():
             touch(gateway,'/network/phase3');wait(lambda:progress().get('rows',{}).get('5')=='UNKNOWN' and wp(aid).get('authorized') is True and wp(aid).get('in')=={'SENT':2,'UNKNOWN':1});assert counts()['max'].count([0,'ambiguous-0'])==1
             assert sorted(counts()['max'])==sorted([[0,'incoming-0-0'],[1,'incoming-1-0'],[0,'incoming-0-1'],[1,'incoming-1-1'],[0,'ambiguous-0']]);assert sorted(counts()['tg'])==[[-10001,'outgoing-1'],[-10000,'outgoing-0']]
             assert s.row(a)['cid']==aid and s.row(b)['cid']==bid and all(s.row(x)['attempts']==1 for x in ids);print('Recovered 4 ACKED + 2 SENT, 1 UNKNOWN; no resend, no container restart',flush=True)
+            # Real PTB 429 response, persist before killing gateway. Broker keeps
+            # independent evidence of any premature API request after restart.
+            touch(gateway,'/network/rate-trigger')
+            wait(lambda:progress().get('cooldown',0)>0 and 'rate_until' in counts())
+            assert counts()['early_calls']==0
+            rec=None;d.call('kill','--signal','KILL',gateway)
+            wait(lambda:dep.row('gateway')['status']=='HEALTHY' and dep.row('gateway')['attempts']==3 and counts().get('after_rate') and progress().get('in')=={'ACKED':4,'UNKNOWN':1},timeout=30)
+            assert counts()['early_calls']==0 and len(counts()['max'])==5 and len(counts()['tg'])==2
+            assert all(s.row(x)['attempts']==1 for x in ids)
+            print('Real PTB RetryAfter: no premature API call across gateway restart',flush=True)
             rec=None;manage_dependencies=False
             for sid in ids:s.desired(sid,False)
             wait(lambda:all(s.row(x)['status']=='STOPPED' for x in ids));touch(gateway,'/registry/stop');assert d.call('wait',gateway)=='0';touch(broker,'/nettg/stop-broker');assert d.call('wait',broker)=='0'

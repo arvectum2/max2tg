@@ -12,6 +12,8 @@ from app.telegram_ipc import CapsuleIpcClient
 from app.shared_topic_provision import SharedTopicProvisioner
 from app.capsule_shared_ingress import is_plain_text_update
 from app.forum_guard import ForumGuard
+from app.telegram_budget import TelegramBudget,BudgetedBot,ApiDeferred
+from telegram.error import RetryAfter
 
 async def remove_dead_socket(path):
     """Caller holds exclusive runtime lock. Never unlink a live listener."""
@@ -39,9 +41,12 @@ class SharedGatewayRuntime:
                     path=registry.capsule_dir(row['session_id'])/'credentials.json'
                     if path.exists() or path.is_symlink() or (row['credential_mode']!='external' and row['status']!='UNCONFIGURED'):raise PermissionError('Legacy credentials prohibited in external-only gateway')
                     if row['desired_active'] and row['session_id'] not in channels:raise PermissionError('Active external capsule missing channel')
+            if managed:
+                if isinstance(bot,BudgetedBot) and bot.budget.db is not registry.db:raise PermissionError("Foreign budget")
+                self.bot=bot if isinstance(bot,BudgetedBot) else BudgetedBot(bot,TelegramBudget(registry.db))
             self.plane=TelegramControlPlane(registry)
             self.provisioner=SharedTopicProvisioner(self.plane)
-            self.guard=ForumGuard(registry,bot) if managed else None
+            self.guard=ForumGuard(registry,self.bot) if managed else None
             allowed=self.guard.allowed if self.guard else None
             self.inbox=TelegramInbox(registry.root/'inbox.sqlite3',self.plane,dispatch_allowed=allowed)
             self.egress=TelegramEgress(registry.root/'telegram-egress.sqlite3',self.plane,topic_scoped=True,dispatch_allowed=allowed)
@@ -131,7 +136,10 @@ class SharedGatewayRuntime:
         async with self._poll_lock:
             if not self.started:raise RuntimeError('Gateway not started')
             offset=self._offset()
-            updates=await self.bot.get_updates(offset=offset,limit=100,timeout=timeout,allowed_updates=['message','edited_message','message_reaction','callback_query','chat_member','my_chat_member'])
+            try:updates=await self.bot.get_updates(offset=offset,limit=100,timeout=timeout,allowed_updates=['message','edited_message','message_reaction','callback_query','chat_member','my_chat_member'])
+            except (ApiDeferred,RetryAfter):
+                if not self.managed:raise
+                return 0
             raw=[u.to_dict() if hasattr(u,'to_dict') else u for u in updates]
             ids=[u.get('update_id') if isinstance(u,dict) else None for u in raw]
             if len(ids)>100 or any(type(i) is not int or i<offset or i>=2**63-1 for i in ids) or ids!=sorted(set(ids)):raise ValueError('Invalid polling batch')
@@ -162,14 +170,15 @@ class SharedGatewayRuntime:
         async with self._drain_lock:
             if not self.started:raise RuntimeError('Gateway not started')
             if self.guard and not self.guard.allowed(sid):raise PermissionError('Forum verification unavailable')
-            return await self.provisioner.create(self.bot,sid,max_chat_id,owner,title)
+            return await self.provisioner.create(self.bot,sid,max_chat_id,owner,title,dispatch_allowed=self.guard.allowed if self.guard else None)
 
     async def run(self,stop):
         """Separate polling and delivery loops; fail closed on storage failure."""
         async def polls():
             while not stop.is_set():
                 await self.poll_once(timeout=20)
-                await asyncio.sleep(.05)
+                delay=min(1,self.bot.budget.remaining) if self.managed else 0
+                await asyncio.sleep(max(.05,delay))
         async def drains():
             while not stop.is_set():
                 await self.drain_once()
