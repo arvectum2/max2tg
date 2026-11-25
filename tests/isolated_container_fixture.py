@@ -13,7 +13,7 @@ from app.worker_secrets import install_worker_secret,load_worker_secret,build_ma
 
 UID=65532
 
-async def _prepare():
+async def _prepare(*,defer_second=False):
     for name in ('registry','channel0','channel1','state0','state1','secret0','secret1'):
         p=Path('/'+name);assert p.is_dir() and not list(p.iterdir());p.chmod(0o700)
     r=CapsuleRegistry('/registry');onboarding=SharedOnboarding(r);sessions=[]
@@ -31,8 +31,9 @@ async def _prepare():
         assert prepare_worker(*folders,sid,actor,forum,key) # idempotent local provisioning
         def check(s,a,f,k):return check_worker(*folders,s,a,f,k.read_bytes())
         onboarding.confirm_provisioned(req,check=check);assert not r.get(sid)['desired_active']
-        assert await onboarding.activate(req,bot,check=check)==sid
-        onboarding.plane.bind_topic(sid,42,77,actor)
+        if not (defer_second and i==1):
+            assert await onboarding.activate(req,bot,check=check)==sid
+            onboarding.plane.bind_topic(sid,42,77,actor)
         sessions.append([sid,actor,forum])
     (r.root/'synthetic-bot-secret').write_text('not-a-real-token');(r.root/'synthetic-bot-secret').chmod(0o600)
     r.close()
@@ -42,7 +43,7 @@ async def _prepare():
     print(json.dumps(sessions),flush=True)
 
 
-def prepare():asyncio.run(_prepare())
+def prepare(*,defer_second=False):asyncio.run(_prepare(defer_second=defer_second))
 
 
 def assert_sandbox():
