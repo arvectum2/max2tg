@@ -73,8 +73,10 @@ class GatewayEgressIpcServer:
         self.topic_scoped=topic_scoped
         self.path = egress_ipc_path(registry.root)
         self._server = None
+        self._connections=set()
 
     async def _receive(self, reader, writer):
+        task=asyncio.current_task();self._connections.add(task)
         try:
             frame = await asyncio.wait_for(_read_frame(reader), timeout=6)
             # Untrusted outer envelope is inspected only to locate the key.
@@ -137,6 +139,7 @@ class GatewayEgressIpcServer:
                 await writer.wait_closed()
             except OSError:
                 pass
+            finally:self._connections.discard(task)
 
     async def start(self):
         if self.path.exists() or self.path.is_symlink():
@@ -149,6 +152,9 @@ class GatewayEgressIpcServer:
     async def stop(self):
         if self._server is not None:
             self._server.close()
+            tasks=list(self._connections)
+            for task in tasks:task.cancel()
+            if tasks:await asyncio.gather(*tasks,return_exceptions=True)
             await self._server.wait_closed()
             self._server = None
             if self.path.is_socket():

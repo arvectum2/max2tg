@@ -7,6 +7,7 @@ Payloads contain private content and must stay in a protected local DB.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from pathlib import Path
@@ -166,6 +167,9 @@ class TelegramInbox:
                 "UPDATE telegram_ingress SET status='RECEIVED',updated_at=? "
                 "WHERE update_id=?",(time.time(),update_id))
             return "RECEIVED"
+        except asyncio.CancelledError:
+            self.db.execute("UPDATE telegram_ingress SET status='UNKNOWN',updated_at=? WHERE update_id=? AND status='INFLIGHT'",(time.time(),update_id))
+            raise
         except Exception:
             self.db.execute(
                 "UPDATE telegram_ingress SET status='UNKNOWN',updated_at=? "

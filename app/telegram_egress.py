@@ -22,8 +22,9 @@ SOURCE_KEY = re.compile(r"^[A-Za-z0-9:_./-]{1,128}$")
 class TelegramEgress:
     """A single owner-private SQLite journal under the capsule registry root."""
 
-    def __init__(self, path: str | Path, plane: TelegramControlPlane):
+    def __init__(self, path: str | Path, plane: TelegramControlPlane, *, topic_scoped=False):
         self.plane = plane
+        self.topic_scoped=topic_scoped
         self.path = Path(path).absolute()
         if self.path.parent != plane.capsules.root:
             raise ValueError("Egress database must reside in private registry root")
@@ -101,6 +102,7 @@ class TelegramEgress:
             raise ValueError("Invalid text content")
         if len(text.encode("utf-16-le")) // 2 > 4096:
             raise ValueError("Telegram text too long")
+        if self.topic_scoped and max_chat_id is None:raise PermissionError("Scoped egress requires MAX chat")
         chat = self._route(sid);thread=None
         if max_chat_id is not None:
             max_chat_id=self.plane.max_chat_key(max_chat_id)
@@ -166,7 +168,7 @@ class TelegramEgress:
                 return "MISSING"
             if row["status"] != "QUEUED":
                 return row["status"]
-            if self._route(sid) != row["tg_chat_id"] or (row["max_chat_id"] is not None and self.plane.topic_route(sid,row["max_chat_id"])!=(row["tg_chat_id"],row["thread_id"])):
+            if (self.topic_scoped and row["max_chat_id"] is None) or self._route(sid) != row["tg_chat_id"] or (row["max_chat_id"] is not None and self.plane.topic_route(sid,row["max_chat_id"])!=(row["tg_chat_id"],row["thread_id"])):
                 self.db.execute(
                     "UPDATE telegram_egress SET status='BLOCKED',updated_at=? "
                     "WHERE session_id=? AND source_key=? AND status='QUEUED'",
