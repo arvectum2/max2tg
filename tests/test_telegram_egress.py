@@ -366,3 +366,17 @@ async def test_parallel_gateway_recovery_cannot_create_false_sent_ack(tmp_path):
     bot.send_message.assert_awaited_once()
     recovered.close()
     close(reg, ledger)
+
+@pytest.mark.asyncio
+async def test_fair_egress_preserves_each_tenant_order(tmp_path):
+    reg,_,ledger,((a,_,ca),(b,_,cb))=setup(tmp_path)
+    try:
+        for i in range(6):ledger.enqueue(a,f'a{i}',f'a{i}')
+        for i in range(2):ledger.enqueue(b,f'b{i}',f'b{i}')
+        assert ledger.ready(4,fair=True)==[(a,'a0'),(b,'b0'),(a,'a1'),(b,'b1')]
+        assert ledger.ready(2,exclude={a},fair=True)==[(b,'b0'),(b,'b1')]
+        calls=[]
+        async def send(**kw):calls.append((kw['chat_id'],kw['text']));return SimpleNamespace(message_id=len(calls))
+        assert await ledger.drain(SimpleNamespace(send_message=send),4,fair=True)=={'SENT':4}
+        assert calls==[(ca,'a0'),(cb,'b0'),(ca,'a1'),(cb,'b1')]
+    finally:close(reg,ledger)

@@ -182,6 +182,10 @@ class SharedGatewayRuntime:
         async with self._drain_lock:
             if not self.started:raise RuntimeError('Gateway not started')
             held=(self._desired_channels() if self.poll_failures else self.guard.held_sessions()) if self.guard else ()
+            if self.managed:
+                # Small rounds release the lifecycle lock often. Only separate
+                # worker IPCs run concurrently; Bot API sends remain serial.
+                return {'ingress':await self.engine.drain(32,exclude=held,concurrency=4,fair=True),'egress':await self.engine.drain_egress(self.bot,16,exclude=held,fair=True)}
             return {'ingress':await self.engine.drain(exclude=held),'egress':await self.engine.drain_egress(self.bot,exclude=held)}
 
     async def provision_topic(self,sid,max_chat_id,owner,title):
@@ -201,8 +205,9 @@ class SharedGatewayRuntime:
                 except asyncio.TimeoutError:pass
         async def drains():
             while not stop.is_set():
-                await self.drain_once()
-                try:await asyncio.wait_for(stop.wait(),1)
+                result=await self.drain_once()
+                progress=any(result[d].get(s,0) for d in ("ingress","egress") for s in ("ACKED","SENT","UNKNOWN","BLOCKED"))
+                try:await asyncio.wait_for(stop.wait(),.05 if self.managed and progress else 1)
                 except asyncio.TimeoutError:pass
         async def checks():
             while not stop.is_set():

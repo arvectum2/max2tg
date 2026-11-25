@@ -117,3 +117,29 @@ async def test_gateway_run_stop_and_cancelled_ingress(shared_setup):
         with pytest.raises(asyncio.CancelledError):await task
         assert g.inbox.counts()=={'UNKNOWN':1};assert (await g.drain_once())['ingress']=={}
     finally:await g.close()
+
+@pytest.mark.asyncio
+async def test_parallel_ingress_fair_and_ordered_with_unavailable_worker(shared_setup):
+    from app.telegram_inbox import WorkerUnavailable
+    reg,plane,old,_,sessions=shared_setup;old.close();b=bot();g=SharedGatewayRuntime(reg,b);await g.start()
+    a,actor,forum=sessions[0];other,actor2,forum2=sessions[1];plane.bind_topic(a,42,77,actor);plane.bind_topic(other,42,77,actor2)
+    try:
+        b.get_updates.return_value=[_telegram_update(i,actor,forum,77,'a') for i in range(1,7)]+[_telegram_update(7,actor2,forum2,77,'b'),_telegram_update(8,actor2,forum2,77,'b')];await g.poll_once()
+        assert g.inbox.ready(4,fair=True)==[1,7,2,8]
+        entered=asyncio.Event();release=asyncio.Event();seen=[]
+        async def deliver(sid,u):
+            seen.append((sid,u['update_id']))
+            if sid==a:await release.wait();raise WorkerUnavailable()
+            entered.set();return True
+        g.engine.deliver=deliver;task=asyncio.create_task(g.engine.drain(4,concurrency=2,fair=True))
+        try:
+            await asyncio.wait_for(entered.wait(),2);assert (a,1) in seen
+        finally:release.set()
+        assert await task=={'ACKED':2,'RECEIVED':1};assert [u for s,u in seen if s==a]==[1];assert [u for s,u in seen if s==other]==[7,8]
+        assert g.inbox.row(2)['status']=='RECEIVED'
+        # Simulate a competing recovery marking a claimed row UNKNOWN;
+        # a late ACK must not overwrite that durable uncertainty.
+        async def late(sid,u):
+            g.inbox.db.execute("UPDATE telegram_ingress SET status='UNKNOWN' WHERE update_id=?",(u['update_id'],));return True
+        assert await g.inbox.dispatch(1,late)=='UNKNOWN';assert g.inbox.row(1)['status']=='UNKNOWN'
+    finally:await g.close()
