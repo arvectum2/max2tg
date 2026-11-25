@@ -32,7 +32,7 @@ async def remove_dead_socket(path):
 class SharedGatewayRuntime:
     def __init__(self,registry,bot,*,channels=None,external_only=False,managed=False,profile=None):
         if managed and (channels is None or not external_only):raise ValueError("Managed mode requires external dedicated channels")
-        self.profile=profile;self.managed=managed;self._opened=set();self.bot_id=None;self.poll_failures=0
+        self.wal_maintenance=None;self.profile=profile;self.managed=managed;self._opened=set();self.bot_id=None;self.poll_failures=0
         self.registry=registry;self.bot=bot;self.lock=RuntimeLock(registry.root/'shared-gateway.lock')
         self.inbox=None;self.egress=None;self.server=None;self.servers=[];self.started=False;self._poll_lock=asyncio.Lock();self._drain_lock=asyncio.Lock()
         try:
@@ -206,6 +206,11 @@ class SharedGatewayRuntime:
             if self.guard and not self._dispatch_allowed(sid):raise PermissionError('Forum verification unavailable')
             return await self.provisioner.create(self.bot,sid,max_chat_id,owner,title,dispatch_allowed=self._dispatch_allowed if self.guard else None)
 
+    def enable_wal_maintenance(self):
+        from app.wal_maintenance import WalMaintenance
+        if not self.managed:raise PermissionError('Managed gateway required')
+        self.wal_maintenance=WalMaintenance((self.registry.db,self.inbox.db,self.egress.db))
+
     async def run(self,stop):
         """Separate polling and delivery loops; fail closed on storage failure."""
         async def polls():
@@ -218,6 +223,7 @@ class SharedGatewayRuntime:
         async def drains():
             while not stop.is_set():
                 result=await self.drain_once()
+                if self.wal_maintenance is not None and not any(result.values()):self.wal_maintenance.idle()
                 progress=any(result[d].get(s,0) for d in ("ingress","egress") for s in ("ACKED","SENT","UNKNOWN","BLOCKED"))
                 try:await asyncio.wait_for(stop.wait(),.05 if self.managed and progress else 1)
                 except asyncio.TimeoutError:pass

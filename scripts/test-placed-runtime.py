@@ -7,7 +7,9 @@ from app.deployment_plan import build_plan,_verify_stopped,validate_bind_sources
 from app.container_supervisor import DockerBackend
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--image',required=True);p.add_argument('--native-volumes',action='store_true');p.add_argument('--load',type=int,choices=range(1,26));p.add_argument('--tenants',type=int,choices=(2,4,8,16),default=2);p.add_argument('--profile',action='store_true');p.add_argument('--long-poll',action='store_true');p.add_argument('--mixed',action='store_true');p.add_argument('--soak',action='store_true');a=p.parse_args();
+    p=argparse.ArgumentParser();p.add_argument('--image',required=True);p.add_argument('--native-volumes',action='store_true');p.add_argument('--load',type=int,choices=range(1,26));p.add_argument('--tenants',type=int,choices=(2,4,8,16),default=2);p.add_argument('--profile',action='store_true');p.add_argument('--long-poll',action='store_true');p.add_argument('--mixed',action='store_true');p.add_argument('--soak',action='store_true');p.add_argument('--storage-check',action='store_true');p.add_argument('--wal-maintenance',action='store_true');a=p.parse_args();
+    if a.storage_check and not a.mixed:p.error('Storage check requires mixed workload')
+    if a.wal_maintenance and not (a.storage_check or a.soak):p.error('WAL candidate requires resource checkpoints')
     if a.soak and not a.mixed:p.error('Soak requires mixed workload')
     if a.mixed and (a.load or not (a.native_volumes and a.profile and a.long_poll)):p.error('Mixed requires native volumes, profile, long-poll and no load')
     if a.long_poll and not ((a.load or a.mixed) and a.profile):p.error('Long polling comparison requires profiled bounded load')
@@ -56,7 +58,9 @@ def main():
                     if a.long_poll:s['command'].append('long-poll')
                     if a.mixed:s['command'].append('mixed')
                     if a.soak:s['command'].append('soak')
-                elif a.profile:s['command'].append('profile')
+                else:
+                    if a.profile:s['command'].append('profile')
+                    if a.wal_maintenance:s['command'].append('wal')
             path=root/'compose.json';path.write_text(json.dumps(plan));cmd=('compose','-f',str(path),'--profile','acceptance-only');d.call(*cmd,'config','--quiet');d.call(*cmd,'create','--no-build','--pull','never')
             for role,s in plan['services'].items():
                 c=d.inspect(s['container_name'])
@@ -111,13 +115,13 @@ def main():
                             by_role[role]=json.loads(d.call('exec',cid,'python','-m','tests.soak_observe',*roots))
                         return by_role
                     checkpoints=[]
-                    if a.soak:checkpoints.append({'at':0,'roles':resources_snapshot()})
+                    if a.soak or a.storage_check:checkpoints.append({'at':0,'roles':resources_snapshot()})
                     begin=time.monotonic();touch('mixed-start');observations=[];deadline=begin+105+90*(cycles-1)
                     while True:
                         sample();last=samples[-1];result=counts()
                         ready_count=int(exec_py(gateway,'from pathlib import Path;print(sum((p/"egress.sock").is_socket() for p in Path("/channels").iterdir()))'))
                         observations.append({'at':time.monotonic()-begin,'pending_in':sum(v for k,v in last['inbox'].items() if k!='ACKED'),'pending_out':sum(v for k,v in last['egress'].items() if k!='SENT'),'ready':ready_count})
-                        if a.soak and len(checkpoints)<=cycles and time.monotonic()-begin>=32+90*(len(checkpoints)-1):
+                        if (a.soak or a.storage_check) and len(checkpoints)<=cycles and time.monotonic()-begin>=32+90*(len(checkpoints)-1):
                             if observations[-1]['pending_in']==observations[-1]['pending_out']==0 and ready_count==a.tenants:
                                 checkpoints.append({'at':round(time.monotonic()-begin,3),'roles':resources_snapshot()})
                         if result.get('mixed_emitted')==2*n and last['inbox']=={'ACKED':target} and last['egress']=={'SENT':target}:break
@@ -130,10 +134,11 @@ def main():
                     metrics['elapsed_s']=round(time.monotonic()-begin,3);metrics['samples']=len(samples);metrics['max_sampled_total_ram_mib']=round(max(sum(_mib(r['MemUsage'].split('/')[0]) for r in s['resources']) for s in samples),2)
                     stages=aggregate_profiles(before,profiles(2));assert stages['gateway']['api.send.call']['count']==n and stages['gateway']['ingress.ipc']['count']>=n
                     metrics['api_calls']={k:v['count'] for k,v in stages['gateway'].items() if k.startswith('api.') and k.endswith('.call')}
-                    if a.soak:
+                    if a.soak or a.storage_check:
                         from tests.soak_observe import summarize_resources
                         checkpoints.append({'at':round(time.monotonic()-begin,3),'roles':resources_snapshot()})
                         metrics['resources']=summarize_resources(checkpoints,cycles=cycles)
+                    metrics['wal_maintenance']=a.wal_maintenance
                     print('MIXED RESULT '+json.dumps(metrics,sort_keys=True),flush=True)
                     print('PROFILE RESULT '+json.dumps(stages,sort_keys=True),flush=True)
                     return

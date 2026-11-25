@@ -33,6 +33,7 @@ class SharedWorkerRuntime:
             self.owner.close();raise
 
     def _init_local(self,state,ipc,server_factory):
+        self.wal_maintenance=None
         self.topics=TopicStore(str(state/'topics.json'),strict=True)
         self.ledger=TelegramOutbound(state/'tg-outbound.sqlite3',self.topics)
         self.egress=CapsuleEgressOutbox(state/'to-telegram.sqlite3',self.sid)
@@ -103,6 +104,10 @@ class SharedWorkerRuntime:
             except (OSError,EOFError,asyncio.TimeoutError,ValueError):return {"ROUTE_UNAVAILABLE":1}
             return await self.listener.drain()
 
+    def enable_wal_maintenance(self):
+        from app.wal_maintenance import WalMaintenance
+        self.wal_maintenance=WalMaintenance((self.ledger.db,self.egress.db))
+
     async def run(self,stop):
         """Drive actual/injected MAX client; cancellation always closes IPC."""
         task=None
@@ -110,7 +115,8 @@ class SharedWorkerRuntime:
             await self.start();task=asyncio.create_task(self.client.run())
             while not stop.is_set():
                 if task.done():await task;raise RuntimeError('MAX client exited')
-                await self.drain_once()
+                result=await self.drain_once()
+                if self.wal_maintenance is not None and not result:self.wal_maintenance.idle()
                 try:await asyncio.wait_for(stop.wait(),1)
                 except asyncio.TimeoutError:pass
         finally:

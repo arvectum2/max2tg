@@ -17,7 +17,7 @@ def test_three_cycles_unique_receipts_and_idle_gates():
 
 def test_resource_checkpoints_compare_idle_not_transient():
     from tests.soak_observe import summarize_resources
-    def c(at,fds,db):return {'at':at,'roles':{'gateway':dict(fds=fds,sockets=3,threads=1,rss_kib=40000,db_bytes=db,db_files=3)}}
+    def c(at,fds,db):return {'at':at,'roles':{'gateway':dict(fds=fds,sockets=3,threads=1,rss_kib=40000,db_bytes=db,db_files=3,db_main_bytes=db,wal_bytes=0,shm_bytes=0)}}
     points=[c(0,20,100),c(35,10,200),c(125,11,300),c(215,10,400),c(255,20,500)]
     result=summarize_resources(points,cycles=3);assert result['max_idle_fd_growth_per_role']==0 and result['checkpoints'][-1]['db_bytes']==500
     with pytest.raises(ValueError):summarize_resources(points[:-1],cycles=3)
