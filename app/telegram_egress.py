@@ -22,8 +22,9 @@ SOURCE_KEY = re.compile(r"^[A-Za-z0-9:_./-]{1,128}$")
 class TelegramEgress:
     """A single owner-private SQLite journal under the capsule registry root."""
 
-    def __init__(self, path: str | Path, plane: TelegramControlPlane, *, topic_scoped=False):
+    def __init__(self, path: str | Path, plane: TelegramControlPlane, *, topic_scoped=False,dispatch_allowed=None):
         self.plane = plane
+        self.dispatch_allowed=dispatch_allowed
         self.topic_scoped=topic_scoped
         self.path = Path(path).absolute()
         if self.path.parent != plane.capsules.root:
@@ -132,15 +133,16 @@ class TelegramEgress:
         )
         return "QUEUED"
 
-    def ready(self, limit: int = 50) -> list[tuple[str, str]]:
+    def ready(self, limit: int = 50, *, exclude=()) -> list[tuple[str, str]]:
         if type(limit) is not int or not 1 <= limit <= 100:
             raise ValueError("Invalid egress batch limit")
+        excluded=tuple(sorted(exclude));where=' AND session_id NOT IN ('+','.join('?' for _ in excluded)+')' if excluded else ''
         return [
             (r["session_id"], r["source_key"])
             for r in self.db.execute(
                 "SELECT session_id,source_key FROM telegram_egress "
-                "WHERE status='QUEUED' ORDER BY created_at,session_id,source_key "
-                "LIMIT ?", (limit,),
+                "WHERE status='QUEUED' "+where+" ORDER BY created_at,session_id,source_key "
+                "LIMIT ?", (*excluded,limit),
             )
         ]
 
@@ -175,6 +177,7 @@ class TelegramEgress:
                     (time.time(), sid, source_key),
                 )
                 return "BLOCKED"
+            if self.dispatch_allowed is not None and not self.dispatch_allowed(sid):return 'QUEUED'
             # The compare-and-swap prevents sending the same event from
             # competing egress instances sharing the same SQLite file.
             claim = self.db.execute(
@@ -217,9 +220,9 @@ class TelegramEgress:
                 return self.row(sid, source_key)["status"]
             return "SENT"
 
-    async def drain(self, bot, limit: int = 50) -> dict[str, int]:
+    async def drain(self, bot, limit: int = 50, *, exclude=()) -> dict[str, int]:
         outcomes: dict[str, int] = {}
-        for sid, source_key in self.ready(limit):
+        for sid, source_key in self.ready(limit,exclude=exclude):
             outcome = await self.send_one(bot, sid, source_key)
             outcomes[outcome] = outcomes.get(outcome, 0) + 1
         return outcomes

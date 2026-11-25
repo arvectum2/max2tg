@@ -8,6 +8,17 @@ import asyncio,time
 from app.telegram_control_plane import TelegramControlPlane
 from app.telegram_ipc import ensure_ipc_key
 
+class ForumPolicyViolation(PermissionError):
+    """Definitive policy mismatch, not an ambiguous transport exception."""
+
+async def inspect_forum(row,bot):
+    gid=int(row['forum']);actor=int(row['actor']);me=await bot.get_me();bid=getattr(me,'id',None)
+    if type(bid) is not int or bid<=0 or bid==actor:raise ForumPolicyViolation('Invalid bot identity')
+    chat=await bot.get_chat(gid);owner=await bot.get_chat_member(gid,actor);admin=await bot.get_chat_member(gid,bid);count=await bot.get_chat_member_count(gid)
+    valid=(getattr(chat,'id',None)==gid and getattr(chat,'type',None)=='supergroup' and getattr(chat,'is_forum',None) is True and not getattr(chat,'username',None) and not getattr(chat,'active_usernames',None) and not getattr(chat,'linked_chat_id',None) and getattr(getattr(owner,'user',None),'id',None)==actor and getattr(owner,'status',None)=='creator' and getattr(getattr(admin,'user',None),'id',None)==bid and getattr(admin,'status',None)=='administrator' and getattr(admin,'can_manage_topics',None) is True and type(count) is int and count==2)
+    if not valid:raise ForumPolicyViolation('Forum verification failed')
+    return bid
+
 class SharedOnboarding:
     def __init__(self,registry):
         self.registry=registry;self.plane=TelegramControlPlane(registry);self.db=registry.db
@@ -50,11 +61,8 @@ class SharedOnboarding:
         async with self._lock:
             row=self.row(request_id)
             if row['stage']=='REVOKED':raise PermissionError('Revoked onboarding')
-            gid=int(row['forum']);actor=int(row['actor']);me=await bot.get_me();bid=getattr(me,'id',None)
-            if type(bid) is not int or bid<=0 or bid==actor:raise PermissionError('Invalid bot identity')
-            chat=await bot.get_chat(gid);owner=await bot.get_chat_member(gid,actor);admin=await bot.get_chat_member(gid,bid);count=await bot.get_chat_member_count(gid)
-            valid=(getattr(chat,'id',None)==gid and getattr(chat,'type',None)=='supergroup' and getattr(chat,'is_forum',None) is True and not getattr(chat,'username',None) and not getattr(chat,'active_usernames',None) and not getattr(chat,'linked_chat_id',None) and getattr(getattr(owner,'user',None),'id',None)==actor and getattr(owner,'status',None)=='creator' and getattr(getattr(admin,'user',None),'id',None)==bid and getattr(admin,'status',None)=='administrator' and getattr(admin,'can_manage_topics',None) is True and type(count) is int and count==2)
-            if not valid:raise PermissionError('Forum verification failed')
+            bid=await inspect_forum(row,bot)
+            gid=int(row['forum'])
             db=self.db;db.execute('BEGIN IMMEDIATE')
             try:
                 fresh=self.row(request_id)

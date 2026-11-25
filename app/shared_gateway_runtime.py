@@ -11,6 +11,7 @@ from app.telegram_gateway import TelegramGatewayEngine
 from app.telegram_ipc import CapsuleIpcClient
 from app.shared_topic_provision import SharedTopicProvisioner
 from app.capsule_shared_ingress import is_plain_text_update
+from app.forum_guard import ForumGuard
 
 async def remove_dead_socket(path):
     """Caller holds exclusive runtime lock. Never unlink a live listener."""
@@ -40,8 +41,10 @@ class SharedGatewayRuntime:
                     if row['desired_active'] and row['session_id'] not in channels:raise PermissionError('Active external capsule missing channel')
             self.plane=TelegramControlPlane(registry)
             self.provisioner=SharedTopicProvisioner(self.plane)
-            self.inbox=TelegramInbox(registry.root/'inbox.sqlite3',self.plane)
-            self.egress=TelegramEgress(registry.root/'telegram-egress.sqlite3',self.plane,topic_scoped=True)
+            self.guard=ForumGuard(registry,bot) if managed else None
+            allowed=self.guard.allowed if self.guard else None
+            self.inbox=TelegramInbox(registry.root/'inbox.sqlite3',self.plane,dispatch_allowed=allowed)
+            self.egress=TelegramEgress(registry.root/'telegram-egress.sqlite3',self.plane,topic_scoped=True,dispatch_allowed=allowed)
             self.channels=None
             if channels is not None:
                 self.channels={}
@@ -106,6 +109,8 @@ class SharedGatewayRuntime:
         if not self.managed or not self.started:raise RuntimeError('Managed gateway not started')
         async with self._drain_lock:
             active=self._desired_channels()
+            await self.guard.refresh(active)
+            active={sid for sid in self._desired_channels() if self.guard.allowed(sid)}
             for server in self.servers:
                 sid=server.bound_sid
                 if sid not in active and sid in self._opened:
@@ -117,7 +122,7 @@ class SharedGatewayRuntime:
     def lifecycle_snapshot(self):
         if not self.managed or not self.started:raise RuntimeError('Managed gateway not started')
         active=self._desired_channels()
-        return {'at':time.time(),'sessions':{sid:{'active':sid in active,'ready':sid in active and sid in self._opened} for sid in self.channels}}
+        return {'at':time.time(),'sessions':{sid:{'active':sid in active,'ready':sid in active and sid in self._opened and self.guard.allowed(sid)} for sid in self.channels}}
 
 
     def _offset(self):return self.inbox.db.execute('SELECT next_offset FROM polling_checkpoint WHERE singleton=1').fetchone()[0]
@@ -127,10 +132,12 @@ class SharedGatewayRuntime:
         async with self._poll_lock:
             if not self.started:raise RuntimeError('Gateway not started')
             offset=self._offset()
-            updates=await self.bot.get_updates(offset=offset,limit=100,timeout=timeout,allowed_updates=['message','edited_message','message_reaction','callback_query'])
+            updates=await self.bot.get_updates(offset=offset,limit=100,timeout=timeout,allowed_updates=['message','edited_message','message_reaction','callback_query','chat_member','my_chat_member'])
             raw=[u.to_dict() if hasattr(u,'to_dict') else u for u in updates]
             ids=[u.get('update_id') if isinstance(u,dict) else None for u in raw]
             if len(ids)>100 or any(type(i) is not int or i<offset or i>=2**63-1 for i in ids) or ids!=sorted(set(ids)):raise ValueError('Invalid polling batch')
+            if self.guard:
+                for u in raw:self.guard.observe(u)
             count=0;db=self.inbox.db
             db.execute('BEGIN IMMEDIATE')
             try:
@@ -149,11 +156,13 @@ class SharedGatewayRuntime:
     async def drain_once(self):
         async with self._drain_lock:
             if not self.started:raise RuntimeError('Gateway not started')
-            return {'ingress':await self.engine.drain(),'egress':await self.engine.drain_egress(self.bot)}
+            held=self.guard.held_sessions() if self.guard else ()
+            return {'ingress':await self.engine.drain(exclude=held),'egress':await self.engine.drain_egress(self.bot,exclude=held)}
 
     async def provision_topic(self,sid,max_chat_id,owner,title):
         async with self._drain_lock:
             if not self.started:raise RuntimeError('Gateway not started')
+            if self.guard and not self.guard.allowed(sid):raise PermissionError('Forum verification unavailable')
             return await self.provisioner.create(self.bot,sid,max_chat_id,owner,title)
 
     async def run(self,stop):
