@@ -21,7 +21,7 @@ def message(gid,mid,text,actor=900):return {'message_id':mid,'date':1700000000,'
 
 async def broker(network_paths=None):
     assert_sandbox();assert not any(Path(p).exists() for p in ('/keys','/secret','/registry','/keys0','/keys1','/botkeys','/botsecret'));ctx=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER);ctx.load_cert_chain('/cert/cert.pem','/cert/key.pem');paths=network_paths or ['/net0','/net1','/nettg'];control=Path(paths[2])
-    evidence=control/'counts.json';counts=json.loads(evidence.read_text()) if evidence.exists() else {'max':[],'tg':[],'auth':[0,0]};servers=[]
+    evidence=control/'counts.json';counts=json.loads(evidence.read_text()) if evidence.exists() else {'max':[],'tg':[],'auth':[0,0]};servers=[];load_sockets={};load_n=0
     (control/'cut-a').unlink(missing_ok=True);(control/'cut-confirmed').unlink(missing_ok=True)
     def report():atomic(control/'counts.json',counts)
     async def api(req):
@@ -42,8 +42,14 @@ async def broker(network_paths=None):
             phase=2 if (control/'phase2').exists() else 1 if (control/'phase1').exists() else 0
             data=[{'update_id':2*j+i+1,'message':message(-10000-i,100+2*j+i,f'incoming-{i}-{j}',100+i)} for j in range(phase) for i in range(2) if 2*j+i+1>=int(form.get('offset',0))]
             if (control/'phase3').exists() and int(form.get('offset',0))<=5:data.append({'update_id':5,'message':message(-10000,104,'ambiguous-0',100)})
+            if load_n:
+                data.extend({'update_id':3+2*j+i,'message':message(-10000-i,200+2*j+i,f'load-in-{i}-{j}',100+i)} for j in range(load_n) for i in range(2) if 3+2*j+i>=int(form.get('offset',0)))
+                data=data[:100]
         elif method=='sendMessage':
-            text=form['text'];assert int(form['message_thread_id'])==77 and text==f'outgoing-{-10000-gid}';counts['tg'].append([gid,text]);report();data=message(gid,5000+len(counts['tg']),text)
+            text=form['text'];i=-10000-gid;assert i in (0,1) and int(form['message_thread_id'])==77 and (text==f'outgoing-{i}' or text in [f'load-out-{i}-{j}' for j in range(load_n)])
+            counts['tg'].append([gid,text])
+            if text.startswith('load-out-'):counts['load_effects'].append([text,time.time()-counts['load_started']])
+            report();data=message(gid,5000+len(counts['tg']),text)
         else:raise AssertionError('Unexpected method '+method)
         return web.json_response({'ok':True,'result':data})
     def handler(i):
@@ -55,11 +61,14 @@ async def broker(network_paths=None):
                 elif op==OpCode.AUTH_SNAPSHOT:
                     assert body['token']==f'synthetic-secret-{i}';authenticated=True;counts['auth'][i]+=1;report();payload={'profile':{'contact':{'id':100+i}}}
                 elif op==OpCode.SEND_MESSAGE:
-                    assert authenticated and body['chatId']==42;text=body['message']['text'];assert text in (f'incoming-{i}-0',f'incoming-{i}-1',f'ambiguous-{i}');counts['max'].append([i,text]);report()
+                    assert authenticated and body['chatId']==42;text=body['message']['text'];assert text in (f'incoming-{i}-0',f'incoming-{i}-1',f'ambiguous-{i}') or text in [f'load-in-{i}-{j}' for j in range(load_n)];counts['max'].append([i,text])
+                    if text.startswith('load-in-'):counts['load_effects'].append([text,time.time()-counts['load_started']])
+                    report()
                     if text.startswith('ambiguous'):await w.close();return w
                     payload={'message':{'id':10000+len(counts['max'])}}
                 await w.send_bytes(encode({'cmd':1,'seq':pkt['seq'],'opcode':op,'payload':payload}))
                 if op==OpCode.AUTH_SNAPSHOT:
+                    load_sockets[i]=w
                     await w.send_bytes(encode({'cmd':0,'seq':0,'opcode':OpCode.DISPATCH,'payload':{'chatId':42,'message':{'id':123,'sender':999,'text':f'outgoing-{i}'}}}))
             return w
         return ws
@@ -79,6 +88,12 @@ async def broker(network_paths=None):
             if (control/'cut-a').exists() and servers[0].server:await servers[0].close();(control/'cut-confirmed').touch()
             if (control/'restore-a').exists() and not servers[0].server and (control/'cut-confirmed').exists():
                 (control/'cut-a').unlink(missing_ok=True);await servers[0].start();(control/'restore-a').unlink()
+            if (control/'load-count').exists() and not load_n:
+                n=int((control/'load-count').read_text());assert 1<=n<=25 and set(load_sockets)=={0,1} and all(not w.closed for w in load_sockets.values())
+                load_n=n;counts['load_started']=time.time();counts['load_effects']=[];report()
+                for j in range(n):
+                    for i,w in load_sockets.items():
+                        await w.send_bytes(encode({'cmd':0,'seq':0,'opcode':OpCode.DISPATCH,'payload':{'chatId':42,'message':{'id':1000+j,'sender':999,'text':f'load-out-{i}-{j}'}}}))
             await asyncio.sleep(.05)
     finally:
         for s in servers:await s.close()
