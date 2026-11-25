@@ -19,7 +19,7 @@ def public_address(value):
     try:ip=ipaddress.ip_address(value)
     except ValueError:raise EgressDenied('Invalid DNS answer') from None
     if not ip.is_global or ip.is_multicast or ip.is_reserved or ip.is_loopback or ip.is_link_local or getattr(ip,'ipv4_mapped',None) is not None or getattr(ip,'sixtofour',None) is not None or getattr(ip,'teredo',None) is not None or '%' in str(value):raise EgressDenied('Non-public DNS answer')
-    if ip.version==6 and ip in ipaddress.ip_network('64:ff9b::/96'):raise EgressDenied('Translation prefix prohibited')
+    if ip.version==6 and (ip not in ipaddress.ip_network('2000::/3') or ip in ipaddress.ip_network('2001::/23') or ip in ipaddress.ip_network('3fff::/20')):raise EgressDenied('Special IPv6 prefix prohibited')
     return str(ip)
 
 async def connect_public(role,authority,*,resolve=None,dial=None):
@@ -30,7 +30,9 @@ async def connect_public(role,authority,*,resolve=None,dial=None):
     addresses=[]
     for family,kind,proto,_,sockaddr in records:
         if family not in (socket.AF_INET,socket.AF_INET6) or kind!=socket.SOCK_STREAM or proto!=socket.IPPROTO_TCP or sockaddr[1]!=443 or len(sockaddr)!=(2 if family==socket.AF_INET else 4) or len(sockaddr)==4 and sockaddr[3]!=0:raise EgressDenied('Invalid DNS record')
-        addr=public_address(sockaddr[0]);addresses.append((family,addr))
+        addr=public_address(sockaddr[0])
+        if ipaddress.ip_address(addr).version!=(4 if family==socket.AF_INET else 6):raise EgressDenied('DNS address family mismatch')
+        addresses.append((family,addr))
     # Validate every answer; never resolve a second time on connect.
     family,addr=addresses[0]
     return await asyncio.wait_for(dial(addr,443,family=family,flags=socket.AI_NUMERICHOST),5)

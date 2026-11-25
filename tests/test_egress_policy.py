@@ -65,3 +65,13 @@ async def test_connection_cap_and_shutdown():
             assert await asyncio.wait_for(a.read(),2)==b''
         finally:
             y.close();w.close();await y.wait_closed();await w.wait_closed();await b.close()
+
+@pytest.mark.parametrize('addr',['64:ff9b:1::808:808','2001:1::1','3fff::1234'])
+def test_special_ipv6_refused(addr):
+    with pytest.raises(EgressDenied):public_address(addr)
+
+@pytest.mark.asyncio
+async def test_dns_family_mismatch_no_dial():
+    resolve=AsyncMock(return_value=[(socket.AF_INET6,socket.SOCK_STREAM,socket.IPPROTO_TCP,'',('8.8.8.8',443,0,0))]);dial=AsyncMock()
+    with pytest.raises(EgressDenied):await connect_public('telegram','api.telegram.org:443',resolve=resolve,dial=dial)
+    dial.assert_not_awaited()
