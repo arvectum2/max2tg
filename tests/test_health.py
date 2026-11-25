@@ -256,3 +256,27 @@ def test_history_gap_fingerprint_stable_across_reconnects(tmp_path):
     h.topics.set_ui("catch_up_warnings",{"42":{"reason":"RPC_ERROR","updated":1000}})
     assert "HISTORY_GAP" not in h.snapshot()["acknowledged_issues"]
     db.close()
+
+async def test_failed_alert_stops_repeating_and_new_record_still_alerts(tmp_path):
+    h,db,c,s,a=supervisor(tmp_path);h.started=time.monotonic()-200
+    old=db.enqueue(MaxMessage(chat_id=42,message_id='failed-old'));db._set_job(old,'FAILED')
+    for _ in range(3):await h.notify(h.snapshot())
+    assert s.bot.send_message.await_count==1 and 'OUTBOX_FAILED' in h.snapshot()['acknowledged_issues']
+    h2=HealthSupervisor(c,s,db,h.topics,a,str(tmp_path));h2.started=time.monotonic()-200;h2._alerts['OUTBOX_FAILED']=0
+    for _ in range(4):await h2.notify(h2.snapshot())
+    assert s.bot.send_message.await_count==1 and db.counts()['FAILED']==1
+    new=db.enqueue(MaxMessage(chat_id=42,message_id='failed-new'));db._set_job(new,'FAILED')
+    for _ in range(3):await h2.notify(h2.snapshot())
+    assert s.bot.send_message.await_count==2 and db.counts()['FAILED']==2
+    db.close()
+
+async def test_alert_does_not_acknowledge_failure_arriving_during_send(tmp_path):
+    h,db,c,s,a=supervisor(tmp_path);h.started=time.monotonic()-200
+    old=db.enqueue(MaxMessage(chat_id=42,message_id='old'));db._set_job(old,'FAILED')
+    async def send(**kw):
+        new=db.enqueue(MaxMessage(chat_id=42,message_id='new'));db._set_job(new,'FAILED')
+        return SimpleNamespace(message_id=22)
+    s.bot.send_message.side_effect=send
+    for _ in range(3):await h.notify(h.snapshot())
+    assert 'OUTBOX_FAILED' not in h.snapshot()['acknowledged_issues'] and db.counts()['FAILED']==2
+    db.close()

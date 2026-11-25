@@ -31,7 +31,7 @@ ALERT_COOLDOWN = 3600
 # generate hourly notifications. A different set of affected ledger records
 # is treated as a NEW incident and is alerted once.
 ACKNOWLEDGEABLE_ISSUES = frozenset({
-    "TG_OUTBOUND_FAILED", "OUTBOX_UNKNOWN", "MUTATION_BLOCKED", "HISTORY_GAP",
+    "TG_OUTBOUND_FAILED", "OUTBOX_UNKNOWN", "OUTBOX_FAILED", "MUTATION_BLOCKED", "HISTORY_GAP",
 })
 STARTUP_GRACE_SEC = 120
 OUTBOX_OLD_AGE_SEC = 300
@@ -135,9 +135,10 @@ class HealthSupervisor:
         A reconnect can change warning timestamps without creating a new
         incident. Never include those timestamps in notification identity.
         """
-        if issue == "OUTBOX_UNKNOWN":
+        if issue in ("OUTBOX_UNKNOWN", "OUTBOX_FAILED"):
+            state = "UNKNOWN" if issue == "OUTBOX_UNKNOWN" else "FAILED"
             values = [row[0] for row in self.outbox.db.execute(
-                "SELECT key FROM jobs WHERE status='UNKNOWN' ORDER BY key")]
+                "SELECT key FROM jobs WHERE status=? ORDER BY key", (state,))]
         elif issue == "MUTATION_BLOCKED":
             values = [row[0] for row in self.outbox.db.execute(
                 "SELECT key FROM message_mutations WHERE state='BLOCKED' ORDER BY key")]
@@ -384,6 +385,7 @@ class HealthSupervisor:
                    and now-self._alerts.get(key,0)>=ALERT_COOLDOWN]
         if not alertable:
             return
+        signatures={key:self._issue_signature(key) for key in alertable if key in ACKNOWLEDGEABLE_ISSUES}
         markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("🩺 Проверить",callback_data="health:refresh"),
             InlineKeyboardButton("🔐 Вход в MAX",callback_data="health:reauth"),
@@ -405,7 +407,11 @@ class HealthSupervisor:
             self._alerts[key]=now
         self._write_atomic(self.alert_path,self._alerts)
         # New historical ledger incidents are reported once, not every hour.
-        self.acknowledge_existing(alertable)
+        # Capture the incident set before awaiting Telegram: a concurrent new
+        # failure must not be silently acknowledged by an earlier notification.
+        if signatures:
+            self._silenced_issues.update({k:v for k,v in signatures.items() if v})
+            self._write_atomic(self.silence_path,self._silenced_issues)
 
     async def monitor(self, interval=HEALTH_CHECK_INTERVAL):
         while True:
