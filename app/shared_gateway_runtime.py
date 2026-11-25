@@ -37,10 +37,16 @@ async def remove_dead_socket(path):
     writer.close();await writer.wait_closed();raise RuntimeError('IPC listener already active')
 
 class SharedGatewayRuntime:
-    def __init__(self,registry,bot,*,channels=None):
+    def __init__(self,registry,bot,*,channels=None,external_only=False):
         self.registry=registry;self.bot=bot;self.lock=RuntimeLock(registry.root/'shared-gateway.lock')
         self.inbox=None;self.egress=None;self.server=None;self.servers=[];self.started=False;self._poll_lock=asyncio.Lock();self._drain_lock=asyncio.Lock()
         try:
+            if external_only:
+                if channels is None:raise PermissionError('External-only gateway requires dedicated channels')
+                for row in registry.list_capsules():
+                    path=registry.capsule_dir(row['session_id'])/'credentials.json'
+                    if path.exists() or path.is_symlink() or (row['credential_mode']!='external' and row['status']!='UNCONFIGURED'):raise PermissionError('Legacy credentials prohibited in external-only gateway')
+                    if row['desired_active'] and row['session_id'] not in channels:raise PermissionError('Active external capsule missing channel')
             self.plane=TelegramControlPlane(registry)
             self.provisioner=SharedTopicProvisioner(self.plane)
             self.inbox=TelegramInbox(registry.root/'inbox.sqlite3',self.plane)
@@ -50,6 +56,9 @@ class SharedGatewayRuntime:
                 self.channels={}
                 for sid,folder in channels.items():
                     if registry.get(sid)['telegram_mode']!='shared':raise ValueError('Shared channel required')
+                    if registry.get(sid)['credential_mode']=='external':
+                        legacy=registry.capsule_dir(sid)/'credentials.json'
+                        if legacy.exists() or legacy.is_symlink():raise PermissionError('External capsule contains legacy credentials')
                     p=Path(folder).absolute()
                     if p.is_symlink() or not p.is_dir() or p.stat().st_uid!=os.getuid() or p.stat().st_mode&0o077:raise PermissionError('Unsafe channel directory')
                     p=p.resolve();root=registry.root.resolve()
@@ -64,6 +73,7 @@ class SharedGatewayRuntime:
                 delivery=CapsuleIpcClient(registry,socket_for=socket_for).deliver
                 self.servers=[GatewayEgressIpcServer(registry,self.egress,topic_scoped=True,channel_path=p/'egress.sock',bound_sid=sid) for sid,p in self.channels.items()]
             else:
+                if any(r['credential_mode']=='external' and r['desired_active'] for r in registry.list_capsules()):raise PermissionError('External capsules require dedicated channels')
                 delivery=None
                 self.server=GatewayEgressIpcServer(registry,self.egress,topic_scoped=True)
                 self.servers=[self.server]

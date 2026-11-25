@@ -11,11 +11,11 @@ def main():
     def command(name,mode,mounts,argv=(),init=False):
         names.append(name);cmd=['docker','run','--name',name,'--pull','never','--label',f'max2tg.test={prefix}','--network','none','--read-only','--security-opt','no-new-privileges','--pids-limit','64','--memory','256m','--mount',f'type=bind,source={root / "app"},target=/src/app,readonly','--mount',f'type=bind,source={root / "tests"},target=/src/tests,readonly','--workdir','/src']
         if not init:cmd+=['--cap-drop','ALL','--user','65532:65532']
-        for volume,target in mounts:cmd+=['--mount',f'type=volume,source={volumes[volume]},target=/{target}']
+        for volume,target in mounts:cmd+=['--mount',f'type=volume,source={volumes[volume]},target=/{target}'+(',readonly' if target=='secret' and not init else '')]
         cmd+=['--entrypoint','python',args.image,'-m','tests.isolated_container_fixture',mode,*argv];return cmd
     try:
         docker('image','inspect',args.image)
-        for key in ('registry','channel0','channel1','state0','state1'):
+        for key in ('registry','channel0','channel1','state0','state1','secret0','secret1'):
             volumes[key]=docker('volume','create','--label',f'max2tg.test={prefix}',prefix+'-'+key)
         init=subprocess.run(command(prefix+'-init','init',[(k,k) for k in volumes],init=True),check=True,text=True,capture_output=True,timeout=25);sessions=json.loads(init.stdout.strip().splitlines()[-1]);print('Synthetic provisioning PASS',flush=True)
         gateway=subprocess.Popen(command(prefix+'-gateway','gateway',[('registry','registry'),('channel0','channel0'),('channel1','channel1')],[json.dumps(sessions)]),text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
@@ -29,7 +29,7 @@ def main():
             time.sleep(.1)
         else:raise RuntimeError('Gateway did not start')
         workers=[]
-        for i,(sid,actor,forum) in enumerate(sessions):workers.append(subprocess.Popen(command(prefix+f'-worker{i}','worker',[(f'state{i}','state'),(f'channel{i}','channel')],[sid,str(actor),str(forum)]),text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT))
+        for i,(sid,actor,forum) in enumerate(sessions):workers.append(subprocess.Popen(command(prefix+f'-worker{i}','worker',[(f'state{i}','state'),(f'channel{i}','channel'),(f'secret{i}','secret')],[sid,str(actor),str(forum)]),text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT))
         for i,worker in enumerate(workers):
             out,_=worker.communicate(timeout=23);print(f'Worker {i}: {out.strip()}',flush=True);assert worker.returncode==0 and 'WORKER PASS' in out
         out,_=gateway.communicate(timeout=23);print(out.strip(),flush=True);assert gateway.returncode==0 and 'GATEWAY PASS' in out
