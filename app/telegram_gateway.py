@@ -22,11 +22,12 @@ log=logging.getLogger(__name__)
 class TelegramGatewayEngine:
     def __init__(self,plane:TelegramControlPlane,inbox:TelegramInbox,
                  deliver:Callable[[str,dict],Awaitable[bool]]|None=None,
-                 *,egress:TelegramEgress|None=None):
+                 *,egress:TelegramEgress|None=None,topic_scoped=False):
         self.plane=plane
         self.inbox=inbox
         self.deliver=deliver or CapsuleIpcClient(plane.capsules).deliver
         self.egress=egress
+        self.topic_scoped=topic_scoped
         self._locks={}
 
     def enqueue_egress_text(self,sid:str,source_key:str,text:str) -> str:
@@ -41,14 +42,27 @@ class TelegramGatewayEngine:
             raise RuntimeError("Central Telegram egress is not configured")
         return await self.egress.drain(bot,limit)
 
+    def _trusted_topic(self,sid,update):
+        message=update.get('message') or {}
+        if not isinstance(message,dict):return False
+        return self.plane.max_chat_for_thread(sid,message.get('message_thread_id')) is not None
+
+    async def _deliver_scoped(self,sid,update):
+        if self.topic_scoped and not self._trusted_topic(sid,update):return False
+        return await self.deliver(sid,update)
+
     async def accept(self,raw_update:dict) -> str:
         """No network if route invalid. Owner-only forum dispatch."""
+        if self.topic_scoped:
+            from app.telegram_inbox import identity
+            chat,actor=identity(raw_update);sid=self.plane.route_group(chat,actor)
+            if not sid or not self._trusted_topic(sid,raw_update):return "DENIED"
         admitted=self.inbox.ingest(raw_update)
         if admitted is None:
             return "DENIED"
         update_id,session=admitted
         async with self._locks.setdefault(session,asyncio.Lock()):
-            return await self.inbox.dispatch(update_id,self.deliver)
+            return await self.inbox.dispatch(update_id,self._deliver_scoped)
 
     async def drain(self,limit:int=100)->dict:
         """Replay only definitely unsent RECEIVED rows after recovery."""
@@ -57,7 +71,7 @@ class TelegramGatewayEngine:
             row=self.inbox.row(update_id)
             session=row["session_id"]
             async with self._locks.setdefault(session,asyncio.Lock()):
-                result=await self.inbox.dispatch(update_id,self.deliver)
+                result=await self.inbox.dispatch(update_id,self._deliver_scoped)
                 results[result]=results.get(result,0)+1
         return results
 

@@ -65,11 +65,12 @@ def _read_private_key(path: Path) -> bytes:
 class GatewayEgressIpcServer:
     """Gateway-only listener which authenticates each tenant request."""
 
-    def __init__(self, registry: CapsuleRegistry, egress: TelegramEgress):
+    def __init__(self, registry: CapsuleRegistry, egress: TelegramEgress, *, topic_scoped=False):
         if egress.plane.capsules is not registry:
             raise ValueError("Gateway IPC must share the exact control plane")
         self.registry = registry
         self.egress = egress
+        self.topic_scoped=topic_scoped
         self.path = egress_ipc_path(registry.root)
         self._server = None
 
@@ -92,19 +93,26 @@ class GatewayEgressIpcServer:
             key = _read_private_key(keypath)
             body = _verify(frame, _derive(key, b"request"))
             if (
-                set(body) != {"session_id", "nonce", "action", "source_key", "text"}
+                set(body) not in ({"session_id", "nonce", "action", "source_key", "text"},
+                                  {"session_id", "nonce", "action", "source_key", "text", "max_chat_id"})
                 or body["session_id"] != sid
                 or type(body["nonce"]) is not str
                 or not _NONCE.fullmatch(body["nonce"])
             ):
                 raise ValueError("Invalid signed egress request")
+            if self.topic_scoped and body.get('max_chat_id') is None:raise PermissionError('Scoped gateway requires MAX chat')
             if body["action"] == "enqueue":
                 state = self.egress.enqueue(
-                    sid, body["source_key"], body["text"]
+                    sid, body["source_key"], body["text"], max_chat_id=body.get("max_chat_id")
                 )
                 result = {"status": state}
             elif body["action"] == "status" and body["text"] is None:
                 row = self.egress.row(sid, body["source_key"])
+                requested=body.get('max_chat_id')
+                if requested is not None:
+                    requested=self.egress.plane.max_chat_key(requested)
+                    if row and row['max_chat_id']!=requested:raise ValueError('Source route mismatch')
+                elif row and row['max_chat_id'] is not None:raise ValueError('Scoped status requires source route')
                 result = {"status": row["status"] if row else "MISSING"}
                 if row and row["status"] == "SENT":
                     result["telegram_id"] = row["telegram_id"]
@@ -160,7 +168,7 @@ class GatewayEgressIpcClient:
         self.socket = Path(socket)
         self.key_file = Path(key_file)
 
-    async def _call(self, action: str, source_key: str, text) -> dict:
+    async def _call(self, action: str, source_key: str, text, *, max_chat_id=None) -> dict:
         import secrets
         key = _read_private_key(self.key_file)
         nonce = secrets.token_hex(16)
@@ -171,6 +179,7 @@ class GatewayEgressIpcClient:
             "source_key": source_key,
             "text": text,
         }
+        if max_chat_id is not None:request["max_chat_id"]=max_chat_id
         frame = _signed(request, _derive(key, b"request"))
         # A disconnected socket means the gateway did not receive a request.
         reader, writer = await asyncio.open_unix_connection(str(self.socket))
@@ -202,8 +211,8 @@ class GatewayEgressIpcClient:
             except OSError:
                 pass
 
-    async def enqueue(self, source_key: str, text: str) -> dict:
-        return await self._call("enqueue", source_key, text)
+    async def enqueue(self, source_key: str, text: str, *, max_chat_id=None) -> dict:
+        return await self._call("enqueue", source_key, text,max_chat_id=max_chat_id)
 
-    async def status(self, source_key: str) -> dict:
-        return await self._call("status", source_key, None)
+    async def status(self, source_key: str, *, max_chat_id=None) -> dict:
+        return await self._call("status", source_key, None,max_chat_id=max_chat_id)
