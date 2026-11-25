@@ -13,7 +13,7 @@ from app.shared_topic_provision import SharedTopicProvisioner
 from app.capsule_shared_ingress import is_plain_text_update
 from app.forum_guard import ForumGuard
 from app.telegram_budget import TelegramBudget,BudgetedBot,ApiDeferred
-from telegram.error import RetryAfter
+from telegram.error import RetryAfter,NetworkError,TimedOut
 
 async def remove_dead_socket(path):
     """Caller holds exclusive runtime lock. Never unlink a live listener."""
@@ -31,7 +31,7 @@ async def remove_dead_socket(path):
 class SharedGatewayRuntime:
     def __init__(self,registry,bot,*,channels=None,external_only=False,managed=False):
         if managed and (channels is None or not external_only):raise ValueError("Managed mode requires external dedicated channels")
-        self.managed=managed;self._opened=set();self.bot_id=None
+        self.managed=managed;self._opened=set();self.bot_id=None;self.poll_failures=0
         self.registry=registry;self.bot=bot;self.lock=RuntimeLock(registry.root/'shared-gateway.lock')
         self.inbox=None;self.egress=None;self.server=None;self.servers=[];self.started=False;self._poll_lock=asyncio.Lock();self._drain_lock=asyncio.Lock()
         try:
@@ -47,7 +47,7 @@ class SharedGatewayRuntime:
             self.plane=TelegramControlPlane(registry)
             self.provisioner=SharedTopicProvisioner(self.plane)
             self.guard=ForumGuard(registry,self.bot) if managed else None
-            allowed=self.guard.allowed if self.guard else None
+            allowed=self._dispatch_allowed if self.guard else None
             self.inbox=TelegramInbox(registry.root/'inbox.sqlite3',self.plane,dispatch_allowed=allowed)
             self.egress=TelegramEgress(registry.root/'telegram-egress.sqlite3',self.plane,topic_scoped=True,dispatch_allowed=allowed)
             self.channels=None
@@ -109,12 +109,20 @@ class SharedGatewayRuntime:
         active={r['sid'] for r in rows if r['stage']=='ACTIVE' and r['desired_active']==1 and r['credential_mode']=='external' and r['status']=='ACTIVE' and r['bot_id']==str(self.bot_id)}
         return active
 
+    def _dispatch_allowed(self,sid):
+        return not self.poll_failures and self.guard.allowed(sid)
+
+    def _invalidate_poll_leases(self):
+        # A missed membership event cannot be replaced by stale positive leases.
+        for r in self.plane.db.execute("SELECT forum FROM shared_onboarding WHERE stage='ACTIVE'"):
+            self.guard.invalidate(int(r[0]))
+
     async def reconcile_channels(self):
         """Only pre-mounted channels; never mounts paths or accepts tenant input."""
         if not self.managed or not self.started:raise RuntimeError('Managed gateway not started')
         await self.guard.refresh(self._desired_channels())
         async with self._drain_lock:
-            active={sid for sid in self._desired_channels() if self.guard.allowed(sid)}
+            active={sid for sid in self._desired_channels() if self._dispatch_allowed(sid)}
             for server in self.servers:
                 sid=server.bound_sid
                 if sid not in active and sid in self._opened:
@@ -126,7 +134,7 @@ class SharedGatewayRuntime:
     def lifecycle_snapshot(self):
         if not self.managed or not self.started:raise RuntimeError('Managed gateway not started')
         active=self._desired_channels()
-        return {'at':time.time(),'sessions':{sid:{'active':sid in active,'ready':sid in active and sid in self._opened and self.guard.allowed(sid)} for sid in self.channels}}
+        return {'at':time.time(),'sessions':{sid:{'active':sid in active,'ready':sid in active and sid in self._opened and self._dispatch_allowed(sid)} for sid in self.channels}}
 
 
     def _offset(self):return self.inbox.db.execute('SELECT next_offset FROM polling_checkpoint WHERE singleton=1').fetchone()[0]
@@ -139,6 +147,13 @@ class SharedGatewayRuntime:
             try:updates=await self.bot.get_updates(offset=offset,limit=100,timeout=timeout,allowed_updates=['message','edited_message','message_reaction','callback_query','chat_member','my_chat_member'])
             except (ApiDeferred,RetryAfter):
                 if not self.managed:raise
+                return 0
+            except NetworkError as exc:
+                # BadRequest derives from NetworkError in PTB; retry only the
+                # exact transport error classes on read-only getUpdates.
+                if not self.managed or type(exc) not in (NetworkError,TimedOut):raise
+                if not self.poll_failures:self._invalidate_poll_leases()
+                self.poll_failures=min(16,self.poll_failures+1)
                 return 0
             raw=[u.to_dict() if hasattr(u,'to_dict') else u for u in updates]
             ids=[u.get('update_id') if isinstance(u,dict) else None for u in raw]
@@ -158,19 +173,22 @@ class SharedGatewayRuntime:
                 db.execute('COMMIT')
             except BaseException:
                 db.execute('ROLLBACK');raise
+            if self.poll_failures:
+                self._invalidate_poll_leases()
+                self.poll_failures=0
             return count
 
     async def drain_once(self):
         async with self._drain_lock:
             if not self.started:raise RuntimeError('Gateway not started')
-            held=self.guard.held_sessions() if self.guard else ()
+            held=(self._desired_channels() if self.poll_failures else self.guard.held_sessions()) if self.guard else ()
             return {'ingress':await self.engine.drain(exclude=held),'egress':await self.engine.drain_egress(self.bot,exclude=held)}
 
     async def provision_topic(self,sid,max_chat_id,owner,title):
         async with self._drain_lock:
             if not self.started:raise RuntimeError('Gateway not started')
-            if self.guard and not self.guard.allowed(sid):raise PermissionError('Forum verification unavailable')
-            return await self.provisioner.create(self.bot,sid,max_chat_id,owner,title,dispatch_allowed=self.guard.allowed if self.guard else None)
+            if self.guard and not self._dispatch_allowed(sid):raise PermissionError('Forum verification unavailable')
+            return await self.provisioner.create(self.bot,sid,max_chat_id,owner,title,dispatch_allowed=self._dispatch_allowed if self.guard else None)
 
     async def run(self,stop):
         """Separate polling and delivery loops; fail closed on storage failure."""
@@ -178,7 +196,9 @@ class SharedGatewayRuntime:
             while not stop.is_set():
                 await self.poll_once(timeout=20)
                 delay=min(1,self.bot.budget.remaining) if self.managed else 0
-                await asyncio.sleep(max(.05,delay))
+                if self.poll_failures:delay=max(delay,min(30,2**min(self.poll_failures-1,5)))
+                try:await asyncio.wait_for(stop.wait(),max(.05,delay))
+                except asyncio.TimeoutError:pass
         async def drains():
             while not stop.is_set():
                 await self.drain_once()

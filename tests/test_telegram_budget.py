@@ -66,3 +66,27 @@ async def test_managed_queue_hold_recheck_and_actual_retryafter_is_unknown(tmp_p
             assert (await g.drain_once())['egress']=={'SENT':1};assert g.egress.row(sid,'one')['status']=='UNKNOWN';assert g.egress.row(sid,'two')['status']=='SENT';assert raw.send_message.await_count==2
             assert await g.provision_topic(sid,43,ACTOR,'test')=='BOUND';raw.create_forum_topic.assert_awaited_once()
         finally:await g.close();r.close()
+
+@pytest.mark.asyncio
+async def test_poll_transport_hold_preserves_offset_and_requires_fresh_forum(tmp_path):
+    from telegram.error import NetworkError,TimedOut,BadRequest,Conflict
+    from tests.test_shared_gateway_ipc import _telegram_update
+    r=CapsuleRegistry(tmp_path/'registry');o=SharedOnboarding(r);raw=bot();sid=o.reserve(REQ,ACTOR,FORUM);await o.verify_forum(REQ,raw);o.confirm_provisioned(REQ,check=lambda *_:True);await o.activate(REQ,raw,check=lambda *_:True);o.plane.bind_topic(sid,42,77,ACTOR)
+    raw.get_updates=AsyncMock(return_value=[]);raw.send_message=AsyncMock(return_value=NS(message_id=55,chat=NS(id=FORUM),message_thread_id=77));c=Clock();budget=TelegramBudget(r.db,clock=c,wall=c,sleep=c.sleep)
+    with tempfile.TemporaryDirectory(prefix='m2poll-',dir='/tmp') as folder:
+        g=SharedGatewayRuntime(r,BudgetedBot(raw,budget),channels={sid:Path(folder)},external_only=True,managed=True);g.guard.clock=c
+        try:
+            await g.start();assert g._dispatch_allowed(sid)
+            g.egress.enqueue(sid,'one','one',max_chat_id=42)
+            raw.get_updates.side_effect=NetworkError('synthetic');assert await g.poll_once()==0;assert g.poll_failures==1 and g._offset()==0
+            await g.reconcile_channels();assert not g.lifecycle_snapshot()['sessions'][sid]['ready'] and not g._dispatch_allowed(sid)
+            assert await g.egress.send_one(g.bot,sid,'one')=='QUEUED';raw.send_message.assert_not_awaited()
+            raw.get_updates.side_effect=TimedOut();assert await g.poll_once()==0;assert g.poll_failures==2
+            for exc in (BadRequest('synthetic'),Conflict('synthetic')):
+                raw.get_updates.side_effect=exc
+                with pytest.raises(type(exc)):await g.poll_once()
+            raw.get_updates.side_effect=None;raw.get_updates.return_value=[_telegram_update(1,ACTOR,FORUM,77,'queued')]
+            assert await g.poll_once()==1 and g._offset()==2 and g.poll_failures==0
+            assert not g._dispatch_allowed(sid);await g.reconcile_channels();assert g._dispatch_allowed(sid)
+            assert await g.egress.send_one(g.bot,sid,'one')=='SENT';assert raw.send_message.await_count==1
+        finally:await g.close();r.close()
