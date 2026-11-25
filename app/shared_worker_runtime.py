@@ -24,20 +24,26 @@ class SharedWorkerRuntime:
         base=registry.capsule_dir(sid);self.owner=RuntimeLock(base/'worker.lock');self.ledger=None;self.egress=None
         try:
             self.plane=TelegramControlPlane(registry);state=base/'state'
-            self.topics=TopicStore(str(state/'topics.json'),strict=True)
-            self.ledger=TelegramOutbound(state/'tg-outbound.sqlite3',self.topics)
-            self.egress=CapsuleEgressOutbox(state/'to-telegram.sqlite3',sid)
-            self.egress.db.execute('''CREATE TABLE IF NOT EXISTS worker_event_gaps(max_chat_id TEXT NOT NULL,max_message_id TEXT NOT NULL,reason TEXT NOT NULL,payload TEXT NOT NULL,created REAL NOT NULL,PRIMARY KEY(max_chat_id,max_message_id))''')
             ipc=GatewayEgressIpcClient(sid,egress_ipc_path(registry.root),ensure_ipc_key(registry,sid))
-            self.listener=SharedCapsuleTextListener(client,self.topics,self.ledger,self.egress,ipc)
-            self.ingress=SharedCapsuleTextIngress(client,self.topics,self.ledger,trusted_topic=lambda thread:self.plane.max_chat_for_thread(sid,thread))
-            self.server=CapsuleIpcServer(registry,sid,self._receive)
+            self._init_local(state,ipc,lambda handler:CapsuleIpcServer(registry,sid,handler))
         except BaseException:
             if self.ledger:self.ledger.close()
             if self.egress:self.egress.close()
             self.owner.close();raise
 
-    def refresh_routes(self):
+    def _init_local(self,state,ipc,server_factory):
+        self.topics=TopicStore(str(state/'topics.json'),strict=True)
+        self.ledger=TelegramOutbound(state/'tg-outbound.sqlite3',self.topics)
+        self.egress=CapsuleEgressOutbox(state/'to-telegram.sqlite3',self.sid)
+        self.egress.db.execute('CREATE TABLE IF NOT EXISTS worker_event_gaps(max_chat_id TEXT NOT NULL,max_message_id TEXT NOT NULL,reason TEXT NOT NULL,payload TEXT NOT NULL,created REAL NOT NULL,PRIMARY KEY(max_chat_id,max_message_id))')
+        self.listener=SharedCapsuleTextListener(self.client,self.topics,self.ledger,self.egress,ipc)
+        self.ingress=SharedCapsuleTextIngress(self.client,self.topics,self.ledger,trusted_topic=self.trusted_topic)
+        self.server=server_factory(self._receive)
+
+    def trusted_topic(self,thread):return self.plane.max_chat_for_thread(self.sid,thread)
+    def route_available(self,cid):return self.plane.topic_route(self.sid,cid) is not None
+
+    async def refresh_routes(self):
         for r in self.plane.db.execute('SELECT max_chat_id,thread_id FROM tg_topic_routes WHERE session_id=? AND active=1',(self.sid,)).fetchall():
             cid,tid=r
             if self.plane.topic_route(self.sid,cid) is None:continue
@@ -48,22 +54,33 @@ class SharedWorkerRuntime:
 
     async def start(self):
         if self.started or self.closed:raise RuntimeError('Worker lifecycle conflict')
-        self.refresh_routes();self.ledger.repair_mappings(self.topics);self.listener.repair_receipts()
+        await self.refresh_routes();self.ledger.repair_mappings(self.topics);self.listener.repair_receipts()
         await remove_dead_socket(self.server.path);await self.server.start()
         self.client.on_message(self.on_message);self.started=True
 
     async def _receive(self,update):
         async with self._lock:
             if not self.started:raise WorkerUnavailable()
-            self.refresh_routes()
+            try:await self.refresh_routes()
+            except (OSError,EOFError,asyncio.TimeoutError,ValueError):raise WorkerUnavailable() from None
             return await self.ingress(update)
 
     async def on_message(self,msg):
         # Do not hold the ingress lock across the client's echo correlation:
         # it may await the in-flight MAX RPC acknowledgement.
         if not self.started:raise RuntimeError('Worker not started')
-        self.refresh_routes();cid=self.plane.max_chat_key(msg.chat_id)
-        if self.plane.topic_route(self.sid,cid) is None:outcome='UNBOUND'
+        cid=TelegramControlPlane.max_chat_key(msg.chat_id)
+        try:await self.refresh_routes()
+        except (OSError,EOFError,asyncio.TimeoutError,ValueError):outcome='ROUTE_UNAVAILABLE'
+        else:outcome=await self._classify(msg,cid)
+        if outcome in ('UNBOUND','PAUSED','UNSUPPORTED','BLOCKED','SELF_UNVERIFIED','ROUTE_UNAVAILABLE'):
+            raw=json.dumps(asdict(msg),ensure_ascii=False,default=str)
+            if len(raw.encode())>1024*1024:raw=json.dumps({'reason':'oversize payload omitted'})
+            self.egress.db.execute('INSERT OR IGNORE INTO worker_event_gaps VALUES(?,?,?,?,?)',(cid,str(msg.message_id),outcome,raw,time.time()))
+        return outcome
+
+    async def _classify(self,msg,cid):
+        if not self.route_available(cid):outcome='UNBOUND'
         elif msg.is_self:
             # Only proven echoes can be discarded; quarantine unverified
             # self messages rather than risking duplicate Telegram delivery.
@@ -71,16 +88,14 @@ class SharedWorkerRuntime:
             if self.ledger.db.execute("SELECT 1 FROM outbound WHERE max_chat=? AND max_id=? AND status='SENT'",(cid,mid)).fetchone() or await self.client.telegram_echo_tg_id(msg) is not None:outcome='ECHO'
             else:outcome='SELF_UNVERIFIED'
         else:outcome=await self.listener.on_message(msg)
-        if outcome in ('UNBOUND','PAUSED','UNSUPPORTED','BLOCKED','SELF_UNVERIFIED'):
-            raw=json.dumps(asdict(msg),ensure_ascii=False,default=str)
-            if len(raw.encode())>1024*1024:raw=json.dumps({'reason':'oversize payload omitted'})
-            self.egress.db.execute('INSERT OR IGNORE INTO worker_event_gaps VALUES(?,?,?,?,?)',(cid,str(msg.message_id),outcome,raw,time.time()))
         return outcome
 
     async def drain_once(self):
         async with self._lock:
             if not self.started:raise RuntimeError('Worker not started')
-            self.refresh_routes();return await self.listener.drain()
+            try:await self.refresh_routes()
+            except (OSError,EOFError,asyncio.TimeoutError,ValueError):return {"ROUTE_UNAVAILABLE":1}
+            return await self.listener.drain()
 
     async def run(self,stop):
         """Drive actual/injected MAX client; cancellation always closes IPC."""

@@ -97,12 +97,13 @@ async def _write_frame(writer:asyncio.StreamWriter,payload:bytes):
 
 
 class CapsuleIpcClient:
-    def __init__(self,registry:CapsuleRegistry):
+    def __init__(self,registry:CapsuleRegistry, *, socket_for=None):
         self.registry=registry
+        self.socket_for=socket_for
 
     async def deliver(self,sid:str,update:dict) -> bool:
         self.registry.get(sid)
-        socket_path=ipc_socket_path(self.registry,sid)
+        socket_path=self.socket_for(sid) if self.socket_for else ipc_socket_path(self.registry,sid)
         key=ensure_ipc_key(self.registry,sid).read_bytes()
         data=_signed({"session_id":sid,"update":update},key)
         # If we cannot connect, worker definitely has not received a byte.
@@ -137,6 +138,15 @@ class CapsuleIpcServer:
         self.key=ensure_ipc_key(registry,sid).read_bytes()
         self._server=None
         self._connections=set()
+        self.local_acl=None
+
+    @classmethod
+    def isolated(cls,sid,path,key,forum,actor,handler):
+        CapsuleRegistry._check_id(sid)
+        if type(forum) is not int or forum>=0 or type(actor) is not int or actor<=0 or len(key)!=32:raise ValueError('Invalid isolated channel')
+        obj=cls.__new__(cls);obj.sid=sid;obj.path=Path(path);obj.key=key;obj.handler=handler
+        obj.local_acl=(forum,{actor});obj._server=None;obj._connections=set()
+        return obj
 
     async def _receive(self,reader,writer):
         task=asyncio.current_task();self._connections.add(task)
@@ -150,14 +160,13 @@ class CapsuleIpcServer:
             # Trust boundary #2: enforce this worker's own Telegram ACL.
             # A signed event for somebody else's forum is still forbidden.
             chat_id,actor_id=identity(update)
-            data=self.registry.credentials(self.sid)
-            permitted={int(data["TG_ADMIN_USER_ID"])}
-            permitted.update(int(x.strip()) for x in
-                data.get("TG_ALLOWED_USER_IDS","").split(",")
-                if x.strip().isdigit())
-            if data.get("TG_ALLOWED_USER_ID","").isdigit():
-                permitted.add(int(data["TG_ALLOWED_USER_ID"]))
-            if (chat_id!=int(data["TG_CHAT_ID"]) or actor_id not in permitted):
+            if self.local_acl is not None:forum,permitted=self.local_acl
+            else:
+                data=self.registry.credentials(self.sid);forum=int(data['TG_CHAT_ID'])
+                permitted={int(data['TG_ADMIN_USER_ID'])}
+                permitted.update(int(x.strip()) for x in data.get('TG_ALLOWED_USER_IDS','').split(',') if x.strip().isdigit())
+                if data.get('TG_ALLOWED_USER_ID','').isdigit():permitted.add(int(data['TG_ALLOWED_USER_ID']))
+            if chat_id!=forum or actor_id not in permitted:
                 raise PermissionError("Foreign Telegram tenant event")
             result=await self.handler(update)
             response={"session_id":self.sid,
