@@ -45,3 +45,15 @@ def test_foreign_identity_and_volume_overlap_fail_closed(tmp_path):
         s.desired(A,False);s.tick();assert not b.calls
         with pytest.raises(BlockingIOError):OfflineContainerSupervisor(tmp_path,IMAGE,CODE,backend=b)
     finally:s.close()
+
+
+def test_fixture_selection_is_immutable_and_allowlisted(tmp_path):
+    tmp_path.chmod(0o700);b=Backend();s=OfflineContainerSupervisor(tmp_path,IMAGE,CODE,backend=b);b.owner=s.owner
+    try:
+        with pytest.raises(ValueError):s.register(A,*VOLUMES,fixture='arbitrary.module')
+        s.register(A,*VOLUMES,fixture='bridge');args=s._args(s.row(A))
+        assert args[-3:]==['-m','tests.supervised_bridge_fixture',A]
+        assert f'type=bind,source={CODE / "app"},target=/src/app,readonly' in args
+        assert '--network' in args and args[args.index('--network')+1]=='none'
+        with pytest.raises(ValueError,match='Immutable'):s.register(A,*VOLUMES)
+    finally:s.close()
