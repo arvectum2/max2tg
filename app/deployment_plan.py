@@ -56,16 +56,22 @@ def plan_digest(plan):return hashlib.sha256(json.dumps(plan,sort_keys=True,separ
 
 
 def verify_stopped_container(spec,c):
-    """Compare actual Docker inspect to exact generated placement spec."""
+    """Compare actual Docker inspect to exact generated held placement spec."""
+    if spec.get("command")!=HOLD or any(m["type"]!="bind" for m in spec.get("volumes",[])):raise PermissionError("Held command required")
+    return _verify_stopped(spec,c)
+
+
+def _verify_stopped(spec,c):
+    """Internal structural verifier, not a launch authorization."""
     try:
         h=c['HostConfig'];cfg=c['Config'];state=c['State'];mounts=c['Mounts']
-        if c['Name']!='/'+spec['container_name'] or c['Image']!=spec['image'] or any(cfg['Labels'].get(k)!=v for k,v in spec['labels'].items()) or cfg['User']!=UID or cfg['Entrypoint']!=['python'] or cfg['Cmd']!=HOLD or state['Running'] or state.get('Status')!='created':raise PermissionError('Container identity or hold mismatch')
+        if c['Name']!='/'+spec['container_name'] or c['Image']!=spec['image'] or any(cfg['Labels'].get(k)!=v for k,v in spec['labels'].items()) or cfg['User']!=UID or cfg['Entrypoint']!=['python'] or cfg['Cmd']!=spec['command'] or state['Running'] or state.get('Status')!='created':raise PermissionError('Container identity or hold mismatch')
         if h['NetworkMode']!='none' or h['Privileged'] or h['CapAdd'] or set(h['CapDrop'] or [])!={'ALL'} or not h['ReadonlyRootfs'] or not any(x in ('no-new-privileges','no-new-privileges:true') for x in h['SecurityOpt'] or []) or h['Memory']!=268435456 or h['NanoCpus']!=500000000 or h['PidsLimit']!=64 or h['RestartPolicy']['Name'] not in ('','no') or h.get('PortBindings') or h.get('PublishAllPorts') or h.get('Devices') or h.get('DeviceRequests') or h.get('VolumesFrom') or h.get('PidMode') or h.get('IpcMode') not in ('','private'):raise PermissionError('Container isolation mismatch')
         if not any(u['Name']=='core' and u['Soft']==u['Hard']==0 for u in h.get('Ulimits') or []):raise PermissionError('Core dump restriction missing')
         log=h['LogConfig']
         if log['Type']!='local' or log['Config'].get('max-size')!='1m' or log['Config'].get('max-file')!='2':raise PermissionError('Log bounds missing')
-        expected={(m['source'],m['target'],not m['read_only'],'rprivate') for m in spec['volumes']}
-        actual={(m['Source'],m['Destination'],m['RW'],m.get('Propagation')) for m in mounts if m['Type']=='bind'}
+        expected={(m['type'],m['source'],m['target'],not m['read_only'],'rprivate' if m['type']=='bind' else '') for m in spec['volumes']}
+        actual={(m['Type'],m['Source'] if m['Type']=='bind' else m.get('Name'),m['Destination'],m['RW'],m.get('Propagation','') if m['Type']=='bind' else '') for m in mounts if m['Type'] in ('bind','volume')}
         if len(mounts)!=len(expected) or actual!=expected:raise PermissionError('Exact role bind mounts required')
     except (KeyError,TypeError,AttributeError):raise PermissionError('Incomplete container evidence') from None
     return {'role':spec['labels']['max2tg.role'],'placement':'PASS','live_launch_authorized':False}

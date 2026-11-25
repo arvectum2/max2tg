@@ -19,8 +19,8 @@ def user(uid):return {'id':uid,'is_bot':uid==900,'first_name':'Synthetic','usern
 def chat(gid):return {'id':gid,'type':'supergroup','title':'Synthetic','is_forum':True}
 def message(gid,mid,text,actor=900):return {'message_id':mid,'date':1700000000,'chat':chat(gid),'from':user(actor),'message_thread_id':77,'text':text,'is_topic_message':True}
 
-async def broker():
-    assert_sandbox();assert not any(Path(p).exists() for p in ('/keys','/secret','/registry','/keys0','/keys1','/botkeys','/botsecret'));ctx=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER);ctx.load_cert_chain('/cert/cert.pem','/cert/key.pem');control=Path('/nettg')
+async def broker(network_paths=None):
+    assert_sandbox();assert not any(Path(p).exists() for p in ('/keys','/secret','/registry','/keys0','/keys1','/botkeys','/botsecret'));ctx=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER);ctx.load_cert_chain('/cert/cert.pem','/cert/key.pem');paths=network_paths or ['/net0','/net1','/nettg'];control=Path(paths[2])
     evidence=control/'counts.json';counts=json.loads(evidence.read_text()) if evidence.exists() else {'max':[],'tg':[],'auth':[0,0]};servers=[]
     (control/'cut-a').unlink(missing_ok=True);(control/'cut-confirmed').unlink(missing_ok=True)
     def report():atomic(control/'counts.json',counts)
@@ -71,7 +71,7 @@ async def broker():
             else:app.router.add_post('/bot123456:synthetic/{method}',api)
             runner=web.AppRunner(app);await runner.setup();runners.append(runner);site=web.TCPSite(runner,'127.0.0.1',0,ssl_context=ctx);await site.start();port=site._server.sockets[0].getsockname()[1]
             async def connect(role,target,p=port):return await asyncio.open_connection('127.0.0.1',p)
-            path=Path(f'/net{i}/proxy.sock' if i<2 else '/nettg/proxy.sock');await remove_dead_socket(path)
+            path=Path(paths[i])/'proxy.sock';await remove_dead_socket(path)
             servers.append(TunnelServer('max-text' if i<2 else 'telegram',path,connector=connect));await servers[-1].start()
         report();atomic(control/'broker-boot.json',{'boot':sum(counts['auth'])});print('READY',flush=True)
         while not (control/'stop-broker').exists():

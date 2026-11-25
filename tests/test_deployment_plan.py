@@ -59,3 +59,10 @@ def test_private_existing_bind_sources(tmp_path):
     with pytest.raises(PermissionError):validate_bind_sources(p)
     key.rmdir();key.symlink_to(tmp_path/'keys'/'workers'/B,target_is_directory=True)
     with pytest.raises(ValueError):validate_bind_sources(p)
+
+
+def test_held_verifier_cannot_accept_runtime_or_named_volume():
+    s=plan()['services']['broker'];c=evidence(s);s['command']=['-m','tests.placement_runtime_fixture','broker','[]'];c['Config']['Cmd']=s['command']
+    with pytest.raises(PermissionError):verify_stopped_container(s,c)
+    s=plan()['services']['broker'];c=evidence(s);s['volumes'][0]['type']='volume'
+    with pytest.raises(PermissionError):verify_stopped_container(s,c)
