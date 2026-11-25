@@ -70,9 +70,19 @@ def main():
             touch('phase1');wait(lambda:receipts(2) and len(counts().get('tg',[]))==2 and len(counts().get('max',[]))==2,timeout=30)
             print('Actual run_isolated_gateway/worker: 2+2 confirmed on '+('native volume' if a.native_volumes else 'bind')+' placement',flush=True)
             worker_starts={sid:d.inspect(plan['services']['worker-'+sid]['container_name'])['State']['StartedAt'] for sid in sids}
-            # Known durable boundary: confirmed receipts, then kill both dependencies.
+            # Broker-only crash: real gateway polling must stay alive, hold
+            # delivery until a successful poll and refreshed forum evidence.
+            gateway_start=d.inspect(plan['services']['gateway']['container_name'])['State']['StartedAt']
+            d.call('kill','--signal','KILL',broker)
+            wait(lambda:exec_py(gateway,'from pathlib import Path;print(not any((p/"egress.sock").exists() for p in Path("/channels").iterdir()))')=='True')
+            assert d.inspect(plan['services']['gateway']['container_name'])['State']['Running']
+            start_broker();touch('phase2');wait(lambda:receipts(4) and len(counts().get('max',[]))==4,timeout=35)
+            c=d.inspect(plan['services']['gateway']['container_name']);assert c['Id']==gateway and c['State']['StartedAt']==gateway_start and c['RestartCount']==0
+            print('Broker-only outage recovered: gateway stayed running; 4 ACKED',flush=True)
+            # Preserve original dual dependency crash at confirmed boundary.
+            prior=counts()['auth'][:]
             for cid in (gateway,broker):d.call('kill','--signal','KILL',cid)
-            start_broker();touch('phase2');d.start(gateway);wait(lambda:receipts(4) and len(counts().get('max',[]))==4,timeout=35)
+            start_broker();d.start(gateway);wait(lambda:receipts(4) and all(x>y for x,y in zip(counts().get('auth',[]),prior)) and len(counts().get('max',[]))==4,timeout=35)
             auth_before=counts()['auth'][0]
             touch('phase3');wait(lambda:ledger(gateway,'/registry/inbox.sqlite3','telegram_ingress')=={'ACKED':4,'UNKNOWN':1},timeout=30)
             wait(lambda:counts().get('auth',[0,0])[0]>auth_before,timeout=15)
