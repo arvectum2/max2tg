@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+"""Run the actual composition functions on disposable Linux bind placements."""
+import argparse,json,secrets,subprocess,tempfile,time,sys
+from pathlib import Path
+sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
+from app.deployment_plan import build_plan,_verify_stopped,validate_bind_sources
+from app.container_supervisor import DockerBackend
+
+def main():
+    p=argparse.ArgumentParser();p.add_argument('--image',required=True);p.add_argument('--native-volumes',action='store_true');a=p.parse_args();d=DockerBackend();code=Path(__file__).resolve().parents[1];image=d.call('image','inspect','--format','{{.Id}}',a.image);owner=secrets.token_hex(12);label='max2tg.placement='+owner
+    with tempfile.TemporaryDirectory(prefix='runtime-',dir=code) as td:
+        root=Path(td).resolve();fixture=root/'fixture';fixture.mkdir(mode=0o700);cert=root/'cert';cert.mkdir();subprocess.run(['openssl','req','-x509','-newkey','rsa:2048','-nodes','-days','1','-subj','/CN=synthetic','-addext','subjectAltName=DNS:api.oneme.ru,DNS:api.telegram.org','-keyout',str(cert/'key.pem'),'-out',str(cert/'cert.pem')],check=True,capture_output=True);(cert/'key.pem').chmod(0o644)
+        plan=None;ids={};vol={};initname='m2tg-placement-'+owner+'-init'
+        def bind(source,target,ro=True):return {'type':'bind','source':str(source),'target':target,'read_only':ro,'bind':{'create_host_path':False,'propagation':'rprivate'}}
+        def exec_py(cid,source):return d.call('exec',cid,'python','-c',source)
+        def read(cid,path):return json.loads(exec_py(cid,f'from pathlib import Path;print(Path({path!r}).read_text() if Path({path!r}).exists() else "null")'))
+        def wait(check,timeout=20):
+            end=time.monotonic()+timeout
+            while time.monotonic()<end:
+                try:
+                    if check():return
+                except (subprocess.CalledProcessError,subprocess.TimeoutExpired):pass
+                time.sleep(.35)
+            raise RuntimeError('Placed runtime condition not met')
+        def setup_args():return ['--network','none','--read-only','--pull','never','--label',label,'--mount',f'type=bind,source={fixture},target=/fixture','--mount',f'type=bind,source={cert},target=/cert,readonly','--mount',f'type=bind,source={code / "tests"},target=/app/tests,readonly','--entrypoint','python',image]
+        try:
+            args=setup_args();module='tests.placement_runtime_fixture'
+            if a.native_volumes:
+                module='tests.supervised_proxy_fixture'
+                for n in ('registry','channel0','channel1','state0','state1','secret0','secret1','net0','net1','nettg','keys0','keys1','botkeys','botsecret'):
+                    vol[n]=d.call('volume','create','--label',label,'m2tg-placement-'+owner+'-'+n)
+                    v=d.volume(vol[n]);assert v.get('Labels',{}).get('max2tg.placement')==owner and v['Driver']=='local' and not v.get('Options')
+                args=args[:-3]+[z for n,v in vol.items() for z in ('--mount',f'type=volume,source={v},target=/{n}')]+args[-3:]
+            d.call('run','-d','--name',initname,*args,'-m',module,'init');wait(lambda:d.inspect(initname)['State']['Status']=='exited',timeout=75)
+            assert d.inspect(initname)['State']['ExitCode']==0,d.call('logs',initname)
+            sessions=json.loads(d.call('logs',initname))
+            sids=[x[0] for x in sessions];plan=build_plan(owner,image,sids,data=fixture/'data',keys=fixture/'keys',backup=fixture/'backup')
+            if a.native_volumes:
+                mapping={fixture/'data'/'registry':'registry',fixture/'data'/'gateway-secret':'botsecret',fixture/'keys'/'gateway':'botkeys',fixture/'data'/'network'/'telegram':'nettg'}
+                for i,sid in enumerate(sids):
+                    for base,n in ((fixture/'data'/'workers'/sid/'state','state'),(fixture/'data'/'workers'/sid/'secret','secret'),(fixture/'data'/'network'/sid,'net'),(fixture/'data'/'channels'/sid,'channel'),(fixture/'keys'/'workers'/sid,'keys')):mapping[base]=n+str(i)
+                for spec in plan['services'].values():
+                    spec['volumes']=[{'type':'volume','source':vol[mapping[Path(m['source'])]],'target':m['target'],'read_only':m['read_only'],'volume':{'nocopy':True}} for m in spec['volumes']]
+                plan['volumes']={v:{'external':True,'name':v} for v in vol.values()}
+            else:assert validate_bind_sources(plan)==14
+            for role,s in plan['services'].items():
+                s['profiles']=['acceptance-only'];s['command']=['-m','tests.placement_runtime_fixture',role if not role.startswith('worker-') else 'worker',json.dumps(sessions) if role in ('gateway','broker') else role[7:]];s['volumes'].append(bind(code/'tests','/app/tests'))
+                if role=='broker':s['volumes'].append(bind(cert,'/cert'))
+            path=root/'compose.json';path.write_text(json.dumps(plan));cmd=('compose','-f',str(path),'--profile','acceptance-only');d.call(*cmd,'config','--quiet');d.call(*cmd,'create','--no-build','--pull','never')
+            for role,s in plan['services'].items():
+                c=d.inspect(s['container_name'])
+                # Docker Desktop may prefix exact host bind sources with /host_mnt.
+                if sys.platform=='darwin':
+                    expected={m['target']:m['source'] for m in s['volumes'] if m['type']=='bind'}
+                    for m in c['Mounts']:
+                        if m['Type']=='bind' and m['Destination'] in expected and m['Source']=='/host_mnt'+expected[m['Destination']]:m['Source']=expected[m['Destination']]
+                _verify_stopped(s,c)
+                ids[role]=c['Id']
+            broker=ids['broker'];gateway=ids['gateway'];workers=[ids['worker-'+sid] for sid in sids]
+            def counts():return read(broker,'/network/telegram/counts.json') or {}
+            def ledger(cid,path,table,column='status'):
+                return json.loads(exec_py(cid,f'import sqlite3,json;d=sqlite3.connect("file:{path}?mode=ro",uri=True);print(json.dumps(dict(d.execute("SELECT {column},count(*) FROM {table} GROUP BY {column}"))))'))
+            def receipts(n):return ledger(gateway,'/registry/inbox.sqlite3','telegram_ingress')=={'ACKED':n} and ledger(gateway,'/registry/telegram-egress.sqlite3','telegram_egress')=={'SENT':2}
+            def ready():return exec_py(gateway,'from pathlib import Path;print(all((p/"egress.sock").is_socket() for p in Path("/channels").iterdir()))')=='True'
+            def touch(name):exec_py(broker,f'from pathlib import Path;Path("/network/telegram/{name}").touch()')
+            def start_broker():
+                at=time.time();d.start(broker);wait(lambda:(read(broker,'/network/telegram/broker-health.json') or {}).get('at',0)>=at)
+            start_broker();d.start(gateway);wait(ready)
+            for cid in workers:d.start(cid)
+            touch('phase1');wait(lambda:receipts(2) and len(counts().get('tg',[]))==2 and len(counts().get('max',[]))==2,timeout=30)
+            print('Actual run_isolated_gateway/worker: 2+2 confirmed on '+('native volume' if a.native_volumes else 'bind')+' placement',flush=True)
+            worker_starts={sid:d.inspect(plan['services']['worker-'+sid]['container_name'])['State']['StartedAt'] for sid in sids}
+            # Known durable boundary: confirmed receipts, then kill both dependencies.
+            for cid in (gateway,broker):d.call('kill','--signal','KILL',cid)
+            start_broker();touch('phase2');d.start(gateway);wait(lambda:receipts(4) and len(counts().get('max',[]))==4,timeout=35)
+            auth_before=counts()['auth'][0]
+            touch('phase3');wait(lambda:ledger(gateway,'/registry/inbox.sqlite3','telegram_ingress')=={'ACKED':4,'UNKNOWN':1},timeout=30)
+            wait(lambda:counts().get('auth',[0,0])[0]>auth_before,timeout=15)
+            assert sorted(counts()['max'])==sorted([[0,'incoming-0-0'],[1,'incoming-1-0'],[0,'incoming-0-1'],[1,'incoming-1-1'],[0,'ambiguous-0']]);assert sorted(counts()['tg'])==[[-10001,'outgoing-1'],[-10000,'outgoing-0']]
+            for sid,cid in zip(sids,workers):
+                c=d.inspect(plan['services']['worker-'+sid]['container_name']);assert c['Id']==cid and c['State']['StartedAt']==worker_starts[sid] and c['State']['Running'] and c['RestartCount']==0
+            print('4 ACKED + 2 SENT + 1 UNKNOWN; exact external effects, same workers',flush=True)
+        except Exception as exc:
+            if isinstance(exc,subprocess.CalledProcessError):print(exc.stdout,exc.stderr,flush=True)
+            for cid in [initname,*ids.values()]:
+                try:print(cid,d.call('logs','--tail','12',cid),flush=True)
+                except subprocess.CalledProcessError:pass
+            raise
+        finally:
+            names=[initname]+([s['container_name'] for s in plan['services'].values()] if plan else [])
+            for name in names:
+                c=d.inspect(name)
+                if c and c['Config']['Labels'].get('max2tg.placement')==owner:d.call('rm','-f',c['Id'])
+            assert not d.call('ps','-aq','--filter','label='+label)
+            # Only remove contents of this fresh isolated mount, not a caller-supplied path.
+            if a.native_volumes:
+                for v in vol.values():
+                    if d.volume(v).get('Labels',{}).get('max2tg.placement')==owner:d.call('volume','rm',v)
+                assert not d.call('volume','ls','-q','--filter','label='+label)
+            else:subprocess.run(['docker','run','--rm',*setup_args(),'-c','import shutil;from pathlib import Path;[(shutil.rmtree(p) if p.is_dir() else p.unlink()) for p in Path("/fixture").iterdir()]'],check=True,capture_output=True,timeout=60)
+    print('PLACED RUNTIME PASS; disposable resources removed',flush=True)
+if __name__=='__main__':main()
