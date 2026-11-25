@@ -100,6 +100,9 @@ class CapsuleRegistry:
                 "ALTER TABLE capsules ADD COLUMN telegram_mode TEXT "
                 "NOT NULL DEFAULT 'dedicated'"
             )
+        if "credential_mode" not in {row['name'] for row in self.db.execute('PRAGMA table_info(capsules)')}:
+            self.db.execute("ALTER TABLE capsules ADD COLUMN credential_mode TEXT NOT NULL DEFAULT 'legacy'")
+        self.db.execute('PRAGMA synchronous=FULL')
         for suffix in ("-wal", "-shm"):
             name = self.db_path.with_name(self.db_path.name + suffix)
             if name.exists():
@@ -158,6 +161,7 @@ class CapsuleRegistry:
         inactive capsule and an atomic replacement of its private credentials.
         """
         current=self.get(sid)
+        if current["credential_mode"]=="external":raise ValueError("Externally provisioned capsule cannot use legacy credentials")
         if current["desired_active"]:
             raise ValueError("Deactivate capsule before changing credentials")
         if telegram_mode not in TELEGRAM_MODES:
@@ -216,8 +220,25 @@ class CapsuleRegistry:
             "WHERE session_id=?",
             (str(group_id),fp,telegram_mode,time.time(),sid))
 
+    def configure_external_shared(self,sid:str,forum:int):
+        """New capsules only; trusted provisioning operator asserts worker secret installed.
+
+        Never accept a MAX token or a secret path at the gateway. No legacy
+        migration or deletion. External activation is an operator decision.
+        """
+        current=self.get(sid)
+        if type(forum) is not int or not -(2**63)<=forum<0:raise ValueError('Invalid forum ID')
+        target=self.capsule_dir(sid)/'credentials.json'
+        if target.exists() or target.is_symlink():raise ValueError('Legacy credentials require separate migration')
+        if current['desired_active'] or current['status'] not in ('UNCONFIGURED','STOPPED') or current['credential_mode']=='legacy' and current['status']!='UNCONFIGURED':raise ValueError('Only new or inactive external capsules')
+        if current['tg_chat_id'] not in (None,str(forum)):raise ValueError('Forum identity cannot change')
+        if self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='tg_routes'").fetchone():
+            route=self.db.execute('SELECT tg_chat_id FROM tg_routes WHERE session_id=?',(sid,)).fetchone()
+            if route and route[0]!=str(forum):raise ValueError('Existing forum binding differs')
+        self.db.execute("UPDATE capsules SET credential_mode='external',telegram_mode='shared',tg_chat_id=?,bot_fingerprint=NULL,status='STOPPED',last_error=NULL,updated_at=? WHERE session_id=?",(str(forum),time.time(),sid))
+
     def credentials(self, sid: str) -> dict[str,str]:
-        self.get(sid)
+        if self.get(sid)["credential_mode"]=="external":raise PermissionError("Gateway has no worker credentials")
         path=self.capsule_dir(sid)/"credentials.json"
         _private_file(path)
         # Ensure no untrusted paths/values are imported as environment knobs.
@@ -235,9 +256,13 @@ class CapsuleRegistry:
         return data
 
     def set_active(self, sid: str, active: bool) -> None:
-        self.get(sid)
+        row=self.get(sid)
         if active:
-            self.credentials(sid)  # refuse activation without private secrets
+            if row['credential_mode']=='external':
+                if row['telegram_mode']!='shared' or not row['tg_chat_id']:raise ValueError('External capsule not configured')
+                path=self.capsule_dir(sid)/'credentials.json'
+                if path.exists() or path.is_symlink():raise PermissionError('Unexpected legacy credential file')
+            else:self.credentials(sid)
         self.db.execute(
             "UPDATE capsules SET desired_active=?,updated_at=? WHERE session_id=?",
             (int(active),time.time(),sid))

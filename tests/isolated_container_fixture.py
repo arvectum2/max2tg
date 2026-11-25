@@ -9,23 +9,24 @@ from app.telegram_ipc import ensure_ipc_key
 from app.shared_gateway_runtime import SharedGatewayRuntime
 from app.isolated_worker_runtime import IsolatedWorkerRuntime
 from app.max_client import MaxMessage
+from app.worker_secrets import install_worker_secret,load_worker_secret,build_max_client
 
 UID=65532
 
 def prepare():
-    for name in ('registry','channel0','channel1','state0','state1'):
+    for name in ('registry','channel0','channel1','state0','state1','secret0','secret1'):
         p=Path('/'+name);assert p.is_dir() and not list(p.iterdir());p.chmod(0o700)
     r=CapsuleRegistry('/registry');plane=TelegramControlPlane(r);sessions=[]
     for i in range(2):
         actor=100+i;forum=-10000-i;owner=r.create_account();sid=r.create_capsule(owner)
-        r.configure(sid,{'MAX_TOKEN':f'synthetic-secret-{i}','MAX_DEVICE_ID':f'synthetic-{i}','TG_ADMIN_USER_ID':str(actor),'TG_CHAT_ID':str(forum)},telegram_mode='shared');r.set_active(sid,True)
+        install_worker_secret(f'/secret{i}',sid,{'session_id':sid,'MAX_TOKEN':f'synthetic-secret-{i}','MAX_DEVICE_ID':f'synthetic-{i}'})
+        r.configure_external_shared(sid,forum);r.set_active(sid,True)
         plane.claim_owner(actor,plane.generate_claim(owner));plane.bind_forum(sid,forum,actor);plane.confirm_forum(forum,is_private_forum=True,owner_is_member=True,bot_is_admin=True);plane.bind_topic(sid,42,77,actor)
         state=Path(f'/state{i}');key=state/'key';key.write_bytes(ensure_ipc_key(r,sid).read_bytes());key.chmod(0o600)
-        (state/'own-secret').write_text(f'synthetic-secret-{i}');(state/'own-secret').chmod(0o600)
         sessions.append([sid,actor,forum])
     (r.root/'synthetic-bot-secret').write_text('not-a-real-token');(r.root/'synthetic-bot-secret').chmod(0o600)
     r.close()
-    for name in ('registry','channel0','channel1','state0','state1'):
+    for name in ('registry','channel0','channel1','state0','state1','secret0','secret1'):
         p=Path('/'+name);os.chown(p,UID,UID)
         for q in p.rglob('*'):os.chown(q,UID,UID)
     print(json.dumps(sessions),flush=True)
@@ -53,8 +54,11 @@ class FakeBot:
         self.sent.append(kw['chat_id']);return SimpleNamespace(message_id=5000+len(self.sent),chat=SimpleNamespace(id=kw['chat_id']),message_thread_id=77)
 
 async def gateway(sessions):
-    assert_sandbox();assert not Path('/state0').exists() and not Path('/state1').exists()
-    r=CapsuleRegistry('/registry');b=FakeBot(sessions);g=SharedGatewayRuntime(r,b,channels={sid:Path(f'/channel{i}') for i,(sid,_,_) in enumerate(sessions)})
+    assert_sandbox();assert not any(Path(p).exists() for p in ('/state0','/state1','/secret0','/secret1'))
+    r=CapsuleRegistry('/registry');assert all(x['credential_mode']=='external' for x in r.list_capsules())
+    assert not list(r.root.rglob('credentials.json')) and not list(r.root.rglob('max.json'))
+    assert all(b'synthetic-secret-' not in p.read_bytes() for p in r.root.rglob('*') if p.is_file())
+    b=FakeBot(sessions);g=SharedGatewayRuntime(r,b,channels={sid:Path(f'/channel{i}') for i,(sid,_,_) in enumerate(sessions)},external_only=True)
     try:
         await g.start();print('READY',flush=True);await g.poll_once();deadline=time.monotonic()+15
         while time.monotonic()<deadline:
@@ -74,11 +78,17 @@ class FakeMax:
 
 async def worker(sid,actor,forum):
     assert_sandbox()
-    for p in ('/registry','/channel0','/channel1','/state0','/state1'):
+    for p in ('/registry','/channel0','/channel1','/state0','/state1','/secret0','/secret1'):
         assert not Path(p).exists(),p
-    assert Path('/state/own-secret').read_text()==f'synthetic-secret-{actor-100}'
+    secret=load_worker_secret('/secret',sid);assert secret['MAX_TOKEN']==f'synthetic-secret-{actor-100}'
+    try:Path('/secret/max.json').write_text('must not write')
+    except OSError:pass
+    else:raise AssertionError('Secret mount is writable')
     assert not hasattr(sys.modules.get('app.isolated_worker_runtime'),'registry')
-    m=FakeMax(actor);w=IsolatedWorkerRuntime(sid,'/state','/channel','/state/key',forum,actor,m)
+    def factory(*,token,device_id,debug):
+        assert token==f'synthetic-secret-{actor-100}' and device_id==f'synthetic-{actor-100}' and debug is False
+        return FakeMax(actor)
+    m=build_max_client('/secret',sid,factory=factory);w=IsolatedWorkerRuntime(sid,'/state','/channel','/state/key',forum,actor,m)
     try:
         await w.start();assert await w.on_message(MaxMessage(chat_id=42,message_id='123',text=f'outgoing-{actor}'))=='PENDING'
         deadline=time.monotonic()+15
@@ -87,7 +97,7 @@ async def worker(sid,actor,forum):
             if w.egress.counts()=={'SENT':1} and w.ledger.counts()=={'SENT':1}:break
             await asyncio.sleep(.05)
         assert w.egress.counts()=={'SENT':1} and w.ledger.counts()=={'SENT':1};assert w.topics.tg_for_max_message(42,'123')>0
-        Path('/channel/done').write_text('synthetic success');print('WORKER PASS: namespace, own secret, signed route, 1 SENT each direction',flush=True)
+        Path('/channel/done').write_text('synthetic success');print('WORKER PASS: namespace, own read-only secret, signed route, 1 SENT each direction',flush=True)
     finally:await w.close()
 
 if __name__=='__main__':
