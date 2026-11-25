@@ -118,7 +118,8 @@ class MaxClient:
     APP_VERSION = "26.11.9"
     HEARTBEAT_SEC = 30
     RECONNECT_SEC = 5
-    def __init__(self, token: str, device_id: str, chat_ids: str | None = None, debug: bool = False):
+    def __init__(self, token: str, device_id: str, chat_ids: str | None = None, debug: bool = False, *, session_factory=None):
+        self._session_factory = session_factory
         self.token = token
         self.device_id = device_id
         self.chat_ids: list[int] = []
@@ -146,6 +147,10 @@ class MaxClient:
         self._on_disconnect_cb = None
         if chat_ids:
             self.chat_ids += map(int, map(str.strip, chat_ids.split(',')))
+
+    def _new_session(self, **kwargs):
+        factory = getattr(self, '_session_factory', None) or aiohttp.ClientSession
+        return factory(**kwargs)
 
     # ── decorator API ──────────────────────────────────────────────
 
@@ -249,7 +254,7 @@ class MaxClient:
             os.makedirs(DEBUG_DIR, exist_ok=True)
 
         self._binary_transport = True
-        async with aiohttp.ClientSession(
+        async with self._new_session(
             headers=_BROWSER_HEADERS, timeout=aiohttp.ClientTimeout(total=60, connect=10, sock_connect=10)
         ) as session:
             self._session = session
@@ -778,7 +783,7 @@ class MaxClient:
         session = getattr(self, "_session", None)
         close_after = False
         if session is None or session.closed:
-            session = aiohttp.ClientSession(headers=_BROWSER_HEADERS)
+            session = self._new_session(headers=_BROWSER_HEADERS)
             close_after = True
         try:
             async with session.get(
@@ -819,7 +824,7 @@ class MaxClient:
         """One bounded raw POST, no redirects or ambiguous retries."""
         if not self._safe_media_url(url) or not 0<len(data)<=25*1024*1024:return False
         session=self._session;close_after=session is None or session.closed
-        if close_after:session=aiohttp.ClientSession(headers=_BROWSER_HEADERS)
+        if close_after:session=self._new_session(headers=_BROWSER_HEADERS)
         headers={**_HTTP_HEADERS,'Content-Type':mimetype,
                  'Content-Disposition':'attachment; filename='+quote(media_filename({'name':filename}),safe=''),
                  'Content-Range':f'bytes 0-{len(data)-1}/{len(data)}'}
@@ -958,7 +963,7 @@ class MaxClient:
         session = getattr(self, "_session", None)
         close_after = False
         if session is None or session.closed:
-            session = aiohttp.ClientSession(headers=_BROWSER_HEADERS)
+            session = self._new_session(headers=_BROWSER_HEADERS)
             close_after = True
         try:
             # aiohttp's default percent-encodes non-ASCII filenames in
@@ -1028,7 +1033,7 @@ class MaxClient:
         session = getattr(self, "_session", None)
         close_after = False
         if session is None or session.closed:
-            session = aiohttp.ClientSession(headers=_BROWSER_HEADERS)
+            session = self._new_session(headers=_BROWSER_HEADERS)
             close_after = True
         try:
             for _ in range(4):

@@ -5,15 +5,17 @@ from app.egress_policy import approved_host,connect_public,EgressDenied
 
 LIMIT=8192
 
-async def read_connect(reader):
+async def read_connect(reader,*,local_adapter=False):
     raw=await asyncio.wait_for(reader.readuntil(b'\r\n\r\n'),3)
     if len(raw)>LIMIT:raise EgressDenied('Header too large')
     lines=raw[:-4].decode('ascii').split('\r\n');first=lines[0].split(' ')
     if len(first)!=3 or first[0]!='CONNECT' or first[2] not in ('HTTP/1.0','HTTP/1.1'):raise EgressDenied('CONNECT required')
     authority=first[1];seen=set()
+    headers={'host','user-agent','proxy-connection','connection','accept','accept-encoding'}
+    if local_adapter:headers.update(('accept-language','sec-ch-ua','sec-ch-ua-mobile','sec-ch-ua-platform'))
     for line in lines[1:]:
         name,sep,value=line.partition(':');name=name.lower()
-        if not sep or name in seen or name not in ('host','user-agent','proxy-connection','connection','accept','accept-encoding'):raise EgressDenied('Unexpected header')
+        if not sep or name in seen or name not in headers:raise EgressDenied('Unexpected header')
         # aiohttp may omit the default port in Host.
         if name=='host' and value.strip() not in (authority,authority.removesuffix(':443')):raise EgressDenied('Host mismatch')
         if any(ord(c)<32 or ord(c)>126 for c in value):raise EgressDenied('Invalid header')
@@ -85,7 +87,7 @@ class LoopbackProxy:
         if len(self.tasks)>=8:await close_writer(writer);return
         self.tasks.add(task)
         try:
-            authority=await read_connect(reader)
+            authority=await read_connect(reader,local_adapter=True)
             r,up=await asyncio.wait_for(asyncio.open_unix_connection(str(self.path),limit=LIMIT),3)
             up.write(f'CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n'.encode('ascii'));await up.drain()
             response=await asyncio.wait_for(r.readuntil(b'\r\n\r\n'),15)
