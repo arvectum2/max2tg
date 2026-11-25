@@ -57,8 +57,9 @@ def _integer(raw):
 class TelegramInbox:
     """Fail-closed durable ingress ledger for a *single* Telegram bot."""
 
-    def __init__(self,db_path:str|Path,plane:TelegramControlPlane):
+    def __init__(self,db_path:str|Path,plane:TelegramControlPlane,*,dispatch_allowed=None):
         self.plane=plane
+        self.dispatch_allowed=dispatch_allowed
         self.path=Path(db_path).absolute()
         if self.path.is_symlink():
             raise ValueError("Symlinked inbox forbidden")
@@ -128,12 +129,13 @@ class TelegramInbox:
             (update_id,)).fetchone()
         return dict(current) if current else None
 
-    def ready(self,limit:int=100) -> list[int]:
+    def ready(self,limit:int=100,*,exclude=()) -> list[int]:
         if not 1<=limit<=100:
             raise ValueError("Invalid batch size")
+        excluded=tuple(sorted(exclude));where=' AND session_id NOT IN ('+','.join('?' for _ in excluded)+')' if excluded else ''
         return [r[0] for r in self.db.execute(
-            "SELECT update_id FROM telegram_ingress WHERE status='RECEIVED' "
-            "ORDER BY update_id LIMIT ?",(limit,))]
+            "SELECT update_id FROM telegram_ingress WHERE status='RECEIVED' "+where+
+            " ORDER BY update_id LIMIT ?",(*excluded,limit))]
 
     async def dispatch(self,update_id:int,deliver:Callable[[str,dict],Awaitable[bool]]) -> str:
         """Dispatch a persisted update. A false/uncertain response is UNKNOWN.
@@ -154,6 +156,7 @@ class TelegramInbox:
                 "UPDATE telegram_ingress SET status='BLOCKED',updated_at=? "
                 "WHERE update_id=?",(time.time(),update_id))
             return "BLOCKED"
+        if self.dispatch_allowed is not None and not self.dispatch_allowed(session):return 'RECEIVED'
         claim=self.db.execute(
             "UPDATE telegram_ingress SET status='INFLIGHT',updated_at=? "
             "WHERE update_id=? AND status='RECEIVED'",

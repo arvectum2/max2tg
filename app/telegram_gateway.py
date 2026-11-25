@@ -36,11 +36,11 @@ class TelegramGatewayEngine:
             raise RuntimeError("Central Telegram egress is not configured")
         return self.egress.enqueue(sid,source_key,text)
 
-    async def drain_egress(self,bot,limit:int=50)->dict[str,int]:
+    async def drain_egress(self,bot,limit:int=50,*,exclude=())->dict[str,int]:
         """Explicitly called by single-bot gateway; never starts polling."""
         if self.egress is None:
             raise RuntimeError("Central Telegram egress is not configured")
-        return await self.egress.drain(bot,limit)
+        return await self.egress.drain(bot,limit,exclude=exclude)
 
     def _trusted_topic(self,sid,update):
         message=update.get('message') or {}
@@ -64,10 +64,10 @@ class TelegramGatewayEngine:
         async with self._locks.setdefault(session,asyncio.Lock()):
             return await self.inbox.dispatch(update_id,self._deliver_scoped)
 
-    async def drain(self,limit:int=100)->dict:
+    async def drain(self,limit:int=100,*,exclude=())->dict:
         """Replay only definitely unsent RECEIVED rows after recovery."""
         results={}
-        for update_id in self.inbox.ready(limit):
+        for update_id in self.inbox.ready(limit,exclude=exclude):
             row=self.inbox.row(update_id)
             session=row["session_id"]
             async with self._locks.setdefault(session,asyncio.Lock()):
