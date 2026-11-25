@@ -8,7 +8,7 @@ from app.isolated_transport import isolated_max_client,isolated_telegram_bot
 from app.max_wire import encode,decode
 from app.max_client import OpCode
 from app.capsule_registry import CapsuleRegistry
-from app.shared_gateway_runtime import SharedGatewayRuntime
+from app.shared_gateway_runtime import SharedGatewayRuntime,remove_dead_socket
 from app.isolated_worker_runtime import IsolatedWorkerRuntime
 from tests.isolated_container_fixture import prepare,assert_sandbox
 from tests.supervised_bridge_fixture import atomic
@@ -20,7 +20,8 @@ def message(gid,mid,text,actor=900):return {'message_id':mid,'date':1700000000,'
 
 async def broker():
     assert_sandbox();ctx=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER);ctx.load_cert_chain('/cert/cert.pem','/cert/key.pem');control=Path('/nettg')
-    counts={'max':[],'tg':[],'auth':[0,0]};servers=[]
+    evidence=control/'counts.json';counts=json.loads(evidence.read_text()) if evidence.exists() else {'max':[],'tg':[],'auth':[0,0]};servers=[]
+    (control/'cut-a').unlink(missing_ok=True);(control/'cut-confirmed').unlink(missing_ok=True)
     def report():atomic(control/'counts.json',counts)
     async def api(req):
         method=req.match_info['method'];form=await req.post();gid=int(form.get('chat_id',-10000));uid=int(form.get('user_id',900))
@@ -63,8 +64,9 @@ async def broker():
             else:app.router.add_post('/bot123456:synthetic/{method}',api)
             runner=web.AppRunner(app);await runner.setup();runners.append(runner);site=web.TCPSite(runner,'127.0.0.1',0,ssl_context=ctx);await site.start();port=site._server.sockets[0].getsockname()[1]
             async def connect(role,target,p=port):return await asyncio.open_connection('127.0.0.1',p)
-            servers.append(TunnelServer('max-text' if i<2 else 'telegram',f'/net{i}/proxy.sock' if i<2 else '/nettg/proxy.sock',connector=connect));await servers[-1].start()
-        report();print('READY',flush=True)
+            path=Path(f'/net{i}/proxy.sock' if i<2 else '/nettg/proxy.sock');await remove_dead_socket(path)
+            servers.append(TunnelServer('max-text' if i<2 else 'telegram',path,connector=connect));await servers[-1].start()
+        report();atomic(control/'broker-boot.json',{'boot':sum(counts['auth'])});print('READY',flush=True)
         while not (control/'stop-broker').exists():
             if (control/'cut-a').exists() and servers[0].server:await servers[0].close();(control/'cut-confirmed').touch()
             if (control/'restore-a').exists() and not servers[0].server and (control/'cut-confirmed').exists():
@@ -80,6 +82,7 @@ async def gateway(sessions):
         async with isolated_telegram_bot('/network/proxy.sock','123456:synthetic',context=ctx) as bot:
             g=SharedGatewayRuntime(r,bot,channels={sid:Path(f'/channel{i}') for i,(sid,_,_) in enumerate(sessions)},external_only=True,managed=True)
             try:
+                for name in ('lifecycle.json','progress.json','paused','pause'):(Path('/registry')/name).unlink(missing_ok=True)
                 await g.start();print('READY',flush=True)
                 while not Path('/registry/stop').exists():
                     atomic('/registry/lifecycle.json',await g.reconcile_channels())
@@ -87,6 +90,9 @@ async def gateway(sessions):
                     except NetworkError:pass
                     await g.drain_once()
                     atomic('/registry/progress.json',{'in':g.inbox.counts(),'out':g.egress.counts(),'rows':{str(i):g.inbox.row(i)['status'] for i in range(1,6) if g.inbox.row(i)}})
+                    if Path('/registry/pause').exists():
+                        Path('/registry/paused').touch()
+                        while Path('/registry/pause').exists():await asyncio.sleep(.05)
                     await asyncio.sleep(.1)
             finally:await g.close()
     finally:r.close()

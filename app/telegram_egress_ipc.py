@@ -121,7 +121,15 @@ class GatewayEgressIpcServer:
                     sid, body["source_key"], body["text"], max_chat_id=body.get("max_chat_id")
                 )
                 result = {"status": state}
-            elif body["action"] == "status" and body["text"] is None:
+                if state=='SENT':
+                    row=self.egress.row(sid,body['source_key'])
+                    result['telegram_id']=row['telegram_id']
+            elif body['action'] in ('status','status_verified'):
+                verified=body['action']=='status_verified'
+                digest=body['text']
+                if verified:
+                    if type(digest) is not str or not re.fullmatch(r'[0-9a-f]{64}',digest):raise ValueError('Invalid content digest')
+                elif digest is not None:raise ValueError('Unexpected status text')
                 row = self.egress.row(sid, body["source_key"])
                 requested=body.get('max_chat_id')
                 if requested is not None:
@@ -129,7 +137,8 @@ class GatewayEgressIpcServer:
                     if row and row['max_chat_id']!=requested:raise ValueError('Source route mismatch')
                 elif row and row['max_chat_id'] is not None:raise ValueError('Scoped status requires source route')
                 result = {"status": row["status"] if row else "MISSING"}
-                if row and row["status"] == "SENT":
+                if verified and row and not hmac.compare_digest(hashlib.sha256(row['text'].encode()).hexdigest(),digest):result={'status':'CONFLICT'}
+                elif row and row["status"] == "SENT":
                     result["telegram_id"] = row["telegram_id"]
             else:
                 raise ValueError("Invalid egress IPC action")
@@ -217,6 +226,7 @@ class GatewayEgressIpcClient:
             if action=='routes':
                 if status!='ROUTES' or set(result)!={'status','forum','actor','routes'} or not isinstance(result['routes'],list) or len(result['routes'])>1000:raise ValueError('Invalid route snapshot')
                 return result
+            if status=="CONFLICT" and action=="status_verified" and set(result)=={"status"}:return result
             if status not in _RESPONSES | {"MISSING"}:
                 raise ValueError("Unexpected gateway outcome")
             if status == "SENT":
@@ -238,6 +248,9 @@ class GatewayEgressIpcClient:
 
     async def status(self, source_key: str, *, max_chat_id=None) -> dict:
         return await self._call("status", source_key, None,max_chat_id=max_chat_id)
+
+    async def status_verified(self,source_key: str,text: str,*,max_chat_id=None) -> dict:
+        return await self._call('status_verified',source_key,hashlib.sha256(text.encode()).hexdigest(),max_chat_id=max_chat_id)
 
     async def routes(self):
         return await self._call("routes","routes",None)
