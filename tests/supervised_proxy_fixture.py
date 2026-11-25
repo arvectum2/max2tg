@@ -5,6 +5,7 @@ from aiohttp import web,WSMsgType
 from telegram.error import NetworkError
 from app.egress_tunnel import TunnelServer
 from app.isolated_transport import isolated_max_client,isolated_telegram_bot
+from app.telegram_budget import TelegramBudget
 from app.max_wire import encode,decode
 from app.max_client import OpCode
 from app.capsule_registry import CapsuleRegistry
@@ -25,6 +26,12 @@ async def broker():
     def report():atomic(control/'counts.json',counts)
     async def api(req):
         method=req.match_info['method'];form=await req.post();gid=int(form.get('chat_id',-10000));uid=int(form.get('user_id',900))
+        if (control/'rate-trigger').exists() and method=='getUpdates' and 'rate_until' not in counts:
+            counts['rate_until']=time.time()+8;counts['early_calls']=0;report()
+            return web.json_response({'ok':False,'error_code':429,'description':'synthetic rate limit','parameters':{'retry_after':8}},status=429)
+        if time.time()<counts.get('rate_until',0):
+            counts['early_calls']+=1;report()
+        elif 'rate_until' in counts:counts['after_rate']=True;report()
         if method=='getMe':data=user(900)
         elif method=='getChat':data={**chat(gid),'accent_color_id':0,'max_reaction_count':1,'accepted_gift_types':{'unlimited_gifts':False,'limited_gifts':False,'unique_gifts':False,'premium_subscription':False,'gifts_from_channels':False}}
         elif method=='getChatMemberCount':data=2
@@ -80,7 +87,7 @@ async def broker():
 async def gateway(sessions):
     assert_sandbox();ctx=ssl.create_default_context(cafile='/registry/test-ca.pem');r=CapsuleRegistry('/registry')
     try:
-        async with isolated_telegram_bot('/network/proxy.sock','123456:synthetic',context=ctx) as bot:
+        async with isolated_telegram_bot('/network/proxy.sock','123456:synthetic',context=ctx,budget=TelegramBudget(r.db)) as bot:
             g=SharedGatewayRuntime(r,bot,channels={sid:Path(f'/channel{i}') for i,(sid,_,_) in enumerate(sessions)},external_only=True,managed=True)
             try:
                 for name in ('lifecycle.json','progress.json','paused','pause'):(Path('/registry')/name).unlink(missing_ok=True)
@@ -91,7 +98,7 @@ async def gateway(sessions):
                     try:await g.poll_once()
                     except NetworkError:pass
                     await g.drain_once()
-                    atomic('/registry/progress.json',{'in':g.inbox.counts(),'out':g.egress.counts(),'rows':{str(i):g.inbox.row(i)['status'] for i in range(1,6) if g.inbox.row(i)}})
+                    atomic('/registry/progress.json',{'in':g.inbox.counts(),'out':g.egress.counts(),'cooldown':g.bot.budget.remaining,'rows':{str(i):g.inbox.row(i)['status'] for i in range(1,6) if g.inbox.row(i)}})
                     if Path('/registry/pause').exists():
                         Path('/registry/paused').touch()
                         while Path('/registry/pause').exists():await asyncio.sleep(.05)
