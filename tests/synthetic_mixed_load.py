@@ -6,7 +6,7 @@ IDLE=(32,50)
 
 def schedule(tenants,cycles=1):
     if type(cycles) is not int or not 1<=cycles<=3:raise ValueError('Invalid cycle count')
-    if tenants not in (2,4,8,16):raise ValueError('Invalid cohort')
+    if tenants not in (2,4,8,16,32):raise ValueError('Invalid cohort')
     seq=Counter();waves=[]
     def add(at,counts):
         entries=[]

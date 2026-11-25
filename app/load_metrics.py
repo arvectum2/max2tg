@@ -7,7 +7,7 @@ def _mib(value):
     return float(m[1])*{'B':2**-20,'KiB':2**-10,'MiB':1,'GiB':1024,'TiB':1024**2}[m[2]]
 
 def summarize_load(n,baseline,samples,effects,elapsed,*,tenants=2):
-    if tenants not in (2,4,8,16) or not samples or type(n) is not int or not 1<=n<=25 or not math.isfinite(elapsed) or elapsed<=0:raise ValueError('Invalid benchmark')
+    if tenants not in (2,4,8,16,32) or not samples or type(n) is not int or not 1<=n<=25 or not math.isfinite(elapsed) or elapsed<=0:raise ValueError('Invalid benchmark')
     expected={f'load-{d}-{i}-{j}' for d in ('in','out') for i in range(tenants) for j in range(n)}
     if len(effects)!=len(expected) or {x[0] for x in effects}!=expected or any(not math.isfinite(x[1]) or x[1]<0 for x in effects):raise ValueError('Incomplete or duplicate effects')
     resources={}
