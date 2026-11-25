@@ -7,7 +7,7 @@ from app.deployment_plan import build_plan,_verify_stopped,validate_bind_sources
 from app.container_supervisor import DockerBackend
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--image',required=True);p.add_argument('--native-volumes',action='store_true');p.add_argument('--load',type=int,choices=range(1,26));p.add_argument('--tenants',type=int,choices=(2,4,8,16),default=2);p.add_argument('--profile',action='store_true');p.add_argument('--long-poll',action='store_true');p.add_argument('--mixed',action='store_true');p.add_argument('--soak',action='store_true');p.add_argument('--storage-check',action='store_true');p.add_argument('--wal-maintenance',action='store_true');a=p.parse_args();
+    p=argparse.ArgumentParser();p.add_argument('--image',required=True);p.add_argument('--native-volumes',action='store_true');p.add_argument('--load',type=int,choices=range(1,26));p.add_argument('--tenants',type=int,choices=(2,4,8,16,32),default=2);p.add_argument('--profile',action='store_true');p.add_argument('--long-poll',action='store_true');p.add_argument('--mixed',action='store_true');p.add_argument('--soak',action='store_true');p.add_argument('--storage-check',action='store_true');p.add_argument('--wal-maintenance',action='store_true');a=p.parse_args();
     if a.storage_check and not a.mixed:p.error('Storage check requires mixed workload')
     if a.wal_maintenance and not (a.storage_check or a.soak):p.error('WAL candidate requires resource checkpoints')
     if a.soak and not a.mixed:p.error('Soak requires mixed workload')
@@ -15,7 +15,16 @@ def main():
     if a.long_poll and not ((a.load or a.mixed) and a.profile):p.error('Long polling comparison requires profiled bounded load')
     if a.profile and not (a.load or a.mixed):p.error('Profile requires bounded load mode')
     if a.tenants!=2 and (not a.native_volumes or not (a.load or a.mixed)):p.error('Larger cohorts require native volumes and bounded load mode')
-    d=DockerBackend();code=Path(__file__).resolve().parents[1];image=d.call('image','inspect','--format','{{.Id}}',a.image);owner=secrets.token_hex(12);label='max2tg.placement='+owner
+    if a.tenants==32 and not (a.mixed and a.native_volumes and a.profile and a.long_poll and a.storage_check and a.wal_maintenance and not a.soak):p.error('32 tenants require single mixed cycle with WAL and storage observations')
+    d=DockerBackend()
+    if a.tenants==32:
+        from app.load_metrics import _mib
+        vm=int(d.call('info','--format','{{.MemTotal}}'))/2**20
+        running=[json.loads(x) for x in d.call('stats','--no-stream','--format','{{json .}}').splitlines()]
+        occupied=sum(_mib(x['MemUsage'].split('/')[0]) for x in running)
+        if vm<7000 or vm-occupied<4096:raise RuntimeError('Insufficient sampled Docker VM headroom')
+        print('COHORT PREFLIGHT '+json.dumps({'vm_mib':round(vm,1),'existing_sampled_mib':round(occupied,1),'test_sampled_cap_mib':2048,'test_cpu_cap_percent':350}),flush=True)
+    code=Path(__file__).resolve().parents[1];image=d.call('image','inspect','--format','{{.Id}}',a.image);owner=secrets.token_hex(12);label='max2tg.placement='+owner
     with tempfile.TemporaryDirectory(prefix='runtime-',dir=code) as td:
         root=Path(td).resolve();fixture=root/'fixture';fixture.mkdir(mode=0o700);cert=root/'cert';cert.mkdir();subprocess.run(['openssl','req','-x509','-newkey','rsa:2048','-nodes','-days','1','-subj','/CN=synthetic','-addext','subjectAltName=DNS:api.oneme.ru,DNS:api.telegram.org','-keyout',str(cert/'key.pem'),'-out',str(cert/'cert.pem')],check=True,capture_output=True);(cert/'key.pem').chmod(0o644)
         plan=None;ids={};vol={};initname='m2tg-placement-'+owner+'-init'
@@ -39,7 +48,7 @@ def main():
                     vol[n]=d.call('volume','create','--label',label,'m2tg-placement-'+owner+'-'+n)
                     v=d.volume(vol[n]);assert v.get('Labels',{}).get('max2tg.placement')==owner and v['Driver']=='local' and not v.get('Options')
                 args=args[:-3]+[z for n,v in vol.items() for z in ('--mount',f'type=volume,source={v},target=/{n}')]+args[-3:]
-            d.call('run','-d','--name',initname,*args,'-m',module,'init',*([str(a.tenants)] if a.native_volumes else []));wait(lambda:d.inspect(initname)['State']['Status']=='exited',timeout=75)
+            d.call('run','-d','--name',initname,*args,'-m',module,'init',*([str(a.tenants)] if a.native_volumes else []));wait(lambda:d.inspect(initname)['State']['Status']=='exited',timeout=100 if a.tenants==32 else 75)
             assert d.inspect(initname)['State']['ExitCode']==0,d.call('logs',initname)
             sessions=json.loads(d.call('logs',initname));assert len(sessions)==a.tenants
             sids=[x[0] for x in sessions];plan=build_plan(owner,image,sids,data=fixture/'data',keys=fixture/'keys',backup=fixture/'backup')
@@ -80,16 +89,16 @@ def main():
             def touch(name):exec_py(broker,f'from pathlib import Path;Path("/network/telegram/{name}").touch()')
             def start_broker():
                 at=time.time();d.start(broker);wait(lambda:(read(broker,'/network/telegram/broker-health.json') or {}).get('at',0)>=at)
-            start_broker();d.start(gateway);wait(ready)
+            start_broker();d.start(gateway);wait(ready,timeout=45 if a.tenants==32 else 20)
             for cid in workers:d.start(cid)
-            touch('phase1');wait(lambda:receipts(a.tenants) and len(counts().get('tg',[]))==a.tenants and len(counts().get('max',[]))==a.tenants,timeout=45)
+            touch('phase1');wait(lambda:receipts(a.tenants) and len(counts().get('tg',[]))==a.tenants and len(counts().get('max',[]))==a.tenants,timeout=75 if a.tenants==32 else 45)
             print(f'Actual run_isolated_gateway/worker: {a.tenants}+{a.tenants} confirmed on '+('native volume' if a.native_volumes else 'bind')+' placement',flush=True)
             if a.load or a.mixed:
                 from app.load_metrics import summarize_load,_mib
                 samples=[]
                 def sample():
                     raw=d.call('stats','--no-stream','--format','{{json .}}',*ids.values());rows=[json.loads(x) for x in raw.splitlines()];
-                    if sum(_mib(x['MemUsage'].split('/')[0]) for x in rows)>1024 or sum(float(x['CPUPerc'].rstrip('%')) for x in rows)>250:raise RuntimeError('Synthetic load resource stop limit exceeded')
+                    if sum(_mib(x['MemUsage'].split('/')[0]) for x in rows)>(2048 if a.tenants==32 else 1024) or sum(float(x['CPUPerc'].rstrip('%')) for x in rows)>(350 if a.tenants==32 else 250):raise RuntimeError('Synthetic load resource stop limit exceeded')
                     samples.append({'resources':rows,'inbox':ledger(gateway,'/registry/inbox.sqlite3','telegram_ingress'),'egress':ledger(gateway,'/registry/telegram-egress.sqlite3','telegram_egress')})
                 def profiles(index):
                     targets={role:cid for role,cid in ids.items() if role!='broker'}
@@ -116,6 +125,7 @@ def main():
                         return by_role
                     checkpoints=[]
                     if a.soak or a.storage_check:checkpoints.append({'at':0,'roles':resources_snapshot()})
+                    if a.tenants==32:exec_py(gateway,'from pathlib import Path;Path("/registry/lease-observe").touch()')
                     begin=time.monotonic();touch('mixed-start');observations=[];deadline=begin+105+90*(cycles-1)
                     while True:
                         sample();last=samples[-1];result=counts()
@@ -138,6 +148,9 @@ def main():
                         from tests.soak_observe import summarize_resources
                         checkpoints.append({'at':round(time.monotonic()-begin,3),'roles':resources_snapshot()})
                         metrics['resources']=summarize_resources(checkpoints,cycles=cycles)
+                    if a.tenants==32:
+                        metrics['lease_observation']=read(gateway,'/registry/lease-observation.json')
+                        assert metrics['lease_observation']['samples']>0
                     metrics['wal_maintenance']=a.wal_maintenance
                     print('MIXED RESULT '+json.dumps(metrics,sort_keys=True),flush=True)
                     print('PROFILE RESULT '+json.dumps(stages,sort_keys=True),flush=True)
