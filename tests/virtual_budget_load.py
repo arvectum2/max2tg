@@ -70,21 +70,7 @@ async def scenario(root,tenants,rate,*,fault=False,latency=.04,scheduler="wave",
                     async with lock:pass # same reconcile/drain exclusion, no socket cost
                     await asyncio.sleep(.2)
             else:
-                pending={}
-                try:
-                    while True:
-                        for sid,task in list(pending.items()):
-                            if task.done():await task;del pending[sid]
-                        now=clock()
-                        if not budget.remaining:
-                            rows=[dict(row) for row in guard.onboarding.db.execute("SELECT * FROM shared_onboarding WHERE stage='ACTIVE'") if row['sid'] in active and row['sid'] not in pending and now>=guard.next_check.get(row['sid'],-1)]
-                            rows.sort(key=lambda row:(guard.valid.get(row['sid'],-1),guard.next_check.get(row['sid'],-1),row['sid']))
-                            for row in rows[:concurrency-len(pending)]:pending[row['sid']]=asyncio.create_task(guard._check(row))
-                        if pending:await asyncio.wait(pending.values(),timeout=.05,return_when=asyncio.FIRST_COMPLETED)
-                        else:await asyncio.sleep(.05)
-                finally:
-                    for task in pending.values():task.cancel()
-                    if pending:await asyncio.gather(*pending.values(),return_exceptions=True)
+                await guard.run_rolling(lambda:active,asyncio.Event())
         async def polls():
             while True:
                 try:await bot.get_updates(timeout=20)

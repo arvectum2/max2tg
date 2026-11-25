@@ -45,12 +45,13 @@ async def isolated_max_client(socket_path,secret_dir,sid,*,context=None,key_path
 
 
 @asynccontextmanager
-async def isolated_telegram_bot(socket_path,token,*,context=None,budget=None):
+async def isolated_telegram_bot(socket_path,token,*,context=None,budget=None,pool_size=8):
     ctx=verified_context(context);proxy=LoopbackProxy(socket_path);requests=[]
     async with AsyncExitStack() as stack:
         stack.push_async_callback(proxy.close)
         url=await proxy.start()
-        for pool in (8,1):
+        if pool_size not in (8,12):raise ValueError("Invalid request pool")
+        for pool in (pool_size,1):
             req=HTTPXRequest(proxy=url,connection_pool_size=pool,httpx_kwargs={'trust_env':False,'verify':ctx})
             requests.append(req);stack.push_async_callback(req.shutdown)
         bot=Bot(token,request=requests[0],get_updates_request=requests[1])
@@ -79,7 +80,7 @@ async def run_isolated_worker(stop,*,socket_path,secret_dir,sid,state,channel,ke
         await runtime.run(stop)
 
 
-async def run_isolated_gateway(stop,*,socket_path,registry,channels,context=None,token=None,secret_dir=None,secret_key_path=None,bot_id=None,profile=None,wal_maintenance=False):
+async def run_isolated_gateway(stop,*,socket_path,registry,channels,context=None,token=None,secret_dir=None,secret_key_path=None,bot_id=None,profile=None,wal_maintenance=False,balanced=False):
     """Trusted composition; no public entrypoint or production supervisor."""
     from app.shared_gateway_runtime import SharedGatewayRuntime
     if any(x is not None for x in (secret_dir,secret_key_path,bot_id)):
@@ -87,8 +88,13 @@ async def run_isolated_gateway(stop,*,socket_path,registry,channels,context=None
         from app.encrypted_credentials import load_encrypted_bot
         token=load_encrypted_bot(secret_dir,bot_id,secret_key_path)
     elif token is None:raise ValueError('Gateway credentials required')
-    async with isolated_telegram_bot(socket_path,token,context=context,budget=TelegramBudget(registry.db,profile=profile)) as bot:
-        runtime=SharedGatewayRuntime(registry,bot,channels=channels,external_only=True,managed=True,profile=profile)
+    if balanced:
+        from app.weighted_budget import WeightedBudget
+        if not 1<=len(channels)<=32:raise ValueError('Experimental cohort limited to 32')
+        budget=WeightedBudget(registry.db,profile=profile,verify_weight=2)
+    else:budget=TelegramBudget(registry.db,profile=profile)
+    async with isolated_telegram_bot(socket_path,token,context=context,budget=budget,pool_size=12 if balanced else 8) as bot:
+        runtime=SharedGatewayRuntime(registry,bot,channels=channels,external_only=True,managed=True,profile=profile,balanced=balanced)
         if wal_maintenance:
             try:runtime.enable_wal_maintenance()
             except BaseException:

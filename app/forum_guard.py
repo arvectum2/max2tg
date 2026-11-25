@@ -124,3 +124,27 @@ class ForumGuard:
                 for task in tasks:
                     if not task.done():task.cancel()
                 if tasks:await asyncio.gather(*tasks,return_exceptions=True)
+
+    async def run_rolling(self,active_provider,stop):
+        """Single owned verifier pool; never detach checks from runtime shutdown."""
+        async with self.lock:
+            pending={}
+            try:
+                while not stop.is_set():
+                    active=set(active_provider())
+                    for sid in set(self.valid)-active:self.valid.pop(sid,None)
+                    for sid,task in list(pending.items()):
+                        if sid not in active:
+                            self.valid.pop(sid,None);self.generation[sid]=self.generation.get(sid,0)+1
+                            task.cancel();await asyncio.gather(task,return_exceptions=True);del pending[sid]
+                        elif task.done():await task;del pending[sid]
+                    if not self._remaining():
+                        now=self.clock()
+                        rows=[dict(row) for row in self.onboarding.db.execute("SELECT * FROM shared_onboarding WHERE stage='ACTIVE'") if row['sid'] in active and row['sid'] not in pending and now>=self.next_check.get(row['sid'],-1)]
+                        rows.sort(key=lambda row:(self.valid.get(row['sid'],-1),self.next_check.get(row['sid'],-1),row['sid']))
+                        for row in rows[:self.concurrency-len(pending)]:pending[row['sid']]=asyncio.create_task(self._check(row))
+                    if pending:await asyncio.wait(pending.values(),timeout=.05,return_when=asyncio.FIRST_COMPLETED)
+                    else:await asyncio.sleep(.05)
+            finally:
+                for task in pending.values():task.cancel()
+                if pending:await asyncio.gather(*pending.values(),return_exceptions=True)
