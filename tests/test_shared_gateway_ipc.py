@@ -453,3 +453,41 @@ def test_dedicated_database_schema_migrates_to_explicit_mode(tmp_path):
         assert after.credentials(sid)["TG_BOT_TOKEN"]=="synthetic:legacy-bot"
     finally:
         after.close()
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('lose_ack',[False,True])
+async def test_missing_central_receipt_after_attempt_never_reenqueued(setup,lose_ack):
+    reg,_,ledger,server,sessions=setup;sid=sessions[0][0];q=worker_queue(reg,sid);c=client(reg,sid)
+    class Lost(GatewayEgressIpcClient):
+        async def enqueue(self,key,text):
+            await super().enqueue(key,text);raise TimeoutError('lost ack')
+    await server.start()
+    try:
+        q.stage('max:lost','synthetic');assert await q.reconcile_one(Lost(sid,server.path,ipc_key_path(reg,sid)) if lose_ack else c,'max:lost')==('PENDING' if lose_ack else 'ACCEPTED')
+        bot=SimpleNamespace(send_message=AsyncMock(return_value=SimpleNamespace(message_id=123)))
+        assert await ledger.drain(bot)=={'SENT':1}
+        # Synthetic partial restore: central record disappears, worker survives.
+        ledger.db.execute('DELETE FROM telegram_egress');q.close();q=worker_queue(reg,sid)
+        assert await q.reconcile_one(c,'max:lost')=='UNKNOWN';assert ledger.counts()=={}
+        assert await q.drain(c)=={};bot.send_message.assert_awaited_once()
+    finally:q.close();await server.stop()
+
+@pytest.mark.asyncio
+async def test_existing_receipt_must_match_content_and_enqueue_returns_id(setup):
+    reg,_,ledger,server,sessions=setup;sid=sessions[0][0];c=client(reg,sid);q=worker_queue(reg,sid)
+    await server.start()
+    try:
+        await c.enqueue('max:existing','original');bot=SimpleNamespace(send_message=AsyncMock(return_value=SimpleNamespace(message_id=345)))
+        assert await ledger.drain(bot)=={'SENT':1};assert await c.enqueue('max:existing','original')=={'status':'SENT','telegram_id':345}
+        q.stage('max:existing','different');assert await q.reconcile_one(c,'max:existing')=='UNKNOWN';assert q.row('max:existing')['telegram_id'] is None
+        bot.send_message.assert_awaited_once()
+    finally:q.close();await server.stop()
+
+@pytest.mark.asyncio
+async def test_legacy_pending_without_submission_proof_is_quarantined(setup):
+    reg,_,ledger,server,sessions=setup;sid=sessions[0][0];q=worker_queue(reg,sid);q.stage('max:old','old');q.db.execute('ALTER TABLE worker_telegram_intents DROP COLUMN submission_attempted');q.close();q=worker_queue(reg,sid)
+    await server.start()
+    try:
+        assert q.row('max:old')['submission_attempted']==1;assert await q.reconcile_one(client(reg,sid),'max:old')=='UNKNOWN';assert ledger.counts()=={}
+        q.stage('max:new','new');assert q.row('max:new')['submission_attempted']==0;assert await q.reconcile_one(client(reg,sid),'max:new')=='ACCEPTED'
+    finally:q.close();await server.stop()

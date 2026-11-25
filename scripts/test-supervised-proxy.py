@@ -43,7 +43,18 @@ def main():
             touch(gateway,'/network/phase1');wait(lambda:progress().get('in')=={'ACKED':2} and all(wp(c).get('out')=={'SENT':1} for c in (aid,bid)));print('Initial actual-client 2+2 receipts',flush=True)
             touch(gateway,'/network/cut-a');wait(lambda:wp(aid).get('authorized') is False and wp(bid).get('authorized') is True)
             touch(gateway,'/network/phase2');wait(lambda:progress().get('rows')=={'1':'ACKED','2':'ACKED','3':'RECEIVED','4':'ACKED'});assert len(counts()['max'])==3;print('A network cut: pending ingress retained, B confirmed',flush=True)
-            touch(gateway,'/network/restore-a');wait(lambda:progress().get('in')=={'ACKED':4} and wp(aid).get('authorized') is True);assert len(counts()['max'])==4 and len(counts()['tg'])==2
+            # Crash at a known durable queue boundary, not during an ambiguous send.
+            touch(gateway,'/registry/pause')
+            wait(lambda:d.call('exec',gateway,'python','-c','from pathlib import Path;print(Path("/registry/paused").exists())')=='True')
+            rec=None
+            for cid in (gateway,broker):d.call('kill','--signal','KILL',cid)
+            wait(lambda:wp(aid).get('authorized') is False and wp(bid).get('authorized') is False)
+            d.call('start',broker)
+            wait(lambda:wp(aid).get('authorized') is True and wp(bid).get('authorized') is True)
+            d.call('start',gateway)
+            wait(lambda:progress().get('in')=={'ACKED':4} and wp(aid).get('authorized') is True)
+            rec=LifecycleReconciler(s);assert len(counts()['max'])==4 and len(counts()['tg'])==2
+            print('Full gateway + broker hard restart: pending ingress recovered, receipts retained',flush=True)
             touch(gateway,'/network/phase3');wait(lambda:progress().get('rows',{}).get('5')=='UNKNOWN' and wp(aid).get('authorized') is True and wp(aid).get('in')=={'SENT':2,'UNKNOWN':1});assert counts()['max'].count([0,'ambiguous-0'])==1
             assert sorted(counts()['max'])==sorted([[0,'incoming-0-0'],[1,'incoming-1-0'],[0,'incoming-0-1'],[1,'incoming-1-1'],[0,'ambiguous-0']]);assert sorted(counts()['tg'])==[[-10001,'outgoing-1'],[-10000,'outgoing-0']]
             assert s.row(a)['cid']==aid and s.row(b)['cid']==bid and all(s.row(x)['attempts']==1 for x in ids);print('Recovered 4 ACKED + 2 SENT, 1 UNKNOWN; no resend, no container restart',flush=True)

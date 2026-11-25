@@ -51,6 +51,8 @@ class CapsuleEgressOutbox:
         columns={r['name'] for r in self.db.execute('PRAGMA table_info(worker_telegram_intents)')}
         for name in ('max_chat_id','max_message_id'):
             if name not in columns:self.db.execute(f'ALTER TABLE worker_telegram_intents ADD COLUMN {name} TEXT')
+        # Legacy pending rows have no proof of non-submission. Conservative migration.
+        if 'submission_attempted' not in columns:self.db.execute('ALTER TABLE worker_telegram_intents ADD COLUMN submission_attempted INTEGER NOT NULL DEFAULT 1')
         for suffix in ("-wal", "-shm"):
             extra = self.path.with_name(self.path.name + suffix)
             if extra.exists():
@@ -89,8 +91,8 @@ class CapsuleEgressOutbox:
             return old["status"]
         self.db.execute(
             "INSERT INTO worker_telegram_intents "
-            "(source_key,text,fingerprint,status,updated_at,max_chat_id,max_message_id) "
-            "VALUES(?,?,?,'PENDING',?,?,?)",
+            "(source_key,text,fingerprint,status,updated_at,max_chat_id,max_message_id,submission_attempted) "
+            "VALUES(?,?,?,'PENDING',?,?,?,0)",
             (key, text, fp, time.time(),max_chat_id,max_message_id)
         )
         return "PENDING"
@@ -105,13 +107,21 @@ class CapsuleEgressOutbox:
             if old["status"] in TERMINAL:
                 return old["status"]
             try:
-                result = await client.status(key,max_chat_id=old["max_chat_id"]) if old["max_chat_id"] is not None else await client.status(key)
-                if result["status"] == "MISSING":
-                    result = await client.enqueue(key, old["text"],max_chat_id=old["max_chat_id"]) if old["max_chat_id"] is not None else await client.enqueue(key, old["text"])
+                result = await client.status_verified(key,old['text'],max_chat_id=old['max_chat_id'])
+                if result['status']=='CONFLICT':
+                    result={'status':'UNKNOWN'}
+                elif result['status']=='MISSING':
+                    if old['status']=='ACCEPTED' or old['submission_attempted']:
+                        # Missing central evidence is not evidence of non-delivery.
+                        result={'status':'UNKNOWN'}
+                    else:
+                        # Commit before any IPC enqueue bytes, including cancellation.
+                        changed=self.db.execute("UPDATE worker_telegram_intents SET submission_attempted=1 WHERE source_key=? AND status='PENDING' AND submission_attempted=0",(key,))
+                        if changed.rowcount!=1:return self.row(key)['status']
+                        result = await client.enqueue(key, old['text'],max_chat_id=old['max_chat_id']) if old['max_chat_id'] is not None else await client.enqueue(key, old['text'])
             except (OSError, EOFError, asyncio.TimeoutError, ValueError):
-                # Gateway may already have committed this event; same key
-                # is safe to retry without creating a second Bot API send.
-                return old["status"]
+                # Reconcile on the next signed status; never resubmit blindly.
+                return old['status']
             state = result["status"]
             if state in ("QUEUED", "SENDING"):
                 final = "ACCEPTED"  # NOT a Telegram delivery acknowledgement.
