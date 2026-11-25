@@ -4,7 +4,9 @@ Caller is an authenticated provisioning operator, not an exposed HTTP/bot
 handler. Forum checks are snapshots; continuous ACL checks remain necessary.
 """
 from __future__ import annotations
-import asyncio,time
+import asyncio,time,inspect
+from functools import wraps
+from app.runtime_lock import RuntimeLock
 from app.telegram_control_plane import TelegramControlPlane
 from app.telegram_ipc import ensure_ipc_key
 
@@ -19,9 +21,30 @@ async def inspect_forum(row,bot):
     if not valid:raise ForumPolicyViolation('Forum verification failed')
     return bid
 
+def provisioning_write(method):
+    """Cooperative shared fence; offline backup takes the exclusive lock."""
+    if inspect.iscoroutinefunction(method):
+        @wraps(method)
+        async def guarded(self,*args,**kwargs):
+            lock=RuntimeLock(self.registry.root/'shared-provisioning.lock',shared=True)
+            try:return await method(self,*args,**kwargs)
+            finally:lock.close()
+    else:
+        @wraps(method)
+        def guarded(self,*args,**kwargs):
+            lock=RuntimeLock(self.registry.root/'shared-provisioning.lock',shared=True)
+            try:return method(self,*args,**kwargs)
+            finally:lock.close()
+    return guarded
+
 class SharedOnboarding:
     def __init__(self,registry):
-        self.registry=registry;self.plane=TelegramControlPlane(registry);self.db=registry.db
+        self.registry=registry
+        self._initialize()
+
+    @provisioning_write
+    def _initialize(self):
+        self.plane=TelegramControlPlane(self.registry);self.db=self.registry.db
         self._lock=asyncio.Lock()
         self.db.execute('''CREATE TABLE IF NOT EXISTS shared_onboarding(
           request_id TEXT PRIMARY KEY, actor TEXT NOT NULL UNIQUE, forum TEXT NOT NULL UNIQUE,
@@ -35,6 +58,7 @@ class SharedOnboarding:
         if not r:raise KeyError('Unknown onboarding request')
         return dict(r)
 
+    @provisioning_write
     def reserve(self,request_id,actor,forum):
         """Bind an already authenticated actor to one new capsule atomically."""
         self.registry._check_id(request_id)
@@ -56,6 +80,7 @@ class SharedOnboarding:
             db.execute('COMMIT');return sid
         except BaseException:db.execute('ROLLBACK');raise
 
+    @provisioning_write
     async def verify_forum(self,request_id,bot):
         """Use injected trusted Bot API reads; never create a group or invite."""
         async with self._lock:
@@ -76,11 +101,13 @@ class SharedOnboarding:
             except BaseException:db.execute('ROLLBACK');raise
             return self.row(request_id)['stage']
 
+    @provisioning_write
     def ipc_key(self,request_id):
         row=self.row(request_id)
         if row['stage'] not in ('FORUM_VERIFIED','PROVISIONED','ACTIVE'):raise PermissionError('Forum must be verified')
         return ensure_ipc_key(self.registry,row['sid'])
 
+    @provisioning_write
     def confirm_provisioned(self,request_id,*,check):
         """Trusted local provisioner checks exact sid/ACL/volumes/key/secret.
 
@@ -92,6 +119,7 @@ class SharedOnboarding:
         result=self.db.execute("UPDATE shared_onboarding SET stage='PROVISIONED',updated=? WHERE request_id=? AND stage IN ('FORUM_VERIFIED','PROVISIONED')",(time.time(),request_id))
         if result.rowcount!=1:raise PermissionError('Provisioning stage changed')
 
+    @provisioning_write
     async def activate(self,request_id,bot,*,check):
         # Fresh forum verification and local evidence required; no launch here.
         if self.row(request_id)['stage'] not in ('PROVISIONED','ACTIVE'):raise PermissionError('Not provisioned')
@@ -108,6 +136,7 @@ class SharedOnboarding:
         except BaseException:self.db.execute('ROLLBACK');raise
         return row['sid']
 
+    @provisioning_write
     def revoke(self,request_id):
         self.db.execute('BEGIN IMMEDIATE')
         try:
