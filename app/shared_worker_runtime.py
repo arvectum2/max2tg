@@ -15,10 +15,11 @@ from app.telegram_inbox import WorkerUnavailable
 from app.shared_gateway_runtime import RuntimeLock,remove_dead_socket
 from app.tg_outbox import TelegramOutbound
 from app.topics import TopicStore
+from app.stage_profile import measure,started,finished
 
 class SharedWorkerRuntime:
     def __init__(self,registry,sid,client):
-        self.registry=registry;self.sid=sid;self.client=client;self.started=False;self.closed=False;self._lock=asyncio.Lock()
+        self.profile=None;self.registry=registry;self.sid=sid;self.client=client;self.started=False;self.closed=False;self._lock=asyncio.Lock()
         row=registry.get(sid)
         if row['telegram_mode']!='shared' or not row['desired_active']:raise PermissionError('Shared active capsule required')
         base=registry.capsule_dir(sid);self.owner=RuntimeLock(base/'worker.lock');self.ledger=None;self.egress=None
@@ -59,18 +60,22 @@ class SharedWorkerRuntime:
         self.client.on_message(self.on_message);self.started=True
 
     async def _receive(self,update):
+        at=started(self.profile)
         async with self._lock:
+            finished(self.profile,"worker.lock",at)
             if not self.started:raise WorkerUnavailable()
-            try:await self.refresh_routes()
+            try:
+                with measure(self.profile,"worker.route"):await self.refresh_routes()
             except (OSError,EOFError,asyncio.TimeoutError,ValueError):raise WorkerUnavailable() from None
-            return await self.ingress(update)
+            with measure(self.profile,"worker.ingress"):return await self.ingress(update)
 
     async def on_message(self,msg):
         # Do not hold the ingress lock across the client's echo correlation:
         # it may await the in-flight MAX RPC acknowledgement.
         if not self.started:raise RuntimeError('Worker not started')
         cid=TelegramControlPlane.max_chat_key(msg.chat_id)
-        try:await self.refresh_routes()
+        try:
+            with measure(self.profile,"worker.route"):await self.refresh_routes()
         except (OSError,EOFError,asyncio.TimeoutError,ValueError):outcome='ROUTE_UNAVAILABLE'
         else:outcome=await self._classify(msg,cid)
         if outcome in ('UNBOUND','PAUSED','UNSUPPORTED','BLOCKED','SELF_UNVERIFIED','ROUTE_UNAVAILABLE'):
@@ -93,7 +98,8 @@ class SharedWorkerRuntime:
     async def drain_once(self):
         async with self._lock:
             if not self.started:raise RuntimeError('Worker not started')
-            try:await self.refresh_routes()
+            try:
+                with measure(self.profile,"worker.route"):await self.refresh_routes()
             except (OSError,EOFError,asyncio.TimeoutError,ValueError):return {"ROUTE_UNAVAILABLE":1}
             return await self.listener.drain()
 

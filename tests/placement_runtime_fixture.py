@@ -3,6 +3,7 @@ import asyncio,json,os,signal,ssl,sys,shutil
 from pathlib import Path
 from types import SimpleNamespace as NS
 from app.capsule_registry import CapsuleRegistry
+from app.stage_profile import StageProfile
 from app.shared_onboarding import SharedOnboarding
 from app.encrypted_storage import create_key
 from app.encrypted_credentials import install_encrypted_worker,install_encrypted_bot
@@ -47,16 +48,22 @@ async def prepare():
 def stop_event():
     stop=asyncio.Event();asyncio.get_running_loop().add_signal_handler(signal.SIGTERM,stop.set);return stop
 
-async def placed_worker(sid):
+def profile_sink(enabled):
+    if not enabled:return None
+    profile=StageProfile()
+    asyncio.get_running_loop().add_signal_handler(signal.SIGUSR1,lambda:print('PROFILE SNAPSHOT '+json.dumps(profile.snapshot(),sort_keys=True),flush=True))
+    return profile
+
+async def placed_worker(sid,enabled=False):
     assert_sandbox();assert not Path('/registry').exists();cfg=json.loads(Path('/state/worker-acl.json').read_text());assert cfg['sid']==sid and 100<=cfg['actor']<116
     assert sorted(p.name for p in Path('/keys').iterdir())==['worker.key'] and sorted(p.name for p in Path('/secret').iterdir())==['max.enc']
     ctx=ssl.create_default_context(cafile='/state/test-ca.pem')
-    await run_isolated_worker(stop_event(),socket_path='/network/proxy.sock',secret_dir='/secret',sid=sid,state='/state',channel='/channel',key_file='/state/key',forum=cfg['forum'],actor=cfg['actor'],context=ctx,secret_key_path='/keys/worker.key')
+    await run_isolated_worker(stop_event(),socket_path='/network/proxy.sock',secret_dir='/secret',sid=sid,state='/state',channel='/channel',key_file='/state/key',forum=cfg['forum'],actor=cfg['actor'],context=ctx,secret_key_path='/keys/worker.key',profile=profile_sink(enabled))
 
-async def placed_gateway(sessions):
+async def placed_gateway(sessions,enabled=False):
     assert_sandbox();assert sorted(p.name for p in Path('/keys').iterdir())==['bot.key'];assert sorted(p.name for p in Path('/secret').iterdir())==['telegram.enc'];r=CapsuleRegistry('/registry')
     try:
-        await run_isolated_gateway(stop_event(),socket_path='/network/proxy.sock',registry=r,channels={sid:Path('/channels')/sid for sid,_,_ in sessions},context=ssl.create_default_context(cafile='/registry/test-ca.pem'),secret_dir='/secret',secret_key_path='/keys/bot.key',bot_id=123456)
+        await run_isolated_gateway(stop_event(),socket_path='/network/proxy.sock',registry=r,channels={sid:Path('/channels')/sid for sid,_,_ in sessions},context=ssl.create_default_context(cafile='/registry/test-ca.pem'),secret_dir='/secret',secret_key_path='/keys/bot.key',bot_id=123456,profile=profile_sink(enabled))
     finally:r.close()
 
 if __name__=='__main__':
@@ -64,6 +71,6 @@ if __name__=='__main__':
     if mode=='init':asyncio.run(prepare())
     elif mode=='broker':
         sessions=json.loads(sys.argv[2]);asyncio.run(broker(['/network/'+sid for sid,_,_ in sessions]+['/network/telegram']))
-    elif mode=='gateway':asyncio.run(placed_gateway(json.loads(sys.argv[2])))
-    elif mode=='worker':asyncio.run(placed_worker(sys.argv[2]))
+    elif mode=='gateway':asyncio.run(placed_gateway(json.loads(sys.argv[2]),sys.argv[3:]==['profile']))
+    elif mode=='worker':asyncio.run(placed_worker(sys.argv[2],sys.argv[3:]==['profile']))
     else:raise SystemExit(78)

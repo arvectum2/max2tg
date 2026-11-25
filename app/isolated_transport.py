@@ -60,21 +60,22 @@ async def isolated_telegram_bot(socket_path,token,*,context=None,budget=None):
             # Initialization performs a read-only getMe; honor persisted cooldown
             # before making it, without consuming the dependency crash budget.
             while True:
-                try:await budget.call(bot.initialize);break
+                try:await budget.call(bot.initialize,metric="initialize");break
                 except (ApiDeferred,RetryAfter):await asyncio.sleep(max(.05,min(1,budget.remaining)))
         stack.push_async_callback(bot.shutdown)
         yield BudgetedBot(bot,budget) if budget is not None else bot
 
 
-async def run_isolated_worker(stop,*,socket_path,secret_dir,sid,state,channel,key_file,forum,actor,context=None,secret_key_path=None):
+async def run_isolated_worker(stop,*,socket_path,secret_dir,sid,state,channel,key_file,forum,actor,context=None,secret_key_path=None,profile=None):
     """Trusted composition; caller owns stop event and container isolation."""
     from app.isolated_worker_runtime import IsolatedWorkerRuntime
     async with isolated_max_client(socket_path,secret_dir,sid,context=context,key_path=secret_key_path) as client:
         runtime=IsolatedWorkerRuntime(sid,state,channel,key_file,forum,actor,client)
+        runtime.profile=profile;runtime.listener.profile=profile
         await runtime.run(stop)
 
 
-async def run_isolated_gateway(stop,*,socket_path,registry,channels,context=None,token=None,secret_dir=None,secret_key_path=None,bot_id=None):
+async def run_isolated_gateway(stop,*,socket_path,registry,channels,context=None,token=None,secret_dir=None,secret_key_path=None,bot_id=None,profile=None):
     """Trusted composition; no public entrypoint or production supervisor."""
     from app.shared_gateway_runtime import SharedGatewayRuntime
     if any(x is not None for x in (secret_dir,secret_key_path,bot_id)):
@@ -82,6 +83,6 @@ async def run_isolated_gateway(stop,*,socket_path,registry,channels,context=None
         from app.encrypted_credentials import load_encrypted_bot
         token=load_encrypted_bot(secret_dir,bot_id,secret_key_path)
     elif token is None:raise ValueError('Gateway credentials required')
-    async with isolated_telegram_bot(socket_path,token,context=context,budget=TelegramBudget(registry.db)) as bot:
-        runtime=SharedGatewayRuntime(registry,bot,channels=channels,external_only=True,managed=True)
+    async with isolated_telegram_bot(socket_path,token,context=context,budget=TelegramBudget(registry.db,profile=profile)) as bot:
+        runtime=SharedGatewayRuntime(registry,bot,channels=channels,external_only=True,managed=True,profile=profile)
         await runtime.run(stop)

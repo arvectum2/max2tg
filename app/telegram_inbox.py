@@ -16,6 +16,7 @@ import time
 from typing import Awaitable,Callable
 
 from app.telegram_control_plane import TelegramControlPlane
+from app.stage_profile import measure,age
 
 MAX_UPDATE_BYTES=512*1024
 GROUP_CONTENT_TYPES=("message","edited_message","channel_post",
@@ -57,8 +58,8 @@ def _integer(raw):
 class TelegramInbox:
     """Fail-closed durable ingress ledger for a *single* Telegram bot."""
 
-    def __init__(self,db_path:str|Path,plane:TelegramControlPlane,*,dispatch_allowed=None):
-        self.plane=plane
+    def __init__(self,db_path:str|Path,plane:TelegramControlPlane,*,dispatch_allowed=None,profile=None):
+        self.profile=profile;self.plane=plane
         self.dispatch_allowed=dispatch_allowed
         self.path=Path(db_path).absolute()
         if self.path.is_symlink():
@@ -166,8 +167,10 @@ class TelegramInbox:
             "WHERE update_id=? AND status='RECEIVED'",
             (time.time(),update_id))
         if claim.rowcount!=1:return self.row(update_id)['status']
+        age(self.profile,"ingress.pending_age",row["updated_at"])
         try:
-            confirmed=await deliver(row["session_id"],json.loads(row["payload"]))
+            with measure(self.profile,"ingress.ipc"):
+                confirmed=await deliver(row["session_id"],json.loads(row["payload"]))
         except WorkerUnavailable:
             # No request made to worker; retry is unambiguously safe.
             self.db.execute(

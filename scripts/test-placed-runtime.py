@@ -7,7 +7,8 @@ from app.deployment_plan import build_plan,_verify_stopped,validate_bind_sources
 from app.container_supervisor import DockerBackend
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--image',required=True);p.add_argument('--native-volumes',action='store_true');p.add_argument('--load',type=int,choices=range(1,26));p.add_argument('--tenants',type=int,choices=(2,4,8,16),default=2);a=p.parse_args();
+    p=argparse.ArgumentParser();p.add_argument('--image',required=True);p.add_argument('--native-volumes',action='store_true');p.add_argument('--load',type=int,choices=range(1,26));p.add_argument('--tenants',type=int,choices=(2,4,8,16),default=2);p.add_argument('--profile',action='store_true');a=p.parse_args();
+    if a.profile and not a.load:p.error('Profile requires bounded load mode')
     if a.tenants!=2 and (not a.native_volumes or not a.load):p.error('Larger cohorts require native volumes and bounded load mode')
     d=DockerBackend();code=Path(__file__).resolve().parents[1];image=d.call('image','inspect','--format','{{.Id}}',a.image);owner=secrets.token_hex(12);label='max2tg.placement='+owner
     with tempfile.TemporaryDirectory(prefix='runtime-',dir=code) as td:
@@ -48,6 +49,7 @@ def main():
             for role,s in plan['services'].items():
                 s['profiles']=['acceptance-only'];s['command']=['-m','tests.placement_runtime_fixture',role if not role.startswith('worker-') else 'worker',json.dumps(sessions) if role in ('gateway','broker') else role[7:]];s['volumes'].append(bind(code/'tests','/app/tests'))
                 if role=='broker':s['volumes'].append(bind(cert,'/cert'))
+                elif a.profile:s['command'].append('profile')
             path=root/'compose.json';path.write_text(json.dumps(plan));cmd=('compose','-f',str(path),'--profile','acceptance-only');d.call(*cmd,'config','--quiet');d.call(*cmd,'create','--no-build','--pull','never')
             for role,s in plan['services'].items():
                 c=d.inspect(s['container_name'])
@@ -78,7 +80,18 @@ def main():
                     raw=d.call('stats','--no-stream','--format','{{json .}}',*ids.values());rows=[json.loads(x) for x in raw.splitlines()];
                     if sum(_mib(x['MemUsage'].split('/')[0]) for x in rows)>1024 or sum(float(x['CPUPerc'].rstrip('%')) for x in rows)>250:raise RuntimeError('Synthetic load resource stop limit exceeded')
                     samples.append({'resources':rows,'inbox':ledger(gateway,'/registry/inbox.sqlite3','telegram_ingress'),'egress':ledger(gateway,'/registry/telegram-egress.sqlite3','telegram_egress')})
+                def profiles(index):
+                    targets={role:cid for role,cid in ids.items() if role!='broker'}
+                    d.call('kill','--signal','USR1',*targets.values());snapshots={}
+                    for role,cid in targets.items():
+                        def read_snapshot():
+                            lines=[x for x in d.call('logs',cid).splitlines() if x.startswith('PROFILE SNAPSHOT ')]
+                            if len(lines)<index:return False
+                            assert len(lines)==index;snapshots[role]=json.loads(lines[-1].split('PROFILE SNAPSHOT ',1)[1]);return True
+                        wait(read_snapshot,timeout=10)
+                    return snapshots
                 sample();baseline=samples.pop()
+                before=profiles(1) if a.profile else None
                 begin=time.monotonic();exec_py(broker,f'from pathlib import Path;Path("/network/telegram/load-count").write_text({str(a.load)!r})')
                 target=a.tenants*(1+a.load);deadline=begin+60
                 while True:
@@ -90,6 +103,12 @@ def main():
                 result=counts();assert sorted(result['max'])==sorted(expected_max) and sorted(result['tg'])==sorted(expected_tg)
                 wait(lambda:all(ledger(cid,'/state/to-telegram.sqlite3','worker_telegram_intents')=={'SENT':a.load+1} for cid in workers),timeout=15)
                 print('LOAD RESULT '+json.dumps(summarize_load(a.load,baseline,samples,result['load_effects'],time.monotonic()-begin,tenants=a.tenants),sort_keys=True),flush=True)
+                if a.profile:
+                    from app.stage_profile import aggregate_profiles
+                    stages=aggregate_profiles(before,profiles(2));assert stages['gateway']['api.send.call']['count']==a.tenants*a.load
+                    assert stages['gateway']['ingress.ipc']['count']>=a.tenants*a.load
+                    assert stages['workers']['worker.receipt_repair']['count']>0
+                    print('PROFILE RESULT '+json.dumps(stages,sort_keys=True),flush=True)
                 return
             worker_starts={sid:d.inspect(plan['services']['worker-'+sid]['container_name'])['State']['StartedAt'] for sid in sids}
             # Broker-only crash: real gateway polling must stay alive, hold
