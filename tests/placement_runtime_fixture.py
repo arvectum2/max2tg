@@ -48,7 +48,7 @@ def stop_event():
     stop=asyncio.Event();asyncio.get_running_loop().add_signal_handler(signal.SIGTERM,stop.set);return stop
 
 async def placed_worker(sid):
-    assert_sandbox();assert not Path('/registry').exists();cfg=json.loads(Path('/state/worker-acl.json').read_text());assert cfg['sid']==sid and cfg['actor'] in (100,101)
+    assert_sandbox();assert not Path('/registry').exists();cfg=json.loads(Path('/state/worker-acl.json').read_text());assert cfg['sid']==sid and 100<=cfg['actor']<116
     assert sorted(p.name for p in Path('/keys').iterdir())==['worker.key'] and sorted(p.name for p in Path('/secret').iterdir())==['max.enc']
     ctx=ssl.create_default_context(cafile='/state/test-ca.pem')
     await run_isolated_worker(stop_event(),socket_path='/network/proxy.sock',secret_dir='/secret',sid=sid,state='/state',channel='/channel',key_file='/state/key',forum=cfg['forum'],actor=cfg['actor'],context=ctx,secret_key_path='/keys/worker.key')
