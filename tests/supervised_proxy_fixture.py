@@ -13,17 +13,27 @@ from app.shared_gateway_runtime import SharedGatewayRuntime,remove_dead_socket
 from app.isolated_worker_runtime import IsolatedWorkerRuntime
 from tests.isolated_container_fixture import prepare,assert_sandbox
 from tests.supervised_bridge_fixture import atomic
+from tests.synthetic_long_poll import UpdateWakeup
 
 
 def user(uid):return {'id':uid,'is_bot':uid==900,'first_name':'Synthetic','username':'synthetic_bot' if uid==900 else 'synthetic_user'}
 def chat(gid):return {'id':gid,'type':'supergroup','title':'Synthetic','is_forum':True}
 def message(gid,mid,text,actor=900):return {'message_id':mid,'date':1700000000,'chat':chat(gid),'from':user(actor),'message_thread_id':77,'text':text,'is_topic_message':True}
 
-async def broker(network_paths=None):
+async def broker(network_paths=None,*,long_poll=False):
     assert_sandbox();assert not any(Path(p).exists() for p in ('/keys','/secret','/registry','/keys0','/keys1','/botkeys','/botsecret'));ctx=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER);ctx.load_cert_chain('/cert/cert.pem','/cert/key.pem');paths=network_paths or ['/net0','/net1','/nettg'];tenants=len(paths)-1;assert tenants in (2,4,8,16);control=Path(paths[-1])
     evidence=control/'counts.json';counts=json.loads(evidence.read_text()) if evidence.exists() else {'max':[],'tg':[],'auth':[0]*tenants};servers=[];load_sockets={};load_n=0
     (control/'cut-a').unlink(missing_ok=True);(control/'cut-confirmed').unlink(missing_ok=True)
     def report():atomic(control/'counts.json',counts)
+    wakeup=UpdateWakeup()
+    def updates(offset):
+        phase=2 if (control/'phase2').exists() else 1 if (control/'phase1').exists() else 0
+        data=[{'update_id':tenants*j+i+1,'message':message(-10000-i,100+tenants*j+i,f'incoming-{i}-{j}',100+i)} for j in range(phase) for i in range(tenants) if tenants*j+i+1>=offset]
+        if (control/'phase3').exists() and offset<=5:data.append({'update_id':5,'message':message(-10000,104,'ambiguous-0',100)})
+        if load_n:
+            data.extend({'update_id':tenants+1+tenants*j+i,'message':message(-10000-i,200+tenants*j+i,f'load-in-{i}-{j}',100+i)} for j in range(load_n) for i in range(tenants) if tenants+1+tenants*j+i>=offset)
+        return data[:100]
+
     async def api(req):
         method=req.match_info['method'];form=await req.post();gid=int(form.get('chat_id',-10000));uid=int(form.get('user_id',900))
         if (control/'rate-trigger').exists() and method=='getUpdates' and 'rate_until' not in counts:
@@ -39,12 +49,8 @@ async def broker(network_paths=None):
             data={'user':user(uid),'status':'creator' if uid!=900 else 'administrator','is_anonymous':False}
             if uid==900:data.update({k:True for k in ('can_be_edited','can_manage_chat','can_delete_messages','can_manage_video_chats','can_restrict_members','can_promote_members','can_change_info','can_invite_users','can_post_stories','can_edit_stories','can_delete_stories','can_manage_topics')})
         elif method=='getUpdates':
-            phase=2 if (control/'phase2').exists() else 1 if (control/'phase1').exists() else 0
-            data=[{'update_id':tenants*j+i+1,'message':message(-10000-i,100+tenants*j+i,f'incoming-{i}-{j}',100+i)} for j in range(phase) for i in range(tenants) if tenants*j+i+1>=int(form.get('offset',0))]
-            if (control/'phase3').exists() and int(form.get('offset',0))<=5:data.append({'update_id':5,'message':message(-10000,104,'ambiguous-0',100)})
-            if load_n:
-                data.extend({'update_id':tenants+1+tenants*j+i,'message':message(-10000-i,200+tenants*j+i,f'load-in-{i}-{j}',100+i)} for j in range(load_n) for i in range(tenants) if tenants+1+tenants*j+i>=int(form.get('offset',0)))
-                data=data[:100]
+            offset=int(form.get('offset',0));timeout=int(form.get('timeout',0))
+            data=await wakeup.get(lambda:updates(offset),timeout) if long_poll else updates(offset)
         elif method=='sendMessage':
             text=form['text'];i=-10000-gid;assert 0<=i<tenants and int(form['message_thread_id'])==77 and (text==f'outgoing-{i}' or text in [f'load-out-{i}-{j}' for j in range(load_n)])
             counts['tg'].append([gid,text])
@@ -78,11 +84,12 @@ async def broker(network_paths=None):
             app=web.Application()
             if i<tenants:app.router.add_get('/websocket',handler(i))
             else:app.router.add_post('/bot123456:synthetic/{method}',api)
-            runner=web.AppRunner(app);await runner.setup();runners.append(runner);site=web.TCPSite(runner,'127.0.0.1',0,ssl_context=ctx);await site.start();port=site._server.sockets[0].getsockname()[1]
+            runner=web.AppRunner(app,handler_cancellation=True);await runner.setup();runners.append(runner);site=web.TCPSite(runner,'127.0.0.1',0,ssl_context=ctx);await site.start();port=site._server.sockets[0].getsockname()[1]
             async def connect(role,target,p=port):return await asyncio.open_connection('127.0.0.1',p)
             path=Path(paths[i])/'proxy.sock';await remove_dead_socket(path)
             servers.append(TunnelServer('max-text' if i<tenants else 'telegram',path,connector=connect));await servers[-1].start()
         report();atomic(control/'broker-boot.json',{'boot':sum(counts['auth'])});print('READY',flush=True)
+        previous=None
         while not (control/'stop-broker').exists():
             atomic(control/'broker-health.json',{'pid':os.getpid(),'at':time.time()})
             if (control/'cut-a').exists() and servers[0].server:await servers[0].close();(control/'cut-confirmed').touch()
@@ -94,6 +101,8 @@ async def broker(network_paths=None):
                 for j in range(n):
                     for i,w in load_sockets.items():
                         await w.send_bytes(encode({'cmd':0,'seq':0,'opcode':OpCode.DISPATCH,'payload':{'chatId':42,'message':{'id':1000+j,'sender':999,'text':f'load-out-{i}-{j}'}}}))
+            state=(load_n,*((control/name).exists() for name in ('phase1','phase2','phase3')))
+            if state!=previous:previous=state;wakeup.notify()
             await asyncio.sleep(.05)
     finally:
         for s in servers:await s.close()

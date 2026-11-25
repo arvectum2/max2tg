@@ -7,7 +7,8 @@ from app.deployment_plan import build_plan,_verify_stopped,validate_bind_sources
 from app.container_supervisor import DockerBackend
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--image',required=True);p.add_argument('--native-volumes',action='store_true');p.add_argument('--load',type=int,choices=range(1,26));p.add_argument('--tenants',type=int,choices=(2,4,8,16),default=2);p.add_argument('--profile',action='store_true');a=p.parse_args();
+    p=argparse.ArgumentParser();p.add_argument('--image',required=True);p.add_argument('--native-volumes',action='store_true');p.add_argument('--load',type=int,choices=range(1,26));p.add_argument('--tenants',type=int,choices=(2,4,8,16),default=2);p.add_argument('--profile',action='store_true');p.add_argument('--long-poll',action='store_true');a=p.parse_args();
+    if a.long_poll and not (a.load and a.profile):p.error('Long polling comparison requires profiled bounded load')
     if a.profile and not a.load:p.error('Profile requires bounded load mode')
     if a.tenants!=2 and (not a.native_volumes or not a.load):p.error('Larger cohorts require native volumes and bounded load mode')
     d=DockerBackend();code=Path(__file__).resolve().parents[1];image=d.call('image','inspect','--format','{{.Id}}',a.image);owner=secrets.token_hex(12);label='max2tg.placement='+owner
@@ -48,7 +49,9 @@ def main():
             else:assert validate_bind_sources(plan)==14
             for role,s in plan['services'].items():
                 s['profiles']=['acceptance-only'];s['command']=['-m','tests.placement_runtime_fixture',role if not role.startswith('worker-') else 'worker',json.dumps(sessions) if role in ('gateway','broker') else role[7:]];s['volumes'].append(bind(code/'tests','/app/tests'))
-                if role=='broker':s['volumes'].append(bind(cert,'/cert'))
+                if role=='broker':
+                    s['volumes'].append(bind(cert,'/cert'))
+                    if a.long_poll:s['command'].append('long-poll')
                 elif a.profile:s['command'].append('profile')
             path=root/'compose.json';path.write_text(json.dumps(plan));cmd=('compose','-f',str(path),'--profile','acceptance-only');d.call(*cmd,'config','--quiet');d.call(*cmd,'create','--no-build','--pull','never')
             for role,s in plan['services'].items():
@@ -109,6 +112,7 @@ def main():
                     assert stages['gateway']['ingress.ipc']['count']>=a.tenants*a.load
                     assert stages['workers']['worker.receipt_repair']['count']>0
                     print('PROFILE RESULT '+json.dumps(stages,sort_keys=True),flush=True)
+                    print('POLL MODE '+('long-poll' if a.long_poll else 'immediate'),flush=True)
                 return
             worker_starts={sid:d.inspect(plan['services']['worker-'+sid]['container_name'])['State']['StartedAt'] for sid in sids}
             # Broker-only crash: real gateway polling must stay alive, hold
