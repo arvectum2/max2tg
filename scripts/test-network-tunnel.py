@@ -16,18 +16,24 @@ def main():
             names.append(name);a=['run','--name',name,'--pull','never','--label',f'max2tg.nettest={owner}','--network','none','--read-only','--security-opt','no-new-privileges','--memory','256m','--pids-limit','64','--mount',f'type=bind,source={root / "app"},target=/src/app,readonly','--mount',f'type=bind,source={root / "tests"},target=/src/tests,readonly','--workdir','/src']
             if not init:a+=['--user','65532:65532','--cap-drop','ALL']
             if detach:a+=['-d']
-            for n,target in mounts:a+=['--mount',f'type=volume,source={n},target=/{target}']
+            for n,target in mounts:a+=['--mount',f'type=volume,source={n},target=/{target}'+(',readonly' if target=='secret' and not init else '')]
             if certdir:a+=['--mount',f'type=bind,source={certdir},target=/cert,readonly']
             return a+['--entrypoint','python',image,'-m','tests.network_tunnel_fixture',role]
         try:
-            for i in range(2):vol.append(d.call('volume','create','--label',f'max2tg.nettest={owner}',prefix+f'-{i}'))
-            both=[(n,f'channel{i}') for i,n in enumerate(vol)];d.call(*cmd(prefix+'-init','init',both,init=True));broker=d.call(*cmd(prefix+'-broker','broker',both,cert,detach=True))
+            for i in range(3):vol.append(d.call('volume','create','--label',f'max2tg.nettest={owner}',prefix+f'-{i}'))
+            both=[(n,f'channel{i}') for i,n in enumerate(vol[:2])];d.call(*cmd(prefix+'-init','init',both+[(vol[2],'secret')],init=True));broker=d.call(*cmd(prefix+'-broker','broker',both,cert,detach=True))
             for _ in range(40):
                 if 'READY' in d.call('logs',broker):break
                 time.sleep(.1)
             else:raise RuntimeError('Broker not ready')
-            for i,role in enumerate(('max-text','telegram')):print(d.call(*cmd(prefix+'-'+role,role,[(vol[i],'channel')],client)),flush=True)
+            for i,role in enumerate(('max-text','telegram')):print(d.call(*cmd(prefix+'-'+role,role,[(vol[i],'channel')]+([(vol[2],'secret')] if i==0 else []),client)),flush=True)
             assert d.call('wait',broker)=='0';print(d.call('logs',broker),flush=True)
+        except subprocess.CalledProcessError as exc:
+            print(exc.stdout,exc.stderr,flush=True)
+            for name in names:
+                try:print(name,d.call("logs",name),flush=True)
+                except subprocess.CalledProcessError:pass
+            raise
         finally:
             for name in reversed(names):
                 c=d.inspect(name)
