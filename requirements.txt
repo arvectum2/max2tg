@@ -4,3 +4,4 @@ python-dotenv>=1.0.0
 httpx[socks]>=0.24.0
 msgpack==1.1.2
 lz4==4.4.4
+cryptography>=46.0.0
