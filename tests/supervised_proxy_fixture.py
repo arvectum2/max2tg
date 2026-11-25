@@ -14,24 +14,26 @@ from app.isolated_worker_runtime import IsolatedWorkerRuntime
 from tests.isolated_container_fixture import prepare,assert_sandbox
 from tests.supervised_bridge_fixture import atomic
 from tests.synthetic_long_poll import UpdateWakeup
+from tests.synthetic_mixed_load import schedule
 
 
 def user(uid):return {'id':uid,'is_bot':uid==900,'first_name':'Synthetic','username':'synthetic_bot' if uid==900 else 'synthetic_user'}
 def chat(gid):return {'id':gid,'type':'supergroup','title':'Synthetic','is_forum':True}
 def message(gid,mid,text,actor=900):return {'message_id':mid,'date':1700000000,'chat':chat(gid),'from':user(actor),'message_thread_id':77,'text':text,'is_topic_message':True}
 
-async def broker(network_paths=None,*,long_poll=False):
+async def broker(network_paths=None,*,long_poll=False,mixed=False):
     assert_sandbox();assert not any(Path(p).exists() for p in ('/keys','/secret','/registry','/keys0','/keys1','/botkeys','/botsecret'));ctx=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER);ctx.load_cert_chain('/cert/cert.pem','/cert/key.pem');paths=network_paths or ['/net0','/net1','/nettg'];tenants=len(paths)-1;assert tenants in (2,4,8,16);control=Path(paths[-1])
     evidence=control/'counts.json';counts=json.loads(evidence.read_text()) if evidence.exists() else {'max':[],'tg':[],'auth':[0]*tenants};servers=[];load_sockets={};load_n=0
     (control/'cut-a').unlink(missing_ok=True);(control/'cut-confirmed').unlink(missing_ok=True)
     def report():atomic(control/'counts.json',counts)
-    wakeup=UpdateWakeup()
+    wakeup=UpdateWakeup();mixed_started=None;mixed_index=0;mixed_updates=[];mixed_at={};waves=schedule(tenants) if mixed else []
     def updates(offset):
         phase=2 if (control/'phase2').exists() else 1 if (control/'phase1').exists() else 0
         data=[{'update_id':tenants*j+i+1,'message':message(-10000-i,100+tenants*j+i,f'incoming-{i}-{j}',100+i)} for j in range(phase) for i in range(tenants) if tenants*j+i+1>=offset]
         if (control/'phase3').exists() and offset<=5:data.append({'update_id':5,'message':message(-10000,104,'ambiguous-0',100)})
         if load_n:
             data.extend({'update_id':tenants+1+tenants*j+i,'message':message(-10000-i,200+tenants*j+i,f'load-in-{i}-{j}',100+i)} for j in range(load_n) for i in range(tenants) if tenants+1+tenants*j+i>=offset)
+        data.extend(u for u in mixed_updates if u["update_id"]>=offset)
         return data[:100]
 
     async def api(req):
@@ -44,7 +46,10 @@ async def broker(network_paths=None,*,long_poll=False):
         elif 'rate_until' in counts:counts['after_rate']=True;report()
         if method=='getMe':data=user(900)
         elif method=='getChat':data={**chat(gid),'accent_color_id':0,'max_reaction_count':1,'accepted_gift_types':{'unlimited_gifts':False,'limited_gifts':False,'unique_gifts':False,'premium_subscription':False,'gifts_from_channels':False}}
-        elif method=='getChatMemberCount':data=2
+        elif method=='getChatMemberCount':
+            data=2
+            if mixed_started is not None:
+                counts['mixed_verified'].setdefault(str(-10000-gid),[]).append(time.monotonic()-mixed_started);report()
         elif method=='getChatMember':
             data={'user':user(uid),'status':'creator' if uid!=900 else 'administrator','is_anonymous':False}
             if uid==900:data.update({k:True for k in ('can_be_edited','can_manage_chat','can_delete_messages','can_manage_video_chats','can_restrict_members','can_promote_members','can_change_info','can_invite_users','can_post_stories','can_edit_stories','can_delete_stories','can_manage_topics')})
@@ -52,9 +57,10 @@ async def broker(network_paths=None,*,long_poll=False):
             offset=int(form.get('offset',0));timeout=int(form.get('timeout',0))
             data=await wakeup.get(lambda:updates(offset),timeout) if long_poll else updates(offset)
         elif method=='sendMessage':
-            text=form['text'];i=-10000-gid;assert 0<=i<tenants and int(form['message_thread_id'])==77 and (text==f'outgoing-{i}' or text in [f'load-out-{i}-{j}' for j in range(load_n)])
+            text=form['text'];i=-10000-gid;assert 0<=i<tenants and int(form['message_thread_id'])==77 and (text==f'outgoing-{i}' or text in [f'load-out-{i}-{j}' for j in range(load_n)] or text.startswith(f'mixed-out-{i}-') and text in mixed_at)
             counts['tg'].append([gid,text])
             if text.startswith('load-out-'):counts['load_effects'].append([text,time.time()-counts['load_started']])
+            if text in mixed_at:counts['mixed_effects'].append([text,time.monotonic()-mixed_at[text],time.monotonic()-mixed_started])
             report();data=message(gid,5000+len(counts['tg']),text)
         else:raise AssertionError('Unexpected method '+method)
         return web.json_response({'ok':True,'result':data})
@@ -67,8 +73,9 @@ async def broker(network_paths=None,*,long_poll=False):
                 elif op==OpCode.AUTH_SNAPSHOT:
                     assert body['token']==f'synthetic-secret-{i}';authenticated=True;counts['auth'][i]+=1;report();payload={'profile':{'contact':{'id':100+i}}}
                 elif op==OpCode.SEND_MESSAGE:
-                    assert authenticated and body['chatId']==42;text=body['message']['text'];assert text in (f'incoming-{i}-0',f'incoming-{i}-1',f'ambiguous-{i}') or text in [f'load-in-{i}-{j}' for j in range(load_n)];counts['max'].append([i,text])
+                    assert authenticated and body['chatId']==42;text=body['message']['text'];assert text in (f'incoming-{i}-0',f'incoming-{i}-1',f'ambiguous-{i}') or text in [f'load-in-{i}-{j}' for j in range(load_n)] or text.startswith(f'mixed-in-{i}-') and text in mixed_at;counts['max'].append([i,text])
                     if text.startswith('load-in-'):counts['load_effects'].append([text,time.time()-counts['load_started']])
+                    if text in mixed_at:counts['mixed_effects'].append([text,time.monotonic()-mixed_at[text],time.monotonic()-mixed_started])
                     report()
                     if text.startswith('ambiguous'):await w.close();return w
                     payload={'message':{'id':10000+len(counts['max'])}}
@@ -101,7 +108,21 @@ async def broker(network_paths=None,*,long_poll=False):
                 for j in range(n):
                     for i,w in load_sockets.items():
                         await w.send_bytes(encode({'cmd':0,'seq':0,'opcode':OpCode.DISPATCH,'payload':{'chatId':42,'message':{'id':1000+j,'sender':999,'text':f'load-out-{i}-{j}'}}}))
-            state=(load_n,*((control/name).exists() for name in ('phase1','phase2','phase3')))
+            if mixed and mixed_started is None and (control/'mixed-start').exists():
+                assert not load_n and set(load_sockets)==set(range(tenants)) and all(not w.closed for w in load_sockets.values())
+                mixed_started=time.monotonic();counts['mixed_effects']=[];counts['mixed_verified']={};counts['mixed_emitted']=0;report()
+            if mixed_started is not None:
+                while mixed_index<len(waves) and time.monotonic()-mixed_started>=waves[mixed_index][0]:
+                    _,pairs=waves[mixed_index]
+                    for i,j in pairs:
+                        uid=tenants+1+len(mixed_updates);text=f'mixed-in-{i}-{j}';mixed_at[text]=time.monotonic()
+                        mixed_updates.append({'update_id':uid,'message':message(-10000-i,1000+uid,text,100+i)})
+                    wakeup.notify()
+                    for i,j in pairs:
+                        text=f'mixed-out-{i}-{j}';mixed_at[text]=time.monotonic()
+                        await load_sockets[i].send_bytes(encode({'cmd':0,'seq':0,'opcode':OpCode.DISPATCH,'payload':{'chatId':42,'message':{'id':2000+j,'sender':999,'text':text}}}))
+                    mixed_index+=1;counts['mixed_emitted']=2*len(mixed_updates);report()
+            state=(load_n,mixed_index,*((control/name).exists() for name in ('phase1','phase2','phase3')))
             if state!=previous:previous=state;wakeup.notify()
             await asyncio.sleep(.05)
     finally:

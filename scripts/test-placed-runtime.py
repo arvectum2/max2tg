@@ -7,10 +7,11 @@ from app.deployment_plan import build_plan,_verify_stopped,validate_bind_sources
 from app.container_supervisor import DockerBackend
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--image',required=True);p.add_argument('--native-volumes',action='store_true');p.add_argument('--load',type=int,choices=range(1,26));p.add_argument('--tenants',type=int,choices=(2,4,8,16),default=2);p.add_argument('--profile',action='store_true');p.add_argument('--long-poll',action='store_true');a=p.parse_args();
-    if a.long_poll and not (a.load and a.profile):p.error('Long polling comparison requires profiled bounded load')
-    if a.profile and not a.load:p.error('Profile requires bounded load mode')
-    if a.tenants!=2 and (not a.native_volumes or not a.load):p.error('Larger cohorts require native volumes and bounded load mode')
+    p=argparse.ArgumentParser();p.add_argument('--image',required=True);p.add_argument('--native-volumes',action='store_true');p.add_argument('--load',type=int,choices=range(1,26));p.add_argument('--tenants',type=int,choices=(2,4,8,16),default=2);p.add_argument('--profile',action='store_true');p.add_argument('--long-poll',action='store_true');p.add_argument('--mixed',action='store_true');a=p.parse_args();
+    if a.mixed and (a.load or not (a.native_volumes and a.profile and a.long_poll)):p.error('Mixed requires native volumes, profile, long-poll and no load')
+    if a.long_poll and not ((a.load or a.mixed) and a.profile):p.error('Long polling comparison requires profiled bounded load')
+    if a.profile and not (a.load or a.mixed):p.error('Profile requires bounded load mode')
+    if a.tenants!=2 and (not a.native_volumes or not (a.load or a.mixed)):p.error('Larger cohorts require native volumes and bounded load mode')
     d=DockerBackend();code=Path(__file__).resolve().parents[1];image=d.call('image','inspect','--format','{{.Id}}',a.image);owner=secrets.token_hex(12);label='max2tg.placement='+owner
     with tempfile.TemporaryDirectory(prefix='runtime-',dir=code) as td:
         root=Path(td).resolve();fixture=root/'fixture';fixture.mkdir(mode=0o700);cert=root/'cert';cert.mkdir();subprocess.run(['openssl','req','-x509','-newkey','rsa:2048','-nodes','-days','1','-subj','/CN=synthetic','-addext','subjectAltName=DNS:api.oneme.ru,DNS:api.telegram.org','-keyout',str(cert/'key.pem'),'-out',str(cert/'cert.pem')],check=True,capture_output=True);(cert/'key.pem').chmod(0o644)
@@ -52,6 +53,7 @@ def main():
                 if role=='broker':
                     s['volumes'].append(bind(cert,'/cert'))
                     if a.long_poll:s['command'].append('long-poll')
+                    if a.mixed:s['command'].append('mixed')
                 elif a.profile:s['command'].append('profile')
             path=root/'compose.json';path.write_text(json.dumps(plan));cmd=('compose','-f',str(path),'--profile','acceptance-only');d.call(*cmd,'config','--quiet');d.call(*cmd,'create','--no-build','--pull','never')
             for role,s in plan['services'].items():
@@ -76,7 +78,7 @@ def main():
             for cid in workers:d.start(cid)
             touch('phase1');wait(lambda:receipts(a.tenants) and len(counts().get('tg',[]))==a.tenants and len(counts().get('max',[]))==a.tenants,timeout=45)
             print(f'Actual run_isolated_gateway/worker: {a.tenants}+{a.tenants} confirmed on '+('native volume' if a.native_volumes else 'bind')+' placement',flush=True)
-            if a.load:
+            if a.load or a.mixed:
                 from app.load_metrics import summarize_load,_mib
                 samples=[]
                 def sample():
@@ -95,6 +97,30 @@ def main():
                     return snapshots
                 sample();baseline=samples.pop()
                 before=profiles(1) if a.profile else None
+                if a.mixed:
+                    from collections import Counter
+                    from tests.synthetic_mixed_load import schedule,summarize
+                    from app.stage_profile import aggregate_profiles
+                    waves=schedule(a.tenants);per=Counter(i for _,pairs in waves for i,j in pairs);n=sum(per.values());target=a.tenants+n
+                    begin=time.monotonic();touch('mixed-start');observations=[];deadline=begin+105
+                    while True:
+                        sample();last=samples[-1];result=counts()
+                        ready_count=int(exec_py(gateway,'from pathlib import Path;print(sum((p/"egress.sock").is_socket() for p in Path("/channels").iterdir()))'))
+                        observations.append({'at':time.monotonic()-begin,'pending_in':sum(v for k,v in last['inbox'].items() if k!='ACKED'),'pending_out':sum(v for k,v in last['egress'].items() if k!='SENT'),'ready':ready_count})
+                        if result.get('mixed_emitted')==2*n and last['inbox']=={'ACKED':target} and last['egress']=={'SENT':target}:break
+                        if time.monotonic()>deadline:raise RuntimeError('Mixed workload did not drain')
+                    expected_max=[[i,f'incoming-{i}-0'] for i in range(a.tenants)]+[[i,f'mixed-in-{i}-{j}'] for _,pairs in waves for i,j in pairs]
+                    expected_tg=[[-10000-i,f'outgoing-{i}'] for i in range(a.tenants)]+[[-10000-i,f'mixed-out-{i}-{j}'] for _,pairs in waves for i,j in pairs]
+                    assert sorted(result['max'])==sorted(expected_max) and sorted(result['tg'])==sorted(expected_tg)
+                    wait(lambda:all(ledger(cid,'/state/to-telegram.sqlite3','worker_telegram_intents')=={'SENT':per[i]+1} for i,cid in enumerate(workers)),timeout=15)
+                    result=counts();metrics=summarize(a.tenants,result['mixed_effects'],result['mixed_verified'],observations)
+                    metrics['elapsed_s']=round(time.monotonic()-begin,3);metrics['samples']=len(samples);metrics['max_sampled_total_ram_mib']=round(max(sum(_mib(r['MemUsage'].split('/')[0]) for r in s['resources']) for s in samples),2)
+                    stages=aggregate_profiles(before,profiles(2));assert stages['gateway']['api.send.call']['count']==n and stages['gateway']['ingress.ipc']['count']>=n
+                    metrics['api_calls']={k:v['count'] for k,v in stages['gateway'].items() if k.startswith('api.') and k.endswith('.call')}
+                    print('MIXED RESULT '+json.dumps(metrics,sort_keys=True),flush=True)
+                    print('PROFILE RESULT '+json.dumps(stages,sort_keys=True),flush=True)
+                    return
+
                 begin=time.monotonic();exec_py(broker,f'from pathlib import Path;Path("/network/telegram/load-count").write_text({str(a.load)!r})')
                 target=a.tenants*(1+a.load);deadline=begin+60
                 while True:
@@ -152,7 +178,7 @@ def main():
                 for v in vol.values():
                     if d.volume(v).get('Labels',{}).get('max2tg.placement')==owner:d.call('volume','rm',v)
                 assert not d.call('volume','ls','-q','--filter','label='+label)
-                if a.load:print('LOAD CLEANUP PASS',flush=True)
+                if a.load or a.mixed:print('LOAD CLEANUP PASS',flush=True)
             else:subprocess.run(['docker','run','--rm',*setup_args(),'-c','import shutil;from pathlib import Path;[(shutil.rmtree(p) if p.is_dir() else p.unlink()) for p in Path("/fixture").iterdir()]'],check=True,capture_output=True,timeout=60)
     print('PLACED RUNTIME PASS; disposable resources removed',flush=True)
 if __name__=='__main__':main()
