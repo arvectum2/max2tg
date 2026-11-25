@@ -57,3 +57,18 @@ def test_fixture_selection_is_immutable_and_allowlisted(tmp_path):
         assert '--network' in args and args[args.index('--network')+1]=='none'
         with pytest.raises(ValueError,match='Immutable'):s.register(A,*VOLUMES)
     finally:s.close()
+
+
+def test_proxy_fixture_requires_dedicated_readonly_network_volume(tmp_path):
+    tmp_path.chmod(0o700);b=Backend();s=OfflineContainerSupervisor(tmp_path,IMAGE,CODE,backend=b);b.owner=s.owner
+    net='m2tg-orch-test-network'
+    try:
+        with pytest.raises(ValueError):s.register(A,*VOLUMES,fixture='proxy-bridge')
+        with pytest.raises(ValueError):s.register(A,*VOLUMES,network_channel=net)
+        with pytest.raises(ValueError):s.register(A,*VOLUMES,fixture='proxy-bridge',network_channel=VOLUMES[0])
+        s.register(A,*VOLUMES,fixture='proxy-bridge',network_channel=net);args=s._args(s.row(A))
+        assert args[-3:]==['-m','tests.supervised_proxy_fixture',A]
+        assert f'type=volume,source={net},target=/network,readonly' in args
+        assert args[args.index('--network')+1]=='none'
+        with pytest.raises(ValueError,match='reuse'):s.register(B,'m2tg-orch-b-state','m2tg-orch-b-channel','m2tg-orch-b-secret',fixture='proxy-bridge',network_channel=net)
+    finally:s.close()

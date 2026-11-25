@@ -1,0 +1,67 @@
+#!/usr/bin/env python3
+"""Disposable actual-client bridge, no external network or real credentials."""
+import argparse,json,subprocess,tempfile,time,sys
+from pathlib import Path
+sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
+from app.container_supervisor import OfflineContainerSupervisor,DockerBackend
+from app.lifecycle_reconcile import LifecycleReconciler
+
+def main():
+    p=argparse.ArgumentParser();p.add_argument('--image',required=True);args=p.parse_args();d=DockerBackend();code=Path(__file__).resolve().parents[1];image=d.call('image','inspect','--format','{{.Id}}',args.image)
+    with tempfile.TemporaryDirectory(prefix='m2tg-proxy-e2e-') as td:
+        root=Path(td);root.chmod(0o700);cert=root/'cert';cert.mkdir();subprocess.run(['openssl','req','-x509','-newkey','rsa:2048','-nodes','-days','1','-subj','/CN=synthetic','-addext','subjectAltName=DNS:api.oneme.ru,DNS:api.telegram.org','-keyout',str(cert/'key.pem'),'-out',str(cert/'cert.pem')],check=True,capture_output=True);(cert/'key.pem').chmod(0o644)
+        s=OfflineContainerSupervisor(root,image,code);owner=s.owner;vol={};names=[];rec=None;gateway=None;ids=[]
+        def run(name,mode,mounts,*extra,init=False,certificate=False):
+            names.append(name);a=['run','--name',name,'--pull','never','--label',f'max2tg.offline={owner}','--network','none','--read-only','--security-opt','no-new-privileges','--memory','256m','--pids-limit','64','--mount',f'type=bind,source={code / "app"},target=/src/app,readonly','--mount',f'type=bind,source={code / "tests"},target=/src/tests,readonly','--workdir','/src']
+            if not init:a+=['-d','--user','65532:65532','--cap-drop','ALL']
+            for k,target in mounts:a+=['--mount',f'type=volume,source={vol[k]},target=/{target}']
+            if certificate:a+=['--mount',f'type=bind,source={cert},target=/cert,readonly']
+            return d.call(*a,'--entrypoint','python',image,'-m','tests.supervised_proxy_fixture',mode,*extra)
+        def read(cid,path):return json.loads(d.call('exec',cid,'python','-c',f'from pathlib import Path;print(Path({path!r}).read_text() if Path({path!r}).exists() else "null")'))
+        def touch(cid,path):d.call('exec',cid,'python','-c',f'from pathlib import Path;Path({path!r}).touch()')
+        def wait(check,timeout=15):
+            end=time.monotonic()+timeout
+            while time.monotonic()<end:
+                if rec:
+                    snap=read(gateway,'/registry/lifecycle.json')
+                    if snap:rec.reconcile(snap)
+                else:s.tick()
+                if check():return
+                time.sleep(.2)
+            raise RuntimeError('Condition not met: '+str([(sid,s.row(sid)['status']) for sid in ids]))
+        try:
+            for k in ('registry','channel0','channel1','state0','state1','secret0','secret1','net0','net1','nettg'):vol[k]=d.call('volume','create','--label',f'max2tg.offline={owner}',f'm2tg-orch-{owner}-{k}')
+            sessions=json.loads(run('m2tg-proxy-init-'+owner,'init',[(k,k) for k in vol],init=True,certificate=True));ids=[x[0] for x in sessions];a,b=ids
+            broker=run('m2tg-proxy-broker-'+owner,'broker',[(k,k) for k in ('net0','net1','nettg')],certificate=True)
+            wait(lambda:'READY' in d.call('logs',broker));gateway=run('m2tg-proxy-gateway-'+owner,'gateway',[(k,k) for k in ('registry','channel0','channel1')]+[('nettg','network')],json.dumps(sessions));wait(lambda:'READY' in d.call('logs',gateway))
+            for i,sid in enumerate(ids):s.register(sid,vol[f'state{i}'],vol[f'channel{i}'],vol[f'secret{i}'],fixture='proxy-bridge',network_channel=vol[f'net{i}']);names.append(s.name(sid))
+            rec=LifecycleReconciler(s)
+            def progress():return read(gateway,'/registry/progress.json') or {}
+            def counts():return read(gateway,'/network/counts.json') or {}
+            wait(lambda:all(s.row(x)['status']=='HEALTHY' for x in ids) and progress().get('out')=={'SENT':2});aid=s.row(a)['cid'];bid=s.row(b)['cid']
+            def wp(cid):return read(cid,'/state/progress.json') or {}
+            touch(gateway,'/network/phase1');wait(lambda:progress().get('in')=={'ACKED':2} and all(wp(c).get('out')=={'SENT':1} for c in (aid,bid)));print('Initial actual-client 2+2 receipts',flush=True)
+            touch(gateway,'/network/cut-a');wait(lambda:wp(aid).get('authorized') is False and wp(bid).get('authorized') is True)
+            touch(gateway,'/network/phase2');wait(lambda:progress().get('rows')=={'1':'ACKED','2':'ACKED','3':'RECEIVED','4':'ACKED'});assert len(counts()['max'])==3;print('A network cut: pending ingress retained, B confirmed',flush=True)
+            touch(gateway,'/network/restore-a');wait(lambda:progress().get('in')=={'ACKED':4} and wp(aid).get('authorized') is True);assert len(counts()['max'])==4 and len(counts()['tg'])==2
+            touch(gateway,'/network/phase3');wait(lambda:progress().get('rows',{}).get('5')=='UNKNOWN' and wp(aid).get('authorized') is True and wp(aid).get('in')=={'SENT':2,'UNKNOWN':1});assert counts()['max'].count([0,'ambiguous-0'])==1
+            assert sorted(counts()['max'])==sorted([[0,'incoming-0-0'],[1,'incoming-1-0'],[0,'incoming-0-1'],[1,'incoming-1-1'],[0,'ambiguous-0']]);assert sorted(counts()['tg'])==[[-10001,'outgoing-1'],[-10000,'outgoing-0']]
+            assert s.row(a)['cid']==aid and s.row(b)['cid']==bid and all(s.row(x)['attempts']==1 for x in ids);print('Recovered 4 ACKED + 2 SENT, 1 UNKNOWN; no resend, no container restart',flush=True)
+            rec=None
+            for sid in ids:s.desired(sid,False)
+            wait(lambda:all(s.row(x)['status']=='STOPPED' for x in ids));touch(gateway,'/registry/stop');assert d.call('wait',gateway)=='0';touch(broker,'/nettg/stop-broker');assert d.call('wait',broker)=='0'
+        except Exception:
+            for name in names:
+                try:print(name,d.call('logs','--tail','20',name),flush=True)
+                except Exception:pass
+            raise
+        finally:
+            s.close()
+            for n in reversed(names):
+                c=d.inspect(n)
+                if c and c['Config']['Labels'].get('max2tg.offline')==owner:d.call('rm','-f',c['Id'])
+            for n in vol.values():
+                if d.volume(n).get('Labels',{}).get('max2tg.offline')==owner:d.call('volume','rm',n)
+            assert not d.call('ps','-aq','--filter',f'label=max2tg.offline={owner}') and not d.call('volume','ls','-q','--filter',f'label=max2tg.offline={owner}')
+    print('SUPERVISED PROXY BRIDGE PASS; disposable resources removed',flush=True)
+if __name__=='__main__':main()
