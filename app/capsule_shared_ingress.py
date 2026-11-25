@@ -12,10 +12,11 @@ from app.topics import TopicStore
 
 
 class SharedCapsuleTextIngress:
-    def __init__(self, client, topics: TopicStore, ledger: TelegramOutbound):
+    def __init__(self, client, topics: TopicStore, ledger: TelegramOutbound, *, trusted_topic=None):
         self.client = client
         self.topics = topics
         self.ledger = ledger
+        self.trusted_topic = trusted_topic
 
     async def __call__(self, update: dict) -> bool:
         message = update.get("message")
@@ -30,8 +31,8 @@ class SharedCapsuleTextIngress:
         if type(thread_id) is not int or thread_id <= 0:
             return False
         max_chat_id = self.topics.chat_for_topic(thread_id)
-        if max_chat_id is None:
-            return False
+        if max_chat_id is None:return False
+        if self.trusted_topic is not None and str(self.trusted_topic(thread_id))!=str(max_chat_id):return False
         telegram_id = message.get("message_id")
         text = message.get("text")
         if (type(telegram_id) is not int or telegram_id <= 0
@@ -39,6 +40,8 @@ class SharedCapsuleTextIngress:
             or "reply_to_message" in message):
             return False
         # No MAX network operation if the connection is not authenticated.
+        from app.chat_preferences import get_chat_prefs
+        if not get_chat_prefs(self.topics,max_chat_id).sync:raise WorkerUnavailable()
         if getattr(self.client,"_authorized",False) is not True:
             raise WorkerUnavailable()
         try:
@@ -54,7 +57,7 @@ class SharedCapsuleTextIngress:
             return False
         result = await self.ledger.deliver_one(
             self.client,chat["id"],telegram_id,
-            is_allowed=lambda target: str(target)==str(max_chat_id)
+            is_allowed=lambda target: str(target)==str(max_chat_id) and get_chat_prefs(self.topics,max_chat_id).sync and (self.trusted_topic is None or str(self.trusted_topic(thread_id))==str(max_chat_id))
         )
         # A successful MAX reply ID is mandatory before signing an IPC ACK.
         return result == "SENT"

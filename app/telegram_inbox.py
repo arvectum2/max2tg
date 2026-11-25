@@ -68,6 +68,7 @@ class TelegramInbox:
         import os
         os.chmod(self.path,0o600)
         self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.execute("PRAGMA synchronous=FULL")
         self.db.execute("PRAGMA busy_timeout=1000")
         self.db.executescript("""
           CREATE TABLE IF NOT EXISTS telegram_ingress(
@@ -152,10 +153,11 @@ class TelegramInbox:
                 "UPDATE telegram_ingress SET status='BLOCKED',updated_at=? "
                 "WHERE update_id=?",(time.time(),update_id))
             return "BLOCKED"
-        self.db.execute(
+        claim=self.db.execute(
             "UPDATE telegram_ingress SET status='INFLIGHT',updated_at=? "
             "WHERE update_id=? AND status='RECEIVED'",
             (time.time(),update_id))
+        if claim.rowcount!=1:return self.row(update_id)['status']
         try:
             confirmed=await deliver(row["session_id"],json.loads(row["payload"]))
         except WorkerUnavailable:

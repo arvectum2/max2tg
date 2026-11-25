@@ -48,6 +48,9 @@ class CapsuleEgressOutbox:
                 updated_at REAL NOT NULL
             );
         """)
+        columns={r['name'] for r in self.db.execute('PRAGMA table_info(worker_telegram_intents)')}
+        for name in ('max_chat_id','max_message_id'):
+            if name not in columns:self.db.execute(f'ALTER TABLE worker_telegram_intents ADD COLUMN {name} TEXT')
         for suffix in ("-wal", "-shm"):
             extra = self.path.with_name(self.path.name + suffix)
             if extra.exists():
@@ -60,14 +63,20 @@ class CapsuleEgressOutbox:
         ).fetchone()
         return dict(row) if row else None
 
-    def stage(self, key: str, text: str) -> str:
+    def stage(self, key: str, text: str, *, max_chat_id=None,max_message_id=None) -> str:
         if not isinstance(key, str) or not SOURCE_KEY.fullmatch(key):
             raise ValueError("Invalid source event key")
         if not isinstance(text, str) or not text or "\x00" in text:
             raise ValueError("Invalid outbound text")
         if len(text.encode("utf-16-le")) // 2 > 4096:
             raise ValueError("Telegram text too long")
-        fp = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        from app.telegram_control_plane import TelegramControlPlane
+        if max_chat_id is not None:
+            max_chat_id=TelegramControlPlane.max_chat_key(max_chat_id)
+            if not isinstance(max_message_id,str) or not SOURCE_KEY.fullmatch(max_message_id):raise ValueError('Invalid MAX message ID')
+        elif max_message_id is not None:raise ValueError('Incomplete MAX identity')
+        identity=text if max_chat_id is None else max_chat_id+'\0'+max_message_id+'\0'+text
+        fp=hashlib.sha256(identity.encode('utf-8')).hexdigest()
         old = self.row(key)
         if old:
             if old["fingerprint"] != fp:
@@ -80,9 +89,9 @@ class CapsuleEgressOutbox:
             return old["status"]
         self.db.execute(
             "INSERT INTO worker_telegram_intents "
-            "(source_key,text,fingerprint,status,updated_at) "
-            "VALUES(?,?,?,'PENDING',?)",
-            (key, text, fp, time.time())
+            "(source_key,text,fingerprint,status,updated_at,max_chat_id,max_message_id) "
+            "VALUES(?,?,?,'PENDING',?,?,?)",
+            (key, text, fp, time.time(),max_chat_id,max_message_id)
         )
         return "PENDING"
 
@@ -96,9 +105,9 @@ class CapsuleEgressOutbox:
             if old["status"] in TERMINAL:
                 return old["status"]
             try:
-                result = await client.status(key)
+                result = await client.status(key,max_chat_id=old["max_chat_id"]) if old["max_chat_id"] is not None else await client.status(key)
                 if result["status"] == "MISSING":
-                    result = await client.enqueue(key, old["text"])
+                    result = await client.enqueue(key, old["text"],max_chat_id=old["max_chat_id"]) if old["max_chat_id"] is not None else await client.enqueue(key, old["text"])
             except (OSError, EOFError, asyncio.TimeoutError, ValueError):
                 # Gateway may already have committed this event; same key
                 # is safe to retry without creating a second Bot API send.

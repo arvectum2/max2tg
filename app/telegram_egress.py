@@ -55,6 +55,9 @@ class TelegramEgress:
             CREATE INDEX IF NOT EXISTS egress_ready
                 ON telegram_egress(status,created_at);
         """)
+        columns={r['name'] for r in self.db.execute('PRAGMA table_info(telegram_egress)')}
+        for name,kind in [('max_chat_id','TEXT'),('thread_id','INTEGER')]:
+            if name not in columns:self.db.execute(f'ALTER TABLE telegram_egress ADD COLUMN {name} {kind}')
         self.db.execute(
             "UPDATE telegram_egress SET status='UNKNOWN',updated_at=? "
             "WHERE status='SENDING'", (time.time(),),
@@ -84,11 +87,12 @@ class TelegramEgress:
         ).fetchone()
         return dict(row) if row else None
 
-    def enqueue(self, sid: str, source_key: str, text: str) -> str:
+    def enqueue(self, sid: str, source_key: str, text: str, *, max_chat_id=None) -> str:
         """Durably admit one immutable event for an ACTIVE owned forum.
 
-        No caller-supplied chat ID, thread ID or bot credential is accepted.
-        For now, send plain text to the forum general topic only.
+        No caller-supplied Telegram chat ID, thread ID or bot credential is accepted.
+        Scoped text selects a MAX chat; the trusted registry resolves its topic.
+        Unscoped legacy events retain their General-only route.
         """
         self.plane.capsules._check_id(sid)
         if not isinstance(source_key, str) or not SOURCE_KEY.fullmatch(source_key):
@@ -97,10 +101,15 @@ class TelegramEgress:
             raise ValueError("Invalid text content")
         if len(text.encode("utf-16-le")) // 2 > 4096:
             raise ValueError("Telegram text too long")
-        chat = self._route(sid)
-        if chat is None:
-            raise PermissionError("No active Telegram forum for session")
-        fingerprint = hashlib.sha256((chat + "\0" + text).encode()).hexdigest()
+        chat = self._route(sid);thread=None
+        if max_chat_id is not None:
+            max_chat_id=self.plane.max_chat_key(max_chat_id)
+            route=self.plane.topic_route(sid,max_chat_id)
+            if route is None or route[0]!=chat:raise PermissionError('No active topic route')
+            chat,thread=route
+        if chat is None:raise PermissionError('No active Telegram forum for session')
+        identity=chat+'\0'+text if thread is None else chat+'\0'+max_chat_id+'\0'+str(thread)+'\0'+text
+        fingerprint=hashlib.sha256(identity.encode()).hexdigest()
         previous = self.row(sid, source_key)
         if previous is not None:
             if previous["fingerprint"] != fingerprint:
@@ -116,8 +125,8 @@ class TelegramEgress:
         self.db.execute(
             "INSERT INTO telegram_egress "
             "(session_id,source_key,tg_chat_id,text,fingerprint,status,"
-            "created_at,updated_at) VALUES(?,?,?,?,?,'QUEUED',?,?)",
-            (sid, source_key, chat, text, fingerprint, now, now),
+            "created_at,updated_at,max_chat_id,thread_id) VALUES(?,?,?,?,?,'QUEUED',?,?,?,?)",
+            (sid, source_key, chat, text, fingerprint, now, now,max_chat_id,thread),
         )
         return "QUEUED"
 
@@ -157,7 +166,7 @@ class TelegramEgress:
                 return "MISSING"
             if row["status"] != "QUEUED":
                 return row["status"]
-            if self._route(sid) != row["tg_chat_id"]:
+            if self._route(sid) != row["tg_chat_id"] or (row["max_chat_id"] is not None and self.plane.topic_route(sid,row["max_chat_id"])!=(row["tg_chat_id"],row["thread_id"])):
                 self.db.execute(
                     "UPDATE telegram_egress SET status='BLOCKED',updated_at=? "
                     "WHERE session_id=? AND source_key=? AND status='QUEUED'",
@@ -178,6 +187,7 @@ class TelegramEgress:
                     chat_id=int(row["tg_chat_id"]),
                     text=row["text"],
                     parse_mode=None,
+                    **({"message_thread_id":row["thread_id"]} if row["thread_id"] is not None else {}),
                 )
             except asyncio.CancelledError:
                 self._uncertain(sid, source_key)
@@ -189,7 +199,8 @@ class TelegramEgress:
             response_chat = getattr(response, "chat", None)
             if (type(message_id) is not int or message_id <= 0
                 or response_chat is not None and
-                getattr(response_chat, "id", None) != int(row["tg_chat_id"])):
+                getattr(response_chat, "id", None) != int(row["tg_chat_id"])
+                or row["thread_id"] is not None and (getattr(response_chat,"id",None)!=int(row["tg_chat_id"]) or getattr(response,"message_thread_id",None)!=row["thread_id"])):
                 self._uncertain(sid, source_key)
                 return "UNKNOWN"
             updated = self.db.execute(
