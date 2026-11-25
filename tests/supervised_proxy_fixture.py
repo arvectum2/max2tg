@@ -21,12 +21,12 @@ def user(uid):return {'id':uid,'is_bot':uid==900,'first_name':'Synthetic','usern
 def chat(gid):return {'id':gid,'type':'supergroup','title':'Synthetic','is_forum':True}
 def message(gid,mid,text,actor=900):return {'message_id':mid,'date':1700000000,'chat':chat(gid),'from':user(actor),'message_thread_id':77,'text':text,'is_topic_message':True}
 
-async def broker(network_paths=None,*,long_poll=False,mixed=False):
+async def broker(network_paths=None,*,long_poll=False,mixed=False,cycles=1):
     assert_sandbox();assert not any(Path(p).exists() for p in ('/keys','/secret','/registry','/keys0','/keys1','/botkeys','/botsecret'));ctx=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER);ctx.load_cert_chain('/cert/cert.pem','/cert/key.pem');paths=network_paths or ['/net0','/net1','/nettg'];tenants=len(paths)-1;assert tenants in (2,4,8,16);control=Path(paths[-1])
     evidence=control/'counts.json';counts=json.loads(evidence.read_text()) if evidence.exists() else {'max':[],'tg':[],'auth':[0]*tenants};servers=[];load_sockets={};load_n=0
     (control/'cut-a').unlink(missing_ok=True);(control/'cut-confirmed').unlink(missing_ok=True)
     def report():atomic(control/'counts.json',counts)
-    wakeup=UpdateWakeup();mixed_started=None;mixed_index=0;mixed_updates=[];mixed_at={};waves=schedule(tenants) if mixed else []
+    wakeup=UpdateWakeup();mixed_started=None;mixed_index=0;mixed_updates=[];mixed_at={};waves=schedule(tenants,cycles) if mixed else []
     def updates(offset):
         phase=2 if (control/'phase2').exists() else 1 if (control/'phase1').exists() else 0
         data=[{'update_id':tenants*j+i+1,'message':message(-10000-i,100+tenants*j+i,f'incoming-{i}-{j}',100+i)} for j in range(phase) for i in range(tenants) if tenants*j+i+1>=offset]

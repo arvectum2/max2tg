@@ -70,7 +70,7 @@ if __name__=='__main__':
     mode=sys.argv[1]
     if mode=='init':asyncio.run(prepare())
     elif mode=='broker':
-        sessions=json.loads(sys.argv[2]);asyncio.run(broker(['/network/'+sid for sid,_,_ in sessions]+['/network/telegram'],long_poll='long-poll' in sys.argv[3:],mixed='mixed' in sys.argv[3:]))
+        sessions=json.loads(sys.argv[2]);asyncio.run(broker(['/network/'+sid for sid,_,_ in sessions]+['/network/telegram'],long_poll='long-poll' in sys.argv[3:],mixed='mixed' in sys.argv[3:],cycles=3 if 'soak' in sys.argv[3:] else 1))
     elif mode=='gateway':asyncio.run(placed_gateway(json.loads(sys.argv[2]),sys.argv[3:]==['profile']))
     elif mode=='worker':asyncio.run(placed_worker(sys.argv[2],sys.argv[3:]==['profile']))
     else:raise SystemExit(78)
