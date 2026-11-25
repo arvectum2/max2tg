@@ -18,7 +18,7 @@ class IsolatedWorkerRuntime(SharedWorkerRuntime):
             if p.is_symlink() or not p.is_dir() or p.stat().st_uid!=os.getuid() or p.stat().st_mode&0o077:raise PermissionError('Unsafe local directory')
         if state==channel or state.is_relative_to(channel) or channel.is_relative_to(state):raise ValueError('State and channel must be separate')
         key=_read_private_key(key_file)
-        self.sid=sid;self.client=client;self.forum=forum;self.actor=actor;self._routes={};self.started=False;self.closed=False;self._lock=asyncio.Lock();self._route_lock=asyncio.Lock()
+        self.profile=None;self.sid=sid;self.client=client;self.forum=forum;self.actor=actor;self._routes={};self.started=False;self.closed=False;self._lock=asyncio.Lock();self._route_lock=asyncio.Lock()
         self.owner=RuntimeLock(state/'worker.lock');self.ledger=None;self.egress=None
         try:
             ipc=GatewayEgressIpcClient(sid,channel/'egress.sock',key_file)

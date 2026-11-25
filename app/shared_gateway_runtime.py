@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio,os,time,stat
 from pathlib import Path
 from app.runtime_lock import RuntimeLock
+from app.stage_profile import measure,started,finished
 from app.telegram_inbox import TelegramInbox
 from app.telegram_control_plane import TelegramControlPlane
 from app.telegram_egress import TelegramEgress
@@ -29,9 +30,9 @@ async def remove_dead_socket(path):
     writer.close();await writer.wait_closed();raise RuntimeError('IPC listener already active')
 
 class SharedGatewayRuntime:
-    def __init__(self,registry,bot,*,channels=None,external_only=False,managed=False):
+    def __init__(self,registry,bot,*,channels=None,external_only=False,managed=False,profile=None):
         if managed and (channels is None or not external_only):raise ValueError("Managed mode requires external dedicated channels")
-        self.managed=managed;self._opened=set();self.bot_id=None;self.poll_failures=0
+        self.profile=profile;self.managed=managed;self._opened=set();self.bot_id=None;self.poll_failures=0
         self.registry=registry;self.bot=bot;self.lock=RuntimeLock(registry.root/'shared-gateway.lock')
         self.inbox=None;self.egress=None;self.server=None;self.servers=[];self.started=False;self._poll_lock=asyncio.Lock();self._drain_lock=asyncio.Lock()
         try:
@@ -43,13 +44,13 @@ class SharedGatewayRuntime:
                     if row['desired_active'] and row['session_id'] not in channels:raise PermissionError('Active external capsule missing channel')
             if managed:
                 if isinstance(bot,BudgetedBot) and bot.budget.db is not registry.db:raise PermissionError("Foreign budget")
-                self.bot=bot if isinstance(bot,BudgetedBot) else BudgetedBot(bot,TelegramBudget(registry.db))
+                self.bot=bot if isinstance(bot,BudgetedBot) else BudgetedBot(bot,TelegramBudget(registry.db,profile=profile))
             self.plane=TelegramControlPlane(registry)
             self.provisioner=SharedTopicProvisioner(self.plane)
             self.guard=ForumGuard(registry,self.bot) if managed else None
             allowed=self._dispatch_allowed if self.guard else None
-            self.inbox=TelegramInbox(registry.root/'inbox.sqlite3',self.plane,dispatch_allowed=allowed)
-            self.egress=TelegramEgress(registry.root/'telegram-egress.sqlite3',self.plane,topic_scoped=True,dispatch_allowed=allowed)
+            self.inbox=TelegramInbox(registry.root/'inbox.sqlite3',self.plane,dispatch_allowed=allowed,profile=profile)
+            self.egress=TelegramEgress(registry.root/'telegram-egress.sqlite3',self.plane,topic_scoped=True,dispatch_allowed=allowed,profile=profile)
             self.channels=None
             if channels is not None:
                 self.channels={}
@@ -120,8 +121,12 @@ class SharedGatewayRuntime:
     async def reconcile_channels(self):
         """Only pre-mounted channels; never mounts paths or accepts tenant input."""
         if not self.managed or not self.started:raise RuntimeError('Managed gateway not started')
-        await self.guard.refresh(self._desired_channels())
+        with measure(self.profile,"gateway.forum_refresh"):
+            await self.guard.refresh(self._desired_channels())
+        at=started(self.profile)
         async with self._drain_lock:
+            finished(self.profile,"gateway.lifecycle_lock",at)
+            at=started(self.profile)
             active={sid for sid in self._desired_channels() if self._dispatch_allowed(sid)}
             for server in self.servers:
                 sid=server.bound_sid
@@ -129,7 +134,7 @@ class SharedGatewayRuntime:
                     await server.stop();self._opened.discard(sid)
                 elif sid in active and sid not in self._opened:
                     await remove_dead_socket(server.path);await server.start();self._opened.add(sid)
-            return self.lifecycle_snapshot()
+            result=self.lifecycle_snapshot();finished(self.profile,"gateway.lifecycle",at);return result
 
     def lifecycle_snapshot(self):
         if not self.managed or not self.started:raise RuntimeError('Managed gateway not started')
@@ -160,7 +165,7 @@ class SharedGatewayRuntime:
             if len(ids)>100 or any(type(i) is not int or i<offset or i>=2**63-1 for i in ids) or ids!=sorted(set(ids)):raise ValueError('Invalid polling batch')
             if self.guard:
                 for u in raw:self.guard.observe(u)
-            count=0;db=self.inbox.db
+            count=0;db=self.inbox.db;at=started(self.profile)
             db.execute('BEGIN IMMEDIATE')
             try:
                 for u in raw:
@@ -173,19 +178,26 @@ class SharedGatewayRuntime:
                 db.execute('COMMIT')
             except BaseException:
                 db.execute('ROLLBACK');raise
+            finished(self.profile,'gateway.ingest_commit',at)
             if self.poll_failures:
                 self._invalidate_poll_leases()
                 self.poll_failures=0
             return count
 
     async def drain_once(self):
+        at=started(self.profile)
         async with self._drain_lock:
+            finished(self.profile,"gateway.drain_lock",at)
             if not self.started:raise RuntimeError('Gateway not started')
             held=(self._desired_channels() if self.poll_failures else self.guard.held_sessions()) if self.guard else ()
             if self.managed:
                 # Small rounds release the lifecycle lock often. Only separate
                 # worker IPCs run concurrently; Bot API sends remain serial.
-                return {'ingress':await self.engine.drain(32,exclude=held,concurrency=4,fair=True),'egress':await self.engine.drain_egress(self.bot,16,exclude=held,fair=True)}
+                with measure(self.profile,'gateway.ingress_round'):
+                    ingress=await self.engine.drain(32,exclude=held,concurrency=4,fair=True)
+                with measure(self.profile,'gateway.egress_round'):
+                    egress=await self.engine.drain_egress(self.bot,16,exclude=held,fair=True)
+                return {'ingress':ingress,'egress':egress}
             return {'ingress':await self.engine.drain(exclude=held),'egress':await self.engine.drain_egress(self.bot,exclude=held)}
 
     async def provision_topic(self,sid,max_chat_id,owner,title):

@@ -15,6 +15,7 @@ import sqlite3
 import time
 
 from app.telegram_budget import BudgetedBot,ApiDeferred
+from app.stage_profile import measure,age
 from app.telegram_control_plane import TelegramControlPlane
 
 SOURCE_KEY = re.compile(r"^[A-Za-z0-9:_./-]{1,128}$")
@@ -23,8 +24,8 @@ SOURCE_KEY = re.compile(r"^[A-Za-z0-9:_./-]{1,128}$")
 class TelegramEgress:
     """A single owner-private SQLite journal under the capsule registry root."""
 
-    def __init__(self, path: str | Path, plane: TelegramControlPlane, *, topic_scoped=False,dispatch_allowed=None):
-        self.plane = plane
+    def __init__(self, path: str | Path, plane: TelegramControlPlane, *, topic_scoped=False,dispatch_allowed=None,profile=None):
+        self.profile=profile;self.plane = plane
         self.dispatch_allowed=dispatch_allowed
         self.topic_scoped=topic_scoped
         self.path = Path(path).absolute()
@@ -194,14 +195,16 @@ class TelegramEgress:
                 return self.row(sid, source_key)["status"]
             def still_allowed():
                 return (self.dispatch_allowed is None or self.dispatch_allowed(sid)) and self._route(sid)==row['tg_chat_id'] and (row['max_chat_id'] is None or self.plane.topic_route(sid,row['max_chat_id'])==(row['tg_chat_id'],row['thread_id']))
+            age(self.profile,"egress.pending_age",row["created_at"])
             try:
-                response = await bot.send_message(
-                    chat_id=int(row["tg_chat_id"]),
-                    text=row["text"],
-                    parse_mode=None,
-                    **({'before':still_allowed} if isinstance(bot,BudgetedBot) else {}),
-                    **({"message_thread_id":row["thread_id"]} if row["thread_id"] is not None else {}),
-                )
+                with measure(self.profile,"egress.send_total"):
+                    response = await bot.send_message(
+                        chat_id=int(row["tg_chat_id"]),
+                        text=row["text"],
+                        parse_mode=None,
+                        **({'before':still_allowed} if isinstance(bot,BudgetedBot) else {}),
+                        **({"message_thread_id":row["thread_id"]} if row["thread_id"] is not None else {}),
+                    )
             except ApiDeferred:
                 # Only the local budget proves that no API invocation occurred.
                 self.db.execute("UPDATE telegram_egress SET status='QUEUED',updated_at=? WHERE session_id=? AND source_key=? AND status='SENDING'",(time.time(),sid,source_key))
