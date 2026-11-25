@@ -15,6 +15,9 @@ from app.max_client import MaxMessage
 from app.recovery_manifest import RecoveryAnchor
 from app.coordinated_backup import capture_delivery_state,materialize_verified,GATEWAY,WORKER
 from app.restored_start_gate import launch_verified_restore
+from app.encrypted_storage import create_key
+from app.encrypted_credentials import install_encrypted_worker
+from app.encrypted_backup import encrypt_snapshot,materialize_encrypted
 from app.runtime_lock import RuntimeLock
 from tests.test_shared_onboarding import bot
 from tests.test_shared_gateway_ipc import FakeMaxClient,_telegram_update
@@ -73,17 +76,19 @@ async def test_capture_and_materialize_real_stopped_runtime(tmp_path):
             with closing(sqlite3.connect((restored/f'{sid}-to-telegram.sqlite3').as_uri()+'?mode=ro&immutable=1',uri=True)) as db:assert db.execute("SELECT telegram_id FROM worker_telegram_intents WHERE status='SENT'").fetchone()[0]==777
         with pytest.raises(FileExistsError):materialize_verified(target,restores,anchor,name='snapshot-restore')
         # Actual reconstructed runtime layout, independent retained secrets/keys.
+        archive_dir=base/'archive';archive_dir.mkdir(mode=0o700);archive_keys=base/'archive-keys';archive_keys.mkdir(mode=0o700);bk=archive_keys/'backup.key';create_key(bk,'backup:'+record['epoch']);archive=archive_dir/'snapshot.enc';assert encrypt_snapshot(target,archive,bk,anchor)['members']==11
+        restored,_=materialize_encrypted(archive,bk,restores,anchor,name='snapshot-encrypted-restore')
         newroot=base/'newregistry';newroot.mkdir(mode=0o700);(newroot/'tenants').mkdir(mode=0o700)
         for n in GATEWAY:shutil.copy2(restored/f'gateway-{n}',newroot/n)
         for n in ('shared-gateway.lock','shared-provisioning.lock'):(newroot/n).touch(mode=0o600)
-        layout={}
+        layout={};secret_keys={}
         for i,(sid,actor,forum) in enumerate(sessions):
             state=base/f'newstate{i}';channel=base/f'newchannel{i}';secret=base/f'newsecret{i}'
             for p in (state,channel,secret):p.mkdir(mode=0o700)
             for n in WORKER:shutil.copy2(restored/f'{sid}-{n}',state/n)
             (state/'worker.lock').touch(mode=0o600);shutil.copy2(states[sid]/'key',state/'key')
             capsule=newroot/'tenants'/sid;capsule.mkdir(mode=0o700);shutil.copy2(state/'key',capsule/'telegram-ipc.key')
-            shutil.copy2(base/f'secret{i}'/'max.json',secret/'max.json');layout[sid]=(state,channel,secret)
+            key_dir=base/f'newkeys{i}';key_dir.mkdir(mode=0o700);kp=key_dir/'worker.key';create_key(kp,'max:'+sid);install_encrypted_worker(secret,sid,{'session_id':sid,'MAX_TOKEN':'synthetic-private','MAX_DEVICE_ID':'synthetic'},kp);secret_keys[sid]=kp;layout[sid]=(state,channel,secret)
         async def start():
             assert anchor._load()['dirty']
             rr=CapsuleRegistry(newroot);gg=SharedGatewayRuntime(rr,b,channels={sid:p[1] for sid,p in layout.items()},external_only=True);ww=[]
@@ -98,16 +103,16 @@ async def test_capture_and_materialize_real_stopped_runtime(tmp_path):
                 await gg.close();rr.close()
         unexpected=AsyncMock(side_effect=AssertionError('Must not start'))
         k=layout[sessions[0][0]][0]/'key';original=k.read_bytes();k.write_bytes(b'z'*32)
-        with pytest.raises(PermissionError,match='IPC key mismatch'):await launch_verified_restore(anchor,newroot,layout,start=unexpected)
+        with pytest.raises(PermissionError,match='IPC key mismatch'):await launch_verified_restore(anchor,newroot,layout,secret_keys=secret_keys,start=unexpected)
         k.write_bytes(original)
         sidecar=newroot/'inbox.sqlite3-wal';sidecar.touch(mode=0o600)
-        with pytest.raises(PermissionError,match='sidecar'):await launch_verified_restore(anchor,newroot,layout,start=unexpected)
+        with pytest.raises(PermissionError,match='sidecar'):await launch_verified_restore(anchor,newroot,layout,secret_keys=secret_keys,start=unexpected)
         sidecar.unlink()
         corrupt=newroot/'inbox.sqlite3';original=corrupt.read_bytes();corrupt.write_bytes(original+b'x')
-        with pytest.raises(PermissionError,match='differs'):await launch_verified_restore(anchor,newroot,layout,start=unexpected)
+        with pytest.raises(PermissionError,match='differs'):await launch_verified_restore(anchor,newroot,layout,secret_keys=secret_keys,start=unexpected)
         corrupt.write_bytes(original);unexpected.assert_not_awaited();assert not anchor._load()['dirty']
-        assert await launch_verified_restore(anchor,newroot,layout,start=start)=='started'
-        with pytest.raises(PermissionError,match='Dirty anchor'):await launch_verified_restore(anchor,newroot,layout,start=unexpected)
+        assert await launch_verified_restore(anchor,newroot,layout,secret_keys=secret_keys,start=start)=='started'
+        with pytest.raises(PermissionError,match='Dirty anchor'):await launch_verified_restore(anchor,newroot,layout,secret_keys=secret_keys,start=unexpected)
         unexpected.assert_not_awaited()
         with pytest.raises(PermissionError,match='Dirty epoch'):capture('snapshot-dirty')
         assert not (output/'snapshot-dirty').exists()

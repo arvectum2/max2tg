@@ -42,7 +42,10 @@ def install_worker_secret(folder,sid,values):
     finally:os.close(dfd)
 
 
-def load_worker_secret(folder,sid):
+def load_worker_secret(folder,sid,*,key_path=None):
+    if key_path is not None:
+        from app.encrypted_credentials import load_encrypted_worker
+        return load_encrypted_worker(folder,sid,key_path)
     dfd=_directory(folder)
     try:
         fd=os.open('max.json',os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=dfd)
@@ -57,9 +60,9 @@ def load_worker_secret(folder,sid):
     finally:os.close(dfd)
 
 
-def build_max_client(folder,sid,*,factory=None):
+def build_max_client(folder,sid,*,factory=None,key_path=None):
     if factory is None:
         from app.max_client import MaxClient
         factory=MaxClient
-    values=load_worker_secret(folder,sid)
+    values=load_worker_secret(folder,sid,key_path=key_path)
     return factory(token=values['MAX_TOKEN'],device_id=values['MAX_DEVICE_ID'],debug=False)

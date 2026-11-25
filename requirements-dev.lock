@@ -14,6 +14,10 @@ certifi==2026.11.20
     # via
     #   httpcore
     #   httpx
+cffi==2.1.1
+    # via cryptography
+cryptography==50.0.2
+    # via -r requirements.txt
 frozenlist==1.8.0
     # via
     #   aiohttp
@@ -49,6 +53,8 @@ propcache==0.5.4
     # via
     #   aiohttp
     #   yarl
+pycparser==3.12
+    # via cffi
 pygments==2.21.0
     # via pytest
 pytest==9.2.0

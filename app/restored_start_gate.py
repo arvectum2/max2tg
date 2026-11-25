@@ -15,7 +15,7 @@ from app.worker_secrets import load_worker_secret
 from app.worker_provision import _read
 
 
-async def launch_verified_restore(anchor:RecoveryAnchor,registry,workers,*,start):
+async def launch_verified_restore(anchor:RecoveryAnchor,registry,workers,*,start,secret_keys=None):
     """Check exact restored data, separate retained keys, then burn clean anchor.
 
     `workers` maps sid to (state, channel, secret). `start` is trusted async
@@ -27,7 +27,11 @@ async def launch_verified_restore(anchor:RecoveryAnchor,registry,workers,*,start
     if type(workers) is not dict or not workers or any(type(sid) is not str or not TENANT_ID.fullmatch(sid) for sid in workers):raise ValueError('Explicit worker set required')
     paths={sid:tuple(_private_dir(p) for p in parts) for sid,parts in workers.items()}
     if any(len(parts)!=3 for parts in paths.values()):raise ValueError('Invalid worker layout')
-    _disjoint([anchor.root,root,*[p for parts in paths.values() for p in parts]])
+    keys={} if secret_keys is None else secret_keys
+    if type(keys) is not dict or not set(keys)<=set(paths):raise ValueError("Invalid worker secret key set")
+    from pathlib import Path
+    key_roots=[_private_dir(Path(p).parent) for p in keys.values()]
+    _disjoint([anchor.root,root,*[p for parts in paths.values() for p in parts],*key_roots])
     outer=RuntimeLock(anchor.root/'backup.lock')
     try:
         with ExitStack() as stack:
@@ -55,7 +59,7 @@ async def launch_verified_restore(anchor:RecoveryAnchor,registry,workers,*,start
                     key=_read(capsule/'telegram-ipc.key',32);local=_read(state/'key',32)
                     if len(key)!=32 or not hmac.compare_digest(key,local):raise PermissionError('Retained IPC key mismatch')
                     if (capsule/'credentials.json').exists() or (capsule/'credentials.json').is_symlink():raise PermissionError('Legacy secret prohibited')
-                    load_worker_secret(secret,sid)
+                    load_worker_secret(secret,sid,key_path=keys.get(sid))
             anchor.mark_dirty()
         # Dirty marker is fsynced before any runtime constructor, network or write.
         # Trusted exclusive host orchestrator controls the handoff to runtime locks.

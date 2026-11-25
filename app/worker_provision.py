@@ -42,16 +42,16 @@ def _ensure(path,data):
     try:os.fsync(directory)
     finally:os.close(directory)
 
-def prepare_worker(state,channel,secret,sid,actor,forum,key):
+def prepare_worker(state,channel,secret,sid,actor,forum,key,*,key_path=None):
     state,channel,secret=_folders(state,channel,secret);expected=_expected(sid,actor,forum,key)
     lock=RuntimeLock(state/'worker.lock')
     try:
-        load_worker_secret(secret,sid)
+        load_worker_secret(secret,sid,key_path=key_path)
         for name,data in expected.items():_ensure(state/name,data)
-        return check_worker(state,channel,secret,sid,actor,forum,key)
+        return check_worker(state,channel,secret,sid,actor,forum,key,key_path=key_path)
     finally:lock.close()
 
-def check_worker(state,channel,secret,sid,actor,forum,key):
+def check_worker(state,channel,secret,sid,actor,forum,key,*,key_path=None):
     state,channel,secret=_folders(state,channel,secret);expected=_expected(sid,actor,forum,key)
-    load_worker_secret(secret,sid)
+    load_worker_secret(secret,sid,key_path=key_path)
     return all(hmac.compare_digest(_read(state/name,len(data)),data) for name,data in expected.items())
