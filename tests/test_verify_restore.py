@@ -49,3 +49,24 @@ def test_refuse_symlink_to_private_topics(tmp_path):
     alias.symlink_to(tmp_path/"topics.json")
     with pytest.raises(ValueError):
         verify_restore(alias,tmp_path/"good.sqlite3")
+
+
+def test_restore_album_members_and_mutations_without_replaying(tmp_path):
+    from app.tg_mutation_outbox import TgMutationOutbox
+    from tests.test_tg_albums import setup_group
+    t=TopicStore(str(tmp_path/'topics.json'));t.set_topic(42,10,'Test')
+    o=OutboxStore(str(tmp_path/'outbox.sqlite3'));o.close()
+    l=TelegramOutbound(tmp_path/'tg-outbound.sqlite3',t);setup_group(l)
+    l.db.execute('CREATE TABLE inbound_updates(update_id INTEGER PRIMARY KEY,payload TEXT)');l.db.execute('INSERT INTO inbound_updates VALUES(1,?)',('{}',));l.close()
+    m=TgMutationOutbox(tmp_path/'tg-mutations.sqlite3');k=m.enqueue('reaction',42,'123',{'emoji':'👍'});m.db.execute("UPDATE tg_mutations SET status='SENDING' WHERE key=?",(k,));m.close()
+    r=verify_restore(tmp_path/'topics.json',tmp_path/'outbox.sqlite3',tmp_path/'tg-outbound.sqlite3',tmp_path/'tg-mutations.sqlite3')
+    assert r['pending_album_members']==3 and r['pending_ingress']==1
+    assert r['tg_outbound_status_counts']=={'RECEIVED':3}
+    assert r['tg_mutation_status_counts']=={'UNKNOWN':1}
+    with sqlite3.connect(tmp_path/'tg-mutations.sqlite3') as c:assert c.execute('SELECT status FROM tg_mutations').fetchone()[0]=='SENDING'
+
+
+def test_explicit_missing_restore_source_fails_closed(tmp_path):
+    t=TopicStore(str(tmp_path/'topics.json'));t.set_topic(42,10,'Test')
+    o=OutboxStore(str(tmp_path/'outbox.sqlite3'));o.close()
+    with pytest.raises(ValueError):verify_restore(tmp_path/'topics.json',tmp_path/'outbox.sqlite3',tmp_path/'missing.sqlite3')

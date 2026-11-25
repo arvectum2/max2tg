@@ -27,11 +27,21 @@ class ContactResolver:
     def my_id(self) -> Any:
         return self._my_id
 
+    @staticmethod
+    def _chat_lookup(cache, chat_id, default=None):
+        if chat_id in cache:
+            return cache[chat_id]
+        if isinstance(chat_id,str) and chat_id.removeprefix('-').isascii() and chat_id.removeprefix('-').isdigit():
+            return cache.get(int(chat_id),default)
+        if type(chat_id) is int:
+            return cache.get(str(chat_id),default)
+        return default
+
     def chat_name(self, chat_id: Any) -> str:
-        return self.chats.get(chat_id, str(chat_id))
+        return self._chat_lookup(self.chats,chat_id,str(chat_id))
 
     def is_dm(self, chat_id: Any) -> bool:
-        return self.chat_types.get(chat_id) == "DIALOG"
+        return self._chat_lookup(self.chat_types,chat_id) == "DIALOG"
 
     def user_name(self, user_id: Any) -> str:
         return self.users.get(user_id, str(user_id))

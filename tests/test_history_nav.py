@@ -397,3 +397,110 @@ async def test_callback_from_other_supergroup_cannot_search_or_import(tmp_path):
     await callback_find(event,ctx)
     assert client.fetch_history.await_count==count
     outbox.close()
+
+@pytest.mark.asyncio
+async def test_known_terminal_gap_does_not_block_manual_history(tmp_path):
+    event,ctx,client,sender,store,db=ui(tmp_path)
+    from app.max_client import MaxMessage
+    original=MaxMessage(chat_id=42,message_id='2',timestamp=1700000002000,text='uncertain')
+    key=db.enqueue(original);db._set_job(key,'UNKNOWN','transport timeout')
+    client.fetch_history=source([raw(i,i*1000) for i in (1,2,3)])
+    sender._bot.send_message=AsyncMock(side_effect=[SimpleNamespace(message_id=101),SimpleNamespace(message_id=103)])
+    report={}
+    assert await import_next_page(client,sender,client.resolver,42,777,report=report)==(2,3,True)
+    assert report=={'terminal_gaps':1,'service_skipped':0}
+    assert history_position(store,42)==0
+    assert db.job(key)['status']=='UNKNOWN'
+    assert db.job(key)['last_error']=='transport timeout'
+    assert store.tg_for_max_message(42,'2') is None
+    assert sender._bot.send_message.await_count==2
+    db.close()
+
+@pytest.mark.asyncio
+async def test_old_terminal_gap_does_not_hide_new_failure(tmp_path):
+    event,ctx,client,sender,store,db=ui(tmp_path)
+    from app.max_client import MaxMessage
+    key=db.enqueue(MaxMessage(chat_id=42,message_id='1',timestamp=1700000001000,text='old'))
+    db._set_job(key,'FAILED','rejected')
+    client.fetch_history=source([raw(i,i*1000) for i in (1,2)])
+    sender._bot.send_message=AsyncMock(return_value=None)
+    with pytest.raises(RuntimeError,match='Позиция истории сохранена'):
+        await import_next_page(client,sender,client.resolver,42,777)
+    assert history_position(store,42) is None
+    assert db.job(key)['status']=='FAILED'
+    assert db.job(db.job_key(42,'2'))['status']=='UNKNOWN'
+    db.close()
+
+@pytest.mark.asyncio
+async def test_history_ui_reports_skipped_gap(tmp_path):
+    event,ctx,client,sender,store,db=ui(tmp_path)
+    from app.max_client import MaxMessage
+    key=db.enqueue(MaxMessage(chat_id=42,message_id='1',timestamp=1700000001000,text='old'))
+    db._set_job(key,'UNKNOWN')
+    client.fetch_history=source([raw(1,1000)])
+    q=button(event,'history:load:42')
+    await callback_history(event,ctx)
+    assert 'пропущено: 1' in q.message.reply_text.await_args.args[0]
+    sender._bot.send_message.assert_not_called()
+    db.close()
+
+@pytest.mark.asyncio
+async def test_history_rate_limit_recovers_using_same_historical_caption(tmp_path):
+    from telegram.error import RetryAfter
+    from app.outbox import OutboxStore
+    event,ctx,client,sender,store,db=ui(tmp_path)
+    client.fetch_history=source([raw(1,1000),raw(2,2000)])
+    sender._bot.send_message=AsyncMock(side_effect=RetryAfter(1))
+    with pytest.raises(RuntimeError,match='Позиция истории сохранена'):
+        await import_next_page(client,sender,client.resolver,42,777)
+    key=db.job_key(42,'1')
+    assert db.job(key)['status']=='RETRY'
+    first=sender._bot.send_message.await_args.kwargs['text']
+    assert first.startswith('🕘')
+    path=tmp_path/'outbox.sqlite3';db.close();db=OutboxStore(str(path));sender.outbox=db
+    db.db.execute('update jobs set next_attempt=0 where key=?',(key,))
+    sender._bot.send_message=AsyncMock(return_value=SimpleNamespace(message_id=1001))
+    for pending in db.recoverable():
+        await client._on_message_cb(pending)
+    assert db.job(key)['status']=='SENT'
+    assert sender._bot.send_message.await_args.kwargs['text']==first
+    assert store.tg_for_max_message(42,'1')==1001
+    sender._bot.send_message=AsyncMock(return_value=SimpleNamespace(message_id=1002))
+    assert await import_next_page(client,sender,client.resolver,42,777)==(1,2,True)
+    sender._bot.send_message.assert_awaited_once()
+    db.close()
+
+@pytest.mark.asyncio
+async def test_live_duplicate_cannot_change_history_retry_rendering(tmp_path):
+    from telegram.error import RetryAfter
+    from app.max_client import MaxMessage
+    event,ctx,client,sender,store,db=ui(tmp_path)
+    client.fetch_history=source([raw(1,1000)])
+    sender._bot.send_message=AsyncMock(side_effect=RetryAfter(1))
+    with pytest.raises(RuntimeError):
+        await import_next_page(client,sender,client.resolver,42,777)
+    first=sender._bot.send_message.await_args.kwargs['text'];key=db.job_key(42,'1')
+    db.db.execute('update jobs set next_attempt=0 where key=?',(key,))
+    sender._bot.send_message=AsyncMock(return_value=SimpleNamespace(message_id=1001))
+    await client._on_message_cb(MaxMessage(chat_id=42,message_id='1',text='changed'))
+    assert sender._bot.send_message.await_args.kwargs['text']==first
+    assert db.job(key)['status']=='SENT'
+    db.close()
+
+@pytest.mark.asyncio
+async def test_history_does_not_change_existing_live_retry_rendering(tmp_path):
+    from telegram.error import RetryAfter
+    from tests.test_outbox import event as live_event
+    event,ctx,client,sender,store,db=ui(tmp_path)
+    sender._bot.send_message=AsyncMock(side_effect=RetryAfter(1))
+    await client._on_message_cb(live_event('1'))
+    key=db.job_key(42,'1');db.db.execute('update jobs set next_attempt=0 where key=?',(key,))
+    client.fetch_history=source([raw(1,1000)])
+    sender._bot.send_message=AsyncMock(return_value=SimpleNamespace(message_id=1001))
+    with pytest.raises(RuntimeError):
+        await import_next_page(client,sender,client.resolver,42,777)
+    sender._bot.send_message.assert_not_called()
+    assert db.job(key)['status']=='RETRY'
+    await client._on_message_cb(db.recoverable()[0])
+    assert db.job(key)['status']=='SENT'
+    db.close()

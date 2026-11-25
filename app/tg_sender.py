@@ -4,13 +4,14 @@ import zipfile
 from types import SimpleNamespace
 import logging
 
-from telegram import Bot, InputFile, InputMediaPhoto
+from telegram import Bot, InputFile, InputMediaPhoto, InputMediaVideo
 from telegram.constants import ParseMode
 from telegram.error import RetryAfter, TimedOut
 from telegram.request import HTTPXRequest
 
 from app.topics import TopicStore
-from app.outbox import current_delivery
+from app.outbox import current_delivery, DeliveryInterrupted
+from app.photo_media import telegram_photo
 from app.chat_preferences import get_chat_prefs
 # Explicit re-exports preserve the legacy imports used by existing consumers.
 from app.telegram_html import (
@@ -240,6 +241,13 @@ class TelegramSender:
     async def send_photo(self, data: bytes, caption: str = "", filename: str = "photo.jpg",
                          message_thread_id: int | None = None,
                          reply_to_message_id: int | None = None):
+        scope=current_delivery()
+        cached=scope.cached_media(("send_photo",)) if scope else None
+        if cached is not None:
+            data=cached
+        else:
+            data=await telegram_photo(data)
+            if data is None:raise DeliveryInterrupted("FAILED","Photo format conversion failed before dispatch")
         parts = self._caption_parts(caption)
         result = await self._send_api("send_photo", dict(
             chat_id=self._chat_id, caption=parts[0] if parts else None,
@@ -285,7 +293,15 @@ class TelegramSender:
         parts=self._caption_parts(caption)
         scope=current_delivery()
         cached=scope.cached_media(("send_media_group",)) if scope else None
-        packed=cached if cached is not None else self._pack_album(photos)
+        if cached is not None:
+            packed=cached
+        else:
+            normalized=[]
+            for photo in photos:
+                data=await telegram_photo(photo)
+                if data is None:raise DeliveryInterrupted("FAILED","Album photo conversion failed before dispatch")
+                normalized.append(data)
+            packed=self._pack_album(normalized)
         saved_photos=self._unpack_album(packed)
         options=dict(chat_id=self._chat_id,message_thread_id=message_thread_id,
                      **self._reply_kwargs(reply_to_message_id),
@@ -294,7 +310,7 @@ class TelegramSender:
         async def call():
             media=[
                 InputMediaPhoto(
-                    media=InputFile(io.BytesIO(data),filename=f"photo-{i+1}.jpg"),
+                    media=InputFile(io.BytesIO(data),filename=f"photo-{i+1}.jpg",attach=True),
                     caption=parts[0] if i==0 and parts else None,
                     parse_mode=ParseMode.HTML if i==0 and parts else None,
                 )
@@ -326,6 +342,60 @@ class TelegramSender:
         if not await self._send_caption_remainder(
             parts,result,message_thread_id):
             return None
+        return result
+
+    @staticmethod
+    def _pack_mixed_album(items):
+        output=io.BytesIO()
+        with zipfile.ZipFile(output,'w',compression=zipfile.ZIP_STORED) as pack:
+            for i,(kind,data) in enumerate(items):
+                if kind not in ('PHOTO','VIDEO'):raise ValueError('Unsupported album item')
+                pack.writestr(zipfile.ZipInfo(f'{i:02d}.'+('jpg' if kind=='PHOTO' else 'mp4')),data)
+        return output.getvalue()
+
+    @staticmethod
+    def _unpack_mixed_album(data):
+        with zipfile.ZipFile(io.BytesIO(data),'r') as pack:
+            names=pack.namelist()
+            if not 2<=len(names)<=10 or any(name not in (f'{i:02d}.jpg',f'{i:02d}.mp4') for i,name in enumerate(names)):
+                raise ValueError('Invalid mixed album')
+            return [('PHOTO' if name.endswith('.jpg') else 'VIDEO',pack.read(name)) for name in names]
+
+    async def send_mixed_album(self,items,caption='',message_thread_id=None,reply_to_message_id=None):
+        from app.video_resolver import is_mp4
+        scope=current_delivery();cached=scope.cached_media(('send_media_group',)) if scope else None
+        if cached is None:
+            normalized=[]
+            for kind,data in items:
+                if kind=='PHOTO':data=await telegram_photo(data)
+                elif kind!='VIDEO' or not is_mp4(data):data=None
+                if not data:raise DeliveryInterrupted('FAILED','Mixed album format invalid before dispatch')
+                normalized.append((kind,data))
+            if sum(len(data) for _,data in normalized)>45*1024*1024:raise DeliveryInterrupted('FAILED','Mixed album exceeds safe size')
+            packed=self._pack_mixed_album(normalized)
+        else:packed=cached
+        saved=self._unpack_mixed_album(packed)
+        if not any(kind=='VIDEO' for kind,_ in saved):raise DeliveryInterrupted('UNKNOWN','Mixed album cache does not match')
+        parts=self._caption_parts(caption)
+        opts=dict(chat_id=self._chat_id,message_thread_id=message_thread_id,**self._reply_kwargs(reply_to_message_id),**self._notification_kwargs(message_thread_id))
+        async def call():
+            media=[]
+            for i,(kind,data) in enumerate(saved):
+                file=InputFile(io.BytesIO(data),filename=f'item-{i+1}.'+('jpg' if kind=='PHOTO' else 'mp4'),attach=True)
+                cls=InputMediaPhoto if kind=='PHOTO' else InputMediaVideo
+                kwargs={'supports_streaming':True} if kind=='VIDEO' else {}
+                media.append(cls(media=file,caption=parts[0] if i==0 and parts else None,parse_mode=ParseMode.HTML if i==0 and parts else None,**kwargs))
+            return await self._bot.send_media_group(media=media,read_timeout=90,write_timeout=120,**opts)
+        if scope:
+            result=await scope.send_part('send_media_group',{'kwargs':opts,'caption':parts[0] if parts else None,'count':len(saved),'kinds':[k for k,_ in saved]},call,media=packed)
+        else:
+            # No durable scope: never blindly repeat an ambiguous album RPC.
+            result=await call()
+            if not isinstance(result,(list,tuple)) or len(result)!=len(saved):return None
+            ids=[getattr(m,'message_id',None) for m in result]
+            if any(type(i) is not int or i<=0 for i in ids) or len(set(ids))!=len(saved):return None
+            result=SimpleNamespace(message_id=ids[0],media_group_ids=ids)
+        if not await self._send_caption_remainder(parts,result,message_thread_id):return None
         return result
 
     async def send_document(self, data: bytes, caption: str = "", filename: str = "file",

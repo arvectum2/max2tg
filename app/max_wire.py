@@ -31,6 +31,13 @@ def _wire_int64(value):
 
 def normalize_ids(value):
     if isinstance(value,dict):
+        # The JSON-backed outbound ledger stores the browser's binary AUDIO
+        # waveform as a byte list. Convert only this field at the wire edge.
+        if value.get('_type') == 'AUDIO' and isinstance(value.get('wave'),list):
+            wave=value['wave']
+            if len(wave)>8192 or any(type(x) is not int or not 0<=x<=255 for x in wave):
+                raise ValueError('Invalid AUDIO waveform')
+            value=dict(value,wave=bytes(wave))
         return {key: _wire_int64(item) if key in _INT64_FIELDS and item is not None
                 else [_wire_int64(x) for x in item] if key in _INT64_ARRAYS and isinstance(item,(list,tuple))
                 else normalize_ids(item) for key,item in value.items()}

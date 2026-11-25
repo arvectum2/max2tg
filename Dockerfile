@@ -23,6 +23,10 @@ ENV PATH=/opt/venv/bin:$PATH \
     PYTHONUNBUFFERED=1 \
     MALLOC_ARENA_MAX=2
 
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 COPY --from=builder /opt/venv /opt/venv
 COPY requirements.lock ./

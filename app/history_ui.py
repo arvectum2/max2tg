@@ -299,9 +299,10 @@ async def callback_history(update,context):
     if sender is None or resolver is None:
         await query.message.reply_text("⚠️ Мост ещё не готов к импорту.")
         return
+    report={}
     try:
         imported,scanned,done=await import_next_page(
-            client,sender,resolver,chat_id,thread_id)
+            client,sender,resolver,chat_id,thread_id,report=report)
     except RuntimeError as exc:
         await query.message.reply_text(
             "⚠️ "+str(exc)+" Повтори загрузку; подтверждённые ID "
@@ -314,6 +315,9 @@ async def callback_history(update,context):
         return
     await query.message.reply_text(
         f"📜 Проверено {scanned} сообщений, добавлено {imported}. "
+        + (f"Неопределённых или отклонённых пропущено: {report['terminal_gaps']}; "
+           "они сохранены в /issues без повторной отправки. " if report.get('terminal_gaps') else "")
+        + (f"Служебных событий пропущено: {report['service_skipped']}. " if report.get('service_skipped') else "")
         + ("Достигнуто начало истории." if done
            else "Можно загрузить следующую порцию."),
         reply_markup=_history_markup(chat_id,done))

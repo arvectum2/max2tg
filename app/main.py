@@ -5,6 +5,7 @@ import logging
 import os
 import signal
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from logging.handlers import RotatingFileHandler
 
@@ -183,14 +184,22 @@ async def main():
                 )
 
     async def tg_outbound_recovery():
+        next_regular=time.monotonic()+20
         while True:
-            await asyncio.sleep(20)
+            online=getattr(client,"_authorized",False)
+            delay=max(0,next_regular-time.monotonic())
+            if online and tg_outbound.has_pending_albums():delay=min(delay,1.0)
+            try:await asyncio.wait_for(tg_outbound.album_wakeup.wait(),timeout=delay)
+            except asyncio.TimeoutError:pass
+            tg_outbound.album_wakeup.clear()
             try:
-                if tg_app is not None:
-                    tg_app.update_queue.replay(tg_app.bot)
-                if not getattr(client,"_authorized",False):
-                    continue
-                await tg_outbound.drain(
+                regular=time.monotonic()>=next_regular
+                if regular:
+                    next_regular=time.monotonic()+20
+                    if tg_app is not None:tg_app.update_queue.replay(tg_app.bot)
+                if not getattr(client,"_authorized",False):continue
+                drain=tg_outbound.drain if regular else tg_outbound.drain_albums
+                await drain(
                     client,is_allowed=lambda cid:
                     get_chat_prefs(topic_store,cid).sync
                     and topic_store.get_topic(cid) is not None,

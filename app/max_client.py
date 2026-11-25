@@ -4,12 +4,13 @@ import logging
 import os
 import random
 import time
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import urljoin, urlsplit, quote
 from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Any
 
 import aiohttp
+from yarl import URL
 
 from app.max_media import media_filename
 from app.max_wire import encode, decode, profile_contact
@@ -88,9 +89,13 @@ class OpCode(IntEnum):
     DELETION_PUSH = 142
     REACTION_PUSH = 156
     REACTION_PUSH_ALTERNATE = 155
+    VIDEO_PLAY = 83           # verified web.max.ru request schema 2026-11-24
     PHOTO_UPLOAD_URL = 80     # get URL for photo upload
-    AUDIO_UPLOAD_URL = 86     # get URL for voice/audio upload (experimental)
+    VIDEO_UPLOAD_URL = 82    # verified native video/audio upload
+    AUDIO_UPLOAD_URL = 86     # legacy constant; not used for audio uploads
     FILE_UPLOAD_URL = 87      # get URL for file upload
+    FILE_DOWNLOAD_URL = 88    # verified web.max.ru request schema
+    AUDIO_PLAY = 301          # verified web.max.ru request schema
     DISPATCH = 128
     UPLOAD_READY = 136        # server says an uploaded file/video is processed
 
@@ -136,6 +141,8 @@ class MaxClient:
         self._dispatch_counter = 0
         self._pending: dict[int, asyncio.Future] = {}
         self._file_pending: dict[int, asyncio.Future] = {}
+        self._video_pending: dict[int, asyncio.Future] = {}
+        self._audio_pending: dict[int, asyncio.Future] = {}
         self._on_disconnect_cb = None
         if chat_ids:
             self.chat_ids += map(int, map(str.strip, chat_ids.split(',')))
@@ -266,7 +273,9 @@ class MaxClient:
                                 "clientSessionId": int(time.time() * 1000),
                                 "userAgent": {
                                     "deviceType": "WEB",
-                                    "deviceName": "Chrome 131.0.0.0",
+                                    "deviceName": "Google Chrome 131.0.0.0",
+                                    "headerUserAgent": _USER_AGENT,
+                                    "osVersion": "Windows",
                                     "appVersion": self.APP_VERSION,
                                     "locale": "ru", "deviceLocale": "ru",
                                     "pushDeviceType": "WEBPUSH",
@@ -308,6 +317,12 @@ class MaxClient:
                         if not fut.done():
                             fut.set_result(None)
                     self._file_pending.clear()
+                    for fut in self._video_pending.values():
+                        if not fut.done():fut.set_result(None)
+                    self._video_pending.clear()
+                    for fut in self._audio_pending.values():
+                        if not fut.done():fut.set_result(None)
+                    self._audio_pending.clear()
 
                 if self._on_disconnect_cb:
                     try:
@@ -430,12 +445,14 @@ class MaxClient:
 
             elif op == OpCode.UPLOAD_READY:
                 # Server confirms an uploaded file/video finished server-side processing.
-                file_id = payload.get("fileId")
-                if file_id is not None:
-                    fut = self._file_pending.pop(int(file_id), None)
-                    if fut and not fut.done():
-                        fut.set_result(payload)
-                log.debug("UPLOAD_READY op=136: %s", payload)
+                for field, pending in (("fileId",self._file_pending),("videoId",self._video_pending),("audioId",self._audio_pending)):
+                    ident=payload.get(field)
+                    if ident is not None:
+                        try:fut=pending.pop(int(ident),None)
+                        except (ValueError,TypeError):continue
+                        if fut is not None and not fut.done():
+                            fut.set_result(None if payload.get("error") else payload)
+                log.debug("UPLOAD_READY op=136 fields=%s",list(payload))
 
             elif op in (OpCode.HEARTBEAT_PING,):
                 log.debug("Heartbeat op=%s", op)
@@ -723,57 +740,37 @@ class MaxClient:
                  link[:60], str(resp)[:300] if resp else resp)
         return resp
 
+    async def download_document_url(self, file_id, chat_id, message_id) -> str | None:
+        """Resolve an ordinary file; do not bypass MAX's unsafe-file flag."""
+        if file_id is None or chat_id is None or not message_id:
+            return None
+        from app.max_wire import normalize_ids
+        try:
+            payload=normalize_ids(dict(fileId=file_id,chatId=chat_id,messageId=message_id,itemType="REGULAR"))
+        except (TypeError,ValueError):
+            return None
+        result=await self.cmd(OpCode.FILE_DOWNLOAD_URL,payload,none_on_timeout=True)
+        if not isinstance(result,dict) or result.get('_max_error') or result.get('unsafe') is not False:
+            return None
+        url=result.get('url')
+        return url if self._safe_media_url(url) else None
+
     async def download_audio_url(self, audio_id, chat_id, message_id,
                                   token: str | None = None) -> str | None:
-        """Resolve an audio attach reference into a downloadable URL.
-
-        Empirically: opcodes 84/85/89 in this range are routed to the calls
-        service or other unrelated subsystems and a single proto.payload
-        validation failure tears down the whole WebSocket. So instead of
-        blind opcode probing, try the same HTTP URL pattern that MAX uses
-        for incoming photos — both are tokenised through the same CDN
-        (i.oneme.ru) and the audio `token` happens to look like the `r`
-        parameter used in photo baseUrls.
-        """
-        if not token:
-            log.warning("download_audio_url: no token in attach")
+        """Use the web client's AUDIO_PLAY RPC, not guessed CDN paths."""
+        if audio_id is None or chat_id is None or not message_id:
             return None
-
-        # Candidate URL templates, ordered by likelihood.
-        candidates = [
-            f"https://i.oneme.ru/i?r={token}",
-            f"https://i.oneme.ru/a?r={token}",
-            f"https://i.oneme.ru/audio?r={token}",
-            f"https://i.oneme.ru/?audioId={audio_id}&token={token}",
-        ]
-        log.info("download_audio_url: trying %d HTTP candidates", len(candidates))
-        for url in candidates:
-            ok = await self._probe_audio_url(url)
-            if ok:
-                log.info("download_audio_url: found audio at %s", url[:80])
-                return url
-
-        # Last cheap try: maybe the audio is stored in the same backend as
-        # regular files, so opcode 88 (file_download) with audioId-as-fileId
-        # could resolve. This opcode is well-known and won't tear down WS.
+        from app.max_wire import normalize_ids
         try:
-            audio_id_int = int(audio_id)
-        except (TypeError, ValueError):
-            audio_id_int = None
-        if audio_id_int is not None and chat_id is not None and message_id:
-            resp = await self.cmd(88, {
-                "fileId": audio_id_int,
-                "chatId": chat_id,
-                "messageId": str(message_id),
-            })
-            log.info("download_audio_url op=88(file-as-audio) → %s",
-                     str(resp)[:400] if resp else resp)
-            if resp and "_max_error" not in resp:
-                url = resp.get("url")
-                if isinstance(url, str) and url.startswith("http"):
-                    return url
-
-        log.warning("download_audio_url: nothing resolved an audio URL")
+            payload=normalize_ids(dict(audioId=audio_id,chatId=chat_id,messageId=message_id,token=token or ''))
+        except (TypeError,ValueError):
+            return None
+        result=await self.cmd(OpCode.AUDIO_PLAY,payload,none_on_timeout=True)
+        if not isinstance(result,dict) or result.get('_max_error'):
+            return None
+        for key in ('opus','m4a','mp3'):
+            url=result.get(key)
+            if self._safe_media_url(url):return url
         return None
 
     async def _probe_audio_url(self, url: str) -> bool:
@@ -804,22 +801,100 @@ class MaxClient:
             if close_after:
                 await session.close()
 
-    async def upload_audio(self, data: bytes, chat_id=None,
-                            filename: str = "voice.ogg",
-                            mimetype: str = "audio/ogg",
-                            timeout: float = 60.0) -> dict | None:
-        """Upload a voice / audio message.
+    async def _native_upload_slot(self, *, voice=False, uploader_type=1):
+        payload={"count":1}
+        if voice:payload.update(type=2,uploaderType=uploader_type)
+        result=await self.cmd(OpCode.VIDEO_UPLOAD_URL,payload,none_on_timeout=True)
+        if not isinstance(result,dict) or result.get('_max_error'):return None
+        if voice and result.get('uploaderType',uploader_type)!=uploader_type:return None
+        info=result.get('info')
+        if not isinstance(info,list) or len(info)!=1 or not isinstance(info[0],dict):return None
+        item=info[0];url=item.get('url');token=item.get('token')
+        try:ident=int(item.get('videoId'))
+        except (TypeError,ValueError):return None
+        if not 0<ident<2**63 or not isinstance(token,str) or not token or not self._safe_media_url(url):return None
+        return ident,token,url
 
-        Known limitation: MAX stores audio in a different namespace from
-        regular files; ``fileId`` from the file-upload path is rejected by
-        the audio service ("EJB service unavailable"). Until we figure out
-        the dedicated audio-upload endpoint, voice arrives in MAX as an
-        ``.ogg`` file rather than a voice bubble.
-        """
-        return await self.upload_file(
-            data, chat_id=chat_id, filename=filename, mimetype=mimetype,
-            attach_type="FILE", timeout=timeout,
-        )
+    async def _upload_native_bytes(self,url,data,filename,mimetype):
+        """One bounded raw POST, no redirects or ambiguous retries."""
+        if not self._safe_media_url(url) or not 0<len(data)<=25*1024*1024:return False
+        session=self._session;close_after=session is None or session.closed
+        if close_after:session=aiohttp.ClientSession(headers=_BROWSER_HEADERS)
+        headers={**_HTTP_HEADERS,'Content-Type':mimetype,
+                 'Content-Disposition':'attachment; filename='+quote(media_filename({'name':filename}),safe=''),
+                 'Content-Range':f'bytes 0-{len(data)-1}/{len(data)}'}
+        try:
+            async with session.post(URL(url,encoded=True),data=data,headers=headers,allow_redirects=False,timeout=aiohttp.ClientTimeout(total=120)) as resp:
+                if resp.status not in (200,201):
+                    log.warning('Native upload rejected: HTTP %d',resp.status);return False
+                last=resp.headers.get('X-Last-Known-Byte')
+                if last is None and resp.headers.get('Range'):
+                    import re
+                    match=re.fullmatch(r'(?:bytes[= ])?0-(\d+)(?:/\d+)?',resp.headers['Range'])
+                    if match is None:return False
+                    last=match[1]
+                if (last is None and resp.status==201) or (last is not None and int(last)+1!=len(data)):return False
+                body=bytearray()
+                async for chunk in resp.content.iter_chunked(8192):
+                    body.extend(chunk)
+                    if len(body)>65536:return False
+                if body.strip():
+                    try:result=json.loads(body)
+                    except (ValueError,UnicodeError):
+                        # Observed MAX video uploader returns HTTP 200 with a
+                        # non-JSON body and a full-byte receipt. Require both;
+                        # upload_video still requires matching processing ACK.
+                        return mimetype in ('video/mp4','audio/mp4') and resp.status == 200 and last is not None and int(last)+1 == len(data)
+                    if not isinstance(result,dict) or 'error_code' in result or result.get('error'):return False
+                return True
+        except Exception as exc:
+            log.warning('Native upload stopped: %s',type(exc).__name__);return False
+        finally:
+            if close_after:await session.close()
+
+    async def upload_audio(self, data: bytes, chat_id=None,
+                           filename: str = "voice.ogg", mimetype: str = "audio/ogg",
+                           timeout: float = 60.0) -> dict | None:
+        # The live test confirmed the server-processing route, not direct OGG.
+        return await self.upload_processed_audio(data,timeout=timeout,uploader_type=0)
+
+    async def upload_processed_audio(self,data:bytes,timeout=25.,uploader_type=0):
+        from app.native_media import prepare_processed_voice
+        prepared=await prepare_processed_voice(data)
+        if prepared is None:return None
+        audio,duration=prepared
+        slot=await self._native_upload_slot(voice=True,uploader_type=uploader_type)
+        if slot is None:return None
+        ident,token,url=slot
+        if ident in self._audio_pending:return None
+        future=asyncio.get_running_loop().create_future();self._audio_pending[ident]=future
+        try:
+            if not await self._upload_native_bytes(url,audio,'voice.m4a','audio/mp4'):return None
+            ack=await asyncio.wait_for(future,timeout)
+            if not isinstance(ack,dict) or ack.get('error') or str(ack.get('audioId'))!=str(ident):return None
+            return {'_type':'AUDIO','audioId':ident,'token':token,'duration':duration,'wave':[]}
+        except asyncio.TimeoutError:return None
+        finally:
+            if self._audio_pending.get(ident) is future:self._audio_pending.pop(ident,None)
+            if not future.done():future.cancel()
+
+    async def upload_video(self,data:bytes,chat_id=None,filename='video.mp4',mimetype='video/mp4',timeout=120.0):
+        from app.native_media import validate_video
+        if not await validate_video(data):return None
+        slot=await self._native_upload_slot()
+        if slot is None:return None
+        ident,token,url=slot
+        if ident in self._video_pending:return None
+        future=asyncio.get_running_loop().create_future();self._video_pending[ident]=future
+        try:
+            if not await self._upload_native_bytes(url,data,filename,'video/mp4'):return None
+            ack=await asyncio.wait_for(future,timeout)
+            if not isinstance(ack,dict) or ack.get('error') or str(ack.get('videoId'))!=str(ident):return None
+            return {'_type':'VIDEO','videoId':ident,'token':token}
+        except asyncio.TimeoutError:return None
+        finally:
+            if self._video_pending.get(ident) is future:self._video_pending.pop(ident,None)
+            if not future.done():future.cancel()
 
     async def upload_file(self, data: bytes, chat_id=None,
                            filename: str = "file.bin",
@@ -942,8 +1017,11 @@ class MaxClient:
         except (ValueError, TypeError):
             return False
 
-    async def download_file(self, url: str) -> bytes | None:
-        """Safely download at most 50 MB from a trusted MAX media host."""
+    async def download_file(self, url: str, *, preserve_url: bool = False, max_bytes: int | None = None) -> bytes | None:
+        """Bounded download; only the video compressor may request a larger source."""
+        if max_bytes is None:max_bytes=MAX_MEDIA_BYTES
+        if type(max_bytes) is not int or not 0 < max_bytes <= 150*1024*1024:
+            raise ValueError("Invalid media download cap")
         if not self._safe_media_url(url):
             log.warning("Refusing untrusted MAX media URL")
             return None
@@ -957,8 +1035,14 @@ class MaxClient:
                 if not self._safe_media_url(url):
                     log.warning("Blocked redirect to untrusted MAX media URL")
                     return None
+                # The CDN signature may cover the exact percent-encoded path
+                # and query. aiohttp/yarl normally requotes these components.
+                request_url = URL(url, encoded=True) if preserve_url else url
+                if preserve_url:
+                    log.info("MAX signed media request host=%s default_requotes=%s",
+                             urlsplit(url).hostname, str(URL(url)) != url)
                 async with session.get(
-                    url, headers=_HTTP_HEADERS,
+                    request_url, headers=_HTTP_HEADERS,
                     timeout=aiohttp.ClientTimeout(total=120),
                     allow_redirects=False,
                 ) as resp:
@@ -969,14 +1053,15 @@ class MaxClient:
                         url = urljoin(url, target)
                         continue
                     if resp.status != 200:
-                        log.warning("MAX media download failed: HTTP %d", resp.status)
+                        log.warning("MAX media download failed: HTTP %d host=%s exact_url=%s",
+                                    resp.status,urlsplit(url).hostname,preserve_url)
                         return None
-                    if resp.content_length and resp.content_length > MAX_MEDIA_BYTES:
-                        log.warning("MAX media exceeds %d bytes", MAX_MEDIA_BYTES)
+                    if resp.content_length and resp.content_length > max_bytes:
+                        log.warning("MAX media exceeds %d bytes", max_bytes)
                         return None
                     result = bytearray()
                     async for chunk in resp.content.iter_chunked(64 * 1024):
-                        if len(result) + len(chunk) > MAX_MEDIA_BYTES:
+                        if len(result) + len(chunk) > max_bytes:
                             log.warning("MAX media exceeded size limit while downloading")
                             return None
                         result.extend(chunk)
@@ -984,8 +1069,9 @@ class MaxClient:
                              urlsplit(url).hostname, len(result))
                     return bytes(result)
             log.warning("MAX media has too many redirects")
-        except Exception:
-            log.exception("MAX media download failed")
+        except Exception as exc:
+            # Never log a signed CDN URL, even through exception formatting.
+            log.warning("MAX media download failed: %s",type(exc).__name__)
         finally:
             if close_after:
                 await session.close()
