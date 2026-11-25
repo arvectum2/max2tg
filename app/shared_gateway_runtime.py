@@ -1,11 +1,13 @@
 """Injected-transport gateway lifecycle; no production entrypoint."""
 from __future__ import annotations
 import asyncio,fcntl,os,time,stat
+from pathlib import Path
 from app.telegram_inbox import TelegramInbox
 from app.telegram_control_plane import TelegramControlPlane
 from app.telegram_egress import TelegramEgress
 from app.telegram_egress_ipc import GatewayEgressIpcServer
 from app.telegram_gateway import TelegramGatewayEngine
+from app.telegram_ipc import CapsuleIpcClient
 from app.shared_topic_provision import SharedTopicProvisioner
 from app.capsule_shared_ingress import is_plain_text_update
 
@@ -35,16 +37,37 @@ async def remove_dead_socket(path):
     writer.close();await writer.wait_closed();raise RuntimeError('IPC listener already active')
 
 class SharedGatewayRuntime:
-    def __init__(self,registry,bot):
+    def __init__(self,registry,bot,*,channels=None):
         self.registry=registry;self.bot=bot;self.lock=RuntimeLock(registry.root/'shared-gateway.lock')
-        self.inbox=None;self.egress=None;self.server=None;self.started=False;self._poll_lock=asyncio.Lock();self._drain_lock=asyncio.Lock()
+        self.inbox=None;self.egress=None;self.server=None;self.servers=[];self.started=False;self._poll_lock=asyncio.Lock();self._drain_lock=asyncio.Lock()
         try:
             self.plane=TelegramControlPlane(registry)
             self.provisioner=SharedTopicProvisioner(self.plane)
             self.inbox=TelegramInbox(registry.root/'inbox.sqlite3',self.plane)
             self.egress=TelegramEgress(registry.root/'telegram-egress.sqlite3',self.plane,topic_scoped=True)
-            self.engine=TelegramGatewayEngine(self.plane,self.inbox,egress=self.egress,topic_scoped=True)
-            self.server=GatewayEgressIpcServer(registry,self.egress,topic_scoped=True)
+            self.channels=None
+            if channels is not None:
+                self.channels={}
+                for sid,folder in channels.items():
+                    if registry.get(sid)['telegram_mode']!='shared':raise ValueError('Shared channel required')
+                    p=Path(folder).absolute()
+                    if p.is_symlink() or not p.is_dir() or p.stat().st_uid!=os.getuid() or p.stat().st_mode&0o077:raise PermissionError('Unsafe channel directory')
+                    p=p.resolve();root=registry.root.resolve()
+                    if p==root or p.is_relative_to(root) or root.is_relative_to(p):raise ValueError('Channel must not expose registry')
+                    if any(p==q or p.is_relative_to(q) or q.is_relative_to(p) for q in self.channels.values()):raise ValueError('Overlapping tenant channels')
+                    self.channels[sid]=p
+                def socket_for(sid):
+                    if sid not in self.channels:
+                        from app.telegram_inbox import WorkerUnavailable
+                        raise WorkerUnavailable()
+                    return self.channels[sid]/'ingress.sock'
+                delivery=CapsuleIpcClient(registry,socket_for=socket_for).deliver
+                self.servers=[GatewayEgressIpcServer(registry,self.egress,topic_scoped=True,channel_path=p/'egress.sock',bound_sid=sid) for sid,p in self.channels.items()]
+            else:
+                delivery=None
+                self.server=GatewayEgressIpcServer(registry,self.egress,topic_scoped=True)
+                self.servers=[self.server]
+            self.engine=TelegramGatewayEngine(self.plane,self.inbox,deliver=delivery,egress=self.egress,topic_scoped=True)
             self.inbox.db.execute('CREATE TABLE IF NOT EXISTS polling_checkpoint (singleton INTEGER PRIMARY KEY CHECK(singleton=1),bot_id INTEGER NOT NULL,next_offset INTEGER NOT NULL)')
         except BaseException:
             if self.inbox:self.inbox.close()
@@ -58,7 +81,9 @@ class SharedGatewayRuntime:
         row=self.inbox.db.execute('SELECT bot_id FROM polling_checkpoint WHERE singleton=1').fetchone()
         if row and row[0]!=bid:raise PermissionError('Different bot cannot reuse polling checkpoint')
         self.inbox.db.execute('INSERT OR IGNORE INTO polling_checkpoint VALUES(1,?,0)',(bid,))
-        await remove_dead_socket(self.server.path);await self.server.start();self.started=True
+        for server in self.servers:
+            await remove_dead_socket(server.path);await server.start()
+        self.started=True
 
     def _offset(self):return self.inbox.db.execute('SELECT next_offset FROM polling_checkpoint WHERE singleton=1').fetchone()[0]
 
@@ -120,7 +145,7 @@ class SharedGatewayRuntime:
 
     async def close(self):
         async with self._poll_lock,self._drain_lock:
-            if self.server:await self.server.stop()
+            for server in self.servers:await server.stop()
             self.started=False
             if self.inbox:self.inbox.close();self.inbox=None
             if self.egress:self.egress.close();self.egress=None

@@ -65,13 +65,15 @@ def _read_private_key(path: Path) -> bytes:
 class GatewayEgressIpcServer:
     """Gateway-only listener which authenticates each tenant request."""
 
-    def __init__(self, registry: CapsuleRegistry, egress: TelegramEgress, *, topic_scoped=False):
+    def __init__(self, registry: CapsuleRegistry, egress: TelegramEgress, *, topic_scoped=False,channel_path=None,bound_sid=None):
         if egress.plane.capsules is not registry:
             raise ValueError("Gateway IPC must share the exact control plane")
         self.registry = registry
         self.egress = egress
         self.topic_scoped=topic_scoped
-        self.path = egress_ipc_path(registry.root)
+        if (channel_path is None)!=(bound_sid is None):raise ValueError("Incomplete channel")
+        self.bound_sid=registry._check_id(bound_sid) if bound_sid is not None else None
+        self.path=Path(channel_path) if channel_path is not None else egress_ipc_path(registry.root)
         self._server = None
         self._connections=set()
 
@@ -90,6 +92,7 @@ class GatewayEgressIpcServer:
                 raise ValueError("Invalid IPC payload")
             sid = raw.get("session_id")
             self.registry._check_id(sid)
+            if self.bound_sid is not None and sid!=self.bound_sid:raise PermissionError("Foreign channel identity")
             self.registry.get(sid)
             keypath = ensure_ipc_key(self.registry, sid)
             key = _read_private_key(keypath)
@@ -102,8 +105,18 @@ class GatewayEgressIpcServer:
                 or not _NONCE.fullmatch(body["nonce"])
             ):
                 raise ValueError("Invalid signed egress request")
-            if self.topic_scoped and body.get('max_chat_id') is None:raise PermissionError('Scoped gateway requires MAX chat')
-            if body["action"] == "enqueue":
+            if body['action']=='routes':
+                if self.bound_sid is None or body['text'] is not None or 'max_chat_id' in body:raise PermissionError('Invalid route query')
+                plane=self.egress.plane;forum=self.egress._route(sid)
+                if forum is None:result={'status':'ROUTES','forum':None,'actor':None,'routes':[]}
+                else:
+                    owner=plane.db.execute('SELECT o.tg_user_id FROM tg_routes r JOIN tg_owners o ON o.user_id=r.user_id WHERE r.session_id=? AND r.tg_chat_id=?',(sid,forum)).fetchone()
+                    if owner is None:raise PermissionError('Missing route owner')
+                    rows=plane.db.execute('SELECT max_chat_id,thread_id FROM tg_topic_routes WHERE session_id=? AND active=1 ORDER BY max_chat_id LIMIT 1001',(sid,)).fetchall()
+                    if len(rows)>1000:raise ValueError('Too many topic routes')
+                    result={'status':'ROUTES','forum':int(forum),'actor':int(owner[0]),'routes':[[r[0],r[1]] for r in rows if plane.topic_route(sid,r[0])==(forum,r[1])]}
+            elif self.topic_scoped and body.get('max_chat_id') is None:raise PermissionError('Scoped gateway requires MAX chat')
+            elif body["action"] == "enqueue":
                 state = self.egress.enqueue(
                     sid, body["source_key"], body["text"], max_chat_id=body.get("max_chat_id")
                 )
@@ -201,6 +214,9 @@ class GatewayEgressIpcClient:
                 raise ValueError("Unauthenticated egress acknowledgement")
             result = response["result"]
             status = result.get("status")
+            if action=='routes':
+                if status!='ROUTES' or set(result)!={'status','forum','actor','routes'} or not isinstance(result['routes'],list) or len(result['routes'])>1000:raise ValueError('Invalid route snapshot')
+                return result
             if status not in _RESPONSES | {"MISSING"}:
                 raise ValueError("Unexpected gateway outcome")
             if status == "SENT":
@@ -222,3 +238,6 @@ class GatewayEgressIpcClient:
 
     async def status(self, source_key: str, *, max_chat_id=None) -> dict:
         return await self._call("status", source_key, None,max_chat_id=max_chat_id)
+
+    async def routes(self):
+        return await self._call("routes","routes",None)
