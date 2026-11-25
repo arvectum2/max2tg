@@ -1,7 +1,8 @@
 """Injected-transport gateway lifecycle; no production entrypoint."""
 from __future__ import annotations
-import asyncio,fcntl,os,time,stat
+import asyncio,os,time,stat
 from pathlib import Path
+from app.runtime_lock import RuntimeLock
 from app.telegram_inbox import TelegramInbox
 from app.telegram_control_plane import TelegramControlPlane
 from app.telegram_egress import TelegramEgress
@@ -10,18 +11,6 @@ from app.telegram_gateway import TelegramGatewayEngine
 from app.telegram_ipc import CapsuleIpcClient
 from app.shared_topic_provision import SharedTopicProvisioner
 from app.capsule_shared_ingress import is_plain_text_update
-
-class RuntimeLock:
-    def __init__(self,path):
-        self.fd=os.open(path,os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW,0o600)
-        try:
-            info=os.fstat(self.fd)
-            if not stat.S_ISREG(info.st_mode) or info.st_uid!=os.getuid() or info.st_mode&0o077:raise PermissionError('Unsafe runtime lock')
-            fcntl.flock(self.fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
-        except BaseException:
-            os.close(self.fd);self.fd=None;raise
-    def close(self):
-        if self.fd is not None:os.close(self.fd);self.fd=None
 
 async def remove_dead_socket(path):
     """Caller holds exclusive runtime lock. Never unlink a live listener."""
