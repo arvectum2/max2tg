@@ -11,6 +11,16 @@ from app.tg_outbox import TelegramOutbound
 from app.topics import TopicStore
 
 
+def is_plain_text_update(update):
+    if not isinstance(update,dict) or any(k in update for k in ('edited_message','callback_query','message_reaction')):return False
+    m=update.get('message')
+    if not isinstance(m,dict):return False
+    if any(m.get(k) for k in ('photo','video','voice','document','audio','animation','sticker','caption','entities','reply_to_message','forward_origin','media_group_id','sender_chat')):return False
+    actor=m.get('from')
+    if not isinstance(actor,dict) or actor.get('is_bot'):return False
+    text=m.get('text');return isinstance(text,str) and bool(text) and len(text)<=50000 and not text.startswith('/') and text!='☰ Меню'
+
+
 class SharedCapsuleTextIngress:
     def __init__(self, client, topics: TopicStore, ledger: TelegramOutbound, *, trusted_topic=None):
         self.client = client
@@ -19,6 +29,7 @@ class SharedCapsuleTextIngress:
         self.trusted_topic = trusted_topic
 
     async def __call__(self, update: dict) -> bool:
+        if not is_plain_text_update(update):return False
         message = update.get("message")
         if not isinstance(message, dict) or (
             "edited_message" in update or "callback_query" in update

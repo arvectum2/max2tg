@@ -136,10 +136,12 @@ class CapsuleIpcServer:
         self.path=ipc_socket_path(registry,sid)
         self.key=ensure_ipc_key(registry,sid).read_bytes()
         self._server=None
+        self._connections=set()
 
     async def _receive(self,reader,writer):
+        task=asyncio.current_task();self._connections.add(task)
         try:
-            request=_verify(await _read_frame(reader),self.key)
+            request=_verify(await asyncio.wait_for(_read_frame(reader),6),self.key)
             if request.get("session_id")!=self.sid:
                 raise PermissionError("Other capsule ID")
             update=request.get("update")
@@ -182,6 +184,7 @@ class CapsuleIpcServer:
                 await writer.wait_closed()
             except OSError:
                 pass
+            finally:self._connections.discard(task)
 
     async def start(self):
         if self.path.exists() or self.path.is_symlink():
@@ -193,6 +196,9 @@ class CapsuleIpcServer:
     async def stop(self):
         if self._server:
             self._server.close()
+            tasks=list(self._connections)
+            for task in tasks:task.cancel()
+            if tasks:await asyncio.gather(*tasks,return_exceptions=True)
             await self._server.wait_closed()
             self._server=None
             if self.path.is_socket():
