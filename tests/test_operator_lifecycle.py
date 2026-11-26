@@ -129,3 +129,40 @@ def test_interrupted_recovery_is_not_replayed(tmp_path):
         with pytest.raises(PermissionError):s.recover_once()
         assert s.status()['state']=='BLOCKED' and d.events==before
     finally:s.close()
+
+
+def test_checkpoint_terminal_handoff_persisted(tmp_path):
+    root,p,d=fixture(tmp_path);s=SyntheticLifecycle(root,p,d,lambda *_:True);calls=[]
+    def capture():calls.append(1);return {'verified':True}
+    try:
+        s.register();s.start()
+        with pytest.raises(PermissionError):s.checkpoint(capture)
+        assert not calls;s.stop();assert s.checkpoint(capture)=={'verified':True}
+        assert s.status()['state']=='ARCHIVED'
+    finally:s.close()
+    s=SyntheticLifecycle(root,p,d,lambda *_:True)
+    try:
+        before=d.events[:]
+        for act in (s.start,s.stop,s.recover_once,lambda:s.checkpoint(capture)):
+            with pytest.raises(PermissionError):act()
+        assert calls==[1] and d.events==before
+    finally:s.close()
+
+
+@pytest.mark.parametrize('interrupted',[False,True])
+def test_failed_or_interrupted_checkpoint_refuses_restart(tmp_path,interrupted):
+    root,p,d=fixture(tmp_path);s=SyntheticLifecycle(root,p,d,lambda *_:True)
+    try:
+        s.register();s.start();s.stop()
+        if interrupted:
+            m=s._load();m['phase']='BACKING_UP';s._save(m)
+        else:
+            with pytest.raises(RuntimeError):s.checkpoint(lambda:{'verified':False})
+    finally:s.close()
+    s=SyntheticLifecycle(root,p,d,lambda *_:True)
+    try:
+        assert s.status()['state']=='BLOCKED';before=d.events[:]
+        for act in (s.start,s.stop,s.recover_once):
+            with pytest.raises(PermissionError):act()
+        assert d.events==before
+    finally:s.close()

@@ -7,7 +7,8 @@ from app.deployment_plan import build_plan,_verify_stopped,validate_bind_sources
 from app.container_supervisor import DockerBackend
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--image',required=True);p.add_argument('--native-volumes',action='store_true');p.add_argument('--load',type=int,choices=range(1,26));p.add_argument('--tenants',type=int,choices=(2,4,8,16,32,64),default=2);p.add_argument('--profile',action='store_true');p.add_argument('--long-poll',action='store_true');p.add_argument('--mixed',action='store_true');p.add_argument('--soak',action='store_true');p.add_argument('--storage-check',action='store_true');p.add_argument('--wal-maintenance',action='store_true');p.add_argument('--delay150',action='store_true');p.add_argument('--balanced',action='store_true');p.add_argument('--balanced-fault',action='store_true');p.add_argument('--reconcile-revoked',action='store_true');p.add_argument('--operator-lifecycle',action='store_true');p.add_argument('--operator-recovery',action='store_true');a=p.parse_args();
+    p=argparse.ArgumentParser();p.add_argument('--image',required=True);p.add_argument('--native-volumes',action='store_true');p.add_argument('--load',type=int,choices=range(1,26));p.add_argument('--tenants',type=int,choices=(2,4,8,16,32,64),default=2);p.add_argument('--profile',action='store_true');p.add_argument('--long-poll',action='store_true');p.add_argument('--mixed',action='store_true');p.add_argument('--soak',action='store_true');p.add_argument('--storage-check',action='store_true');p.add_argument('--wal-maintenance',action='store_true');p.add_argument('--delay150',action='store_true');p.add_argument('--balanced',action='store_true');p.add_argument('--balanced-fault',action='store_true');p.add_argument('--reconcile-revoked',action='store_true');p.add_argument('--operator-lifecycle',action='store_true');p.add_argument('--operator-recovery',action='store_true');p.add_argument('--operator-backup',action='store_true');a=p.parse_args();
+    if a.operator_backup and not a.operator_lifecycle:p.error('Backup requires operator lifecycle fixture')
     if a.operator_recovery and not a.operator_lifecycle:p.error('Recovery requires operator lifecycle fixture')
     if a.operator_lifecycle and not (a.native_volumes and a.tenants==2 and not (a.load or a.mixed or a.balanced_fault or a.balanced or a.profile or a.long_poll or a.wal_maintenance or a.delay150 or a.storage_check or a.soak)):p.error('Operator lifecycle requires simple two-session native fixture')
     if a.reconcile_revoked and not a.balanced_fault:p.error('Reconciliation requires balanced fault fixture')
@@ -154,7 +155,25 @@ def main():
                     assert sorted(counts()['max'])==sorted([[i,f'incoming-{i}-{j}'] for i in range(2) for j in range(2)])
                     assert all(d.inspect(s['container_name'])['Id']==ids[role] for role,s in plan['services'].items())
                     assert all(ledger(cid,'/state/to-telegram.sqlite3','worker_telegram_intents')=={'SENT':1} for cid in workers)
-                    assert ctl.stop()['state']=='STOPPED';print('OPERATOR LIFECYCLE PASS '+json.dumps({'containers':4,'cycles':2,'same_ids':True,'max_effects':4,'tg_effects':2,'clean_stop':True,'live_launch_authorized':False},sort_keys=True),flush=True)
+                    assert ctl.stop()['state']=='STOPPED'
+                    if a.operator_backup:
+                        names=('snapshots','archive','backupkeys','anchor','restores')
+                        for n in names:
+                            vol[n]=d.call('volume','create','--label',label,'m2tg-placement-'+owner+'-'+n)
+                            v=d.volume(vol[n]);assert v.get('Labels',{}).get('max2tg.placement')==owner and v['Driver']=='local' and not v.get('Options')
+                        mounts=[z for n in names for z in ('--mount',f'type=volume,source={vol[n]},target=/{n}')]
+                        base=['run','--rm','--name',adminname,'--network','none','--read-only','--pull','never','--label',label,'--memory','256m','--pids-limit','64']
+                        d.call(*base,*mounts,'--entrypoint','python',image,'-c','import os;from pathlib import Path;[(os.chown(p,65532,65532),p.chmod(0o700)) for p in map(Path,'+repr(['/'+n for n in names])+')]')
+                        def capture():
+                            sources=[z for n in ('registry','state0','state1') for z in ('--mount',f'type=volume,source={vol[n]},target=/{n}')]
+                            return json.loads(d.call(*base,'--user','65532:65532','--cap-drop','ALL','--security-opt','no-new-privileges',*mounts,*sources,'--mount',f'type=bind,source={code / "tests"},target=/app/tests,readonly','--entrypoint','python',image,'-m','tests.operator_backup_fixture',json.dumps(sids)))
+                        result=ctl.checkpoint(capture);assert result['members']==11 and result['logical_rows_equal'] and result['credentials_excluded'] and ctl.status()['state']=='ARCHIVED'
+                        for action in (ctl.start,ctl.stop,ctl.recover_once):
+                            try:action()
+                            except PermissionError:pass
+                            else:raise AssertionError('Archived lifecycle reopened')
+                        print('OPERATOR BACKUP PASS '+json.dumps(result,sort_keys=True),flush=True)
+                    print('OPERATOR LIFECYCLE PASS '+json.dumps({'containers':4,'cycles':2,'same_ids':True,'max_effects':4,'tg_effects':2,'clean_stop':True,'live_launch_authorized':False},sort_keys=True),flush=True)
                 finally:ctl.close()
                 return
             start_broker();d.start(gateway);wait(ready,timeout=90 if a.tenants==64 else 45 if a.tenants==32 else 20)
