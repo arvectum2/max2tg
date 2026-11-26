@@ -33,7 +33,7 @@ async def broker(network_paths=None,*,long_poll=False,mixed=False,cycles=1,delay
         data=[{'update_id':tenants*j+i+1,'message':message(-10000-i,100+tenants*j+i,f'incoming-{i}-{j}',100+i)} for j in range(phase) for i in range(tenants) if tenants*j+i+1>=offset]
         if (control/'phase3').exists() and offset<=5:data.append({'update_id':5,'message':message(-10000,104,'ambiguous-0',100)})
         if load_n:
-            data.extend({'update_id':tenants+1+tenants*j+i,'message':message(-10000-i,200+tenants*j+i,f'load-in-{i}-{j}',100+i)} for j in range(load_n) for i in range(tenants) if tenants+1+tenants*j+i>=offset)
+            data.extend({'update_id':tenants*max(1,phase)+1+tenants*j+i,'message':message(-10000-i,200+tenants*j+i,f'load-in-{i}-{j}',100+i)} for j in range(load_n) for i in range(tenants) if tenants*max(1,phase)+1+tenants*j+i>=offset)
         data.extend(u for u in mixed_updates if u["update_id"]>=offset)
         if fault and counts.get('revocation_emitted') and offset<=6:
             event=message(-10000,999,'synthetic-membership',100);event.pop('text');event['new_chat_members']=[user(777)]

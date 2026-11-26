@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Run the actual composition functions on disposable Linux bind placements."""
 import argparse,json,secrets,subprocess,tempfile,time,sys
+from copy import deepcopy
 from pathlib import Path
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 from app.deployment_plan import build_plan,_verify_stopped,validate_bind_sources
 from app.container_supervisor import DockerBackend
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--image',required=True);p.add_argument('--native-volumes',action='store_true');p.add_argument('--load',type=int,choices=range(1,26));p.add_argument('--tenants',type=int,choices=(2,4,8,16,32,64),default=2);p.add_argument('--profile',action='store_true');p.add_argument('--long-poll',action='store_true');p.add_argument('--mixed',action='store_true');p.add_argument('--soak',action='store_true');p.add_argument('--storage-check',action='store_true');p.add_argument('--wal-maintenance',action='store_true');p.add_argument('--delay150',action='store_true');p.add_argument('--balanced',action='store_true');p.add_argument('--balanced-fault',action='store_true');p.add_argument('--reconcile-revoked',action='store_true');p.add_argument('--operator-lifecycle',action='store_true');p.add_argument('--operator-recovery',action='store_true');p.add_argument('--operator-backup',action='store_true');a=p.parse_args();
+    p=argparse.ArgumentParser();p.add_argument('--image',required=True);p.add_argument('--native-volumes',action='store_true');p.add_argument('--load',type=int,choices=range(1,26));p.add_argument('--tenants',type=int,choices=(2,4,8,16,32,64),default=2);p.add_argument('--profile',action='store_true');p.add_argument('--long-poll',action='store_true');p.add_argument('--mixed',action='store_true');p.add_argument('--soak',action='store_true');p.add_argument('--storage-check',action='store_true');p.add_argument('--wal-maintenance',action='store_true');p.add_argument('--delay150',action='store_true');p.add_argument('--balanced',action='store_true');p.add_argument('--balanced-fault',action='store_true');p.add_argument('--reconcile-revoked',action='store_true');p.add_argument('--operator-lifecycle',action='store_true');p.add_argument('--operator-recovery',action='store_true');p.add_argument('--operator-backup',action='store_true');p.add_argument('--operator-restore',action='store_true');a=p.parse_args();
+    if a.operator_restore and not a.operator_backup:p.error('Restore requires operator backup fixture')
     if a.operator_backup and not a.operator_lifecycle:p.error('Backup requires operator lifecycle fixture')
     if a.operator_recovery and not a.operator_lifecycle:p.error('Recovery requires operator lifecycle fixture')
     if a.operator_lifecycle and not (a.native_volumes and a.tenants==2 and not (a.load or a.mixed or a.balanced_fault or a.balanced or a.profile or a.long_poll or a.wal_maintenance or a.delay150 or a.storage_check or a.soak)):p.error('Operator lifecycle requires simple two-session native fixture')
@@ -36,7 +38,7 @@ def main():
     code=Path(__file__).resolve().parents[1];image=d.call('image','inspect','--format','{{.Id}}',a.image);owner=secrets.token_hex(12);label='max2tg.placement='+owner
     with tempfile.TemporaryDirectory(prefix='runtime-',dir=code) as td:
         root=Path(td).resolve();fixture=root/'fixture';fixture.mkdir(mode=0o700);cert=root/'cert';cert.mkdir();subprocess.run(['openssl','req','-x509','-newkey','rsa:2048','-nodes','-days','1','-subj','/CN=synthetic','-addext','subjectAltName=DNS:api.oneme.ru,DNS:api.telegram.org','-keyout',str(cert/'key.pem'),'-out',str(cert/'cert.pem')],check=True,capture_output=True);(cert/'key.pem').chmod(0o644)
-        plan=None;ids={};vol={};initname='m2tg-placement-'+owner+'-init';adminname='m2tg-placement-'+owner+'-receipt-admin'
+        plan=None;restore_plan=None;restore_owner=None;ids={};vol={};initname='m2tg-placement-'+owner+'-init';adminname='m2tg-placement-'+owner+'-receipt-admin'
         def bind(source,target,ro=True):return {'type':'bind','source':str(source),'target':target,'read_only':ro,'bind':{'create_host_path':False,'propagation':'rprivate'}}
         def exec_py(cid,source):return d.call('exec',cid,'python','-c',source)
         def read(cid,path):return json.loads(exec_py(cid,f'from pathlib import Path;print(Path({path!r}).read_text() if Path({path!r}).exists() else "null")'))
@@ -155,7 +157,7 @@ def main():
                     assert sorted(counts()['max'])==sorted([[i,f'incoming-{i}-{j}'] for i in range(2) for j in range(2)])
                     assert all(d.inspect(s['container_name'])['Id']==ids[role] for role,s in plan['services'].items())
                     assert all(ledger(cid,'/state/to-telegram.sqlite3','worker_telegram_intents')=={'SENT':1} for cid in workers)
-                    assert ctl.stop()['state']=='STOPPED'
+                    auth_baseline[:]=counts()['auth'];assert ctl.stop()['state']=='STOPPED'
                     if a.operator_backup:
                         names=('snapshots','archive','backupkeys','anchor','restores')
                         for n in names:
@@ -173,6 +175,48 @@ def main():
                             except PermissionError:pass
                             else:raise AssertionError('Archived lifecycle reopened')
                         print('OPERATOR BACKUP PASS '+json.dumps(result,sort_keys=True),flush=True)
+                        if a.operator_restore:
+                            fresh=('newregistry','newstate0','newstate1','newchannel0','newchannel1')
+                            for n in fresh:
+                                vol[n]=d.call('volume','create','--label',label,'m2tg-placement-'+owner+'-'+n)
+                                v=d.volume(vol[n]);assert v.get('Labels',{}).get('max2tg.placement')==owner and v['Driver']=='local' and not v.get('Options')
+                            def mount(name,target=None,ro=False):return ['--mount',f'type=volume,source={vol[name]},target=/{target or name}'+(',readonly' if ro else '')]
+                            newmounts=[z for n in fresh for z in mount(n)]
+                            d.call(*base,*newmounts,'--entrypoint','python',image,'-c','import os;from pathlib import Path;[(os.chown(p,65532,65532),p.chmod(0o700)) for p in map(Path,'+repr(['/'+n for n in fresh])+')]')
+                            retained=[z for n in ('secret0','secret1','keys0','keys1','botsecret','botkeys') for z in mount(n,ro=True)]
+                            def offline(action):
+                                assert ctl.status()['state']=='ARCHIVED'
+                                old=[*mount('registry','oldregistry',True),*mount('state0','oldstate0',True),*mount('state1','oldstate1',True)] if action=='prepare' else []
+                                return json.loads(d.call(*base,'--user','65532:65532','--cap-drop','ALL','--security-opt','no-new-privileges',*newmounts,*retained,*old,*mount('anchor'),*mount('restores',ro=True),'--mount',f'type=bind,source={code / "tests"},target=/app/tests,readonly','--entrypoint','python',image,'-m','tests.operator_restore_fixture',action,json.dumps(sids)))
+                            assert offline('prepare')=={'prepared':True,'dirty':False}
+                            restore_owner=secrets.token_hex(12);restore_plan=deepcopy(plan);restore_plan['name']='m2tg-placement-'+restore_owner
+                            replacements={vol[n]:vol['new'+n] for n in ('registry','state0','state1','channel0','channel1')}
+                            for role,s in restore_plan['services'].items():
+                                s['container_name']='m2tg-placement-'+restore_owner+'-'+role;s['labels']['max2tg.placement']=restore_owner
+                                for m in s['volumes']:
+                                    if m['source'] in replacements:m['source']=replacements[m['source']]
+                            restore_plan['volumes']={m['source']:{'external':True,'name':m['source']} for s in restore_plan['services'].values() for m in s['volumes'] if m['type']=='volume'}
+                            restored_path=root/'restore-compose.json';restored_path.write_text(json.dumps(restore_plan));restore_cmd=('compose','-f',str(restored_path),'--profile','acceptance-only');d.call(*restore_cmd,'config','--quiet');d.call(*restore_cmd,'create','--no-build','--pull','never')
+                            restored_root=root/'restored-lifecycle';restored_root.mkdir(mode=0o700)
+                            new_ids={role:d.inspect(s['container_name'])['Id'] for role,s in restore_plan['services'].items()};assert not set(new_ids.values())&set(ids.values())
+                            broker=new_ids['broker'];gateway=new_ids['gateway'];workers=[new_ids['worker-'+sid] for sid in sids]
+                            restored_ctl=SyntheticLifecycle(restored_root,restore_plan,d,probe,observe=observation)
+                            try:
+                                restored_ctl.register();assert restored_ctl.status()['state']=='HELD'
+                                assert offline('gate')=={'verified':True,'dirty':True,'live_launch_authorized':False}
+                                assert offline('gate')=={'verified':False,'dirty':True}
+                                assert restored_ctl.start()['state']=='RUNNING'
+                                wait(lambda:restored_ctl.monitor()['healthy'],timeout=30)
+                                assert receipts(4) and sorted(counts()['tg'])==[[-10001,'outgoing-1'],[-10000,'outgoing-0']] and len(counts()['max'])==4
+                                exec_py(broker,'from pathlib import Path;Path("/network/telegram/load-count").write_text("1")')
+                                wait(lambda:ledger(gateway,'/registry/inbox.sqlite3','telegram_ingress')=={'ACKED':6} and ledger(gateway,'/registry/telegram-egress.sqlite3','telegram_egress')=={'SENT':4},timeout=40)
+                                wait(lambda:all(ledger(cid,'/state/to-telegram.sqlite3','worker_telegram_intents')=={'SENT':2} for cid in workers),timeout=15)
+                                assert sorted(counts()['tg'])==sorted([[-10000-i,t] for i in range(2) for t in (f'outgoing-{i}',f'load-out-{i}-0')])
+                                assert sorted(counts()['max'])==sorted([[i,t] for i in range(2) for t in (f'incoming-{i}-0',f'incoming-{i}-1',f'load-in-{i}-0')])
+                                assert ctl.status()['state']=='ARCHIVED';assert restored_ctl.stop()['state']=='STOPPED'
+                                print('OPERATOR RESTORE PASS '+json.dumps({'new_container_ids':4,'fresh_delivery_volumes':5,'old_effects_preserved':6,'new_effects':4,'dirty_anchor_reuse_refused':True,'source_archived':True},sort_keys=True),flush=True)
+                            finally:restored_ctl.close()
+
                     print('OPERATOR LIFECYCLE PASS '+json.dumps({'containers':4,'cycles':2,'same_ids':True,'max_effects':4,'tg_effects':2,'clean_stop':True,'live_launch_authorized':False},sort_keys=True),flush=True)
                 finally:ctl.close()
                 return
@@ -235,7 +279,11 @@ def main():
                     result=counts();
                     if a.tenants==64:
                         print("COHORT OBSERVATION "+json.dumps({"effects":len(result["mixed_effects"]),"lease":read(gateway,"/registry/lease-observation.json"),"idle_samples":[v for v in observations if any(32+90*c<=v["at"]<=50+90*c for c in range(cycles))],"verified_min":min(map(len,result["mixed_verified"].values()),default=0)},sort_keys=True),flush=True)
-                    metrics=summarize(a.tenants,result['mixed_effects'],result['mixed_verified'],observations,cycles=cycles)
+                    try:metrics=summarize(a.tenants,result['mixed_effects'],result['mixed_verified'],observations,cycles=cycles)
+                    except ValueError:
+                        # Capture the actual synthetic verification timeline on acceptance failure.
+                        print('MIXED ACCEPTANCE DIAGNOSTIC '+json.dumps({'verify_times':{i:[round(t,3) for t in times] for i,times in result['mixed_verified'].items()},'effects':len(result['mixed_effects']),'idle_observations':[v for v in observations if any(32+90*c<=v['at']<=50+90*c for c in range(cycles))]},sort_keys=True),flush=True)
+                        raise
                     metrics['cycles']=cycles;metrics['elapsed_s']=round(time.monotonic()-begin,3);metrics['samples']=len(samples);metrics['max_sampled_total_ram_mib']=round(max(sum(_mib(r['MemUsage'].split('/')[0]) for r in s['resources']) for s in samples),2)
                     stages=aggregate_profiles(before,profiles(2));assert stages['gateway']['api.send.call']['count']==n and stages['gateway']['ingress.ipc']['count']>=n
                     metrics['api_calls']={k:v['count'] for k,v in stages['gateway'].items() if k.startswith('api.') and k.endswith('.call')}
@@ -359,11 +407,12 @@ def main():
                 except subprocess.CalledProcessError:pass
             raise
         finally:
-            names=[initname,adminname]+([s['container_name'] for s in plan['services'].values()] if plan else [])
+            names=[initname,adminname]+([s['container_name'] for s in plan['services'].values()] if plan else [])+([s['container_name'] for s in restore_plan['services'].values()] if restore_plan else [])
             for name in names:
                 c=d.inspect(name)
-                if c and c['Config']['Labels'].get('max2tg.placement')==owner:d.call('rm','-f',c['Id'])
+                if c and c['Config']['Labels'].get('max2tg.placement') in (owner,restore_owner) and c['Config']['Labels'].get('max2tg.placement'):d.call('rm','-f',c['Id'])
             assert not d.call('ps','-aq','--filter','label='+label)
+            if restore_owner:assert not d.call('ps','-aq','--filter','label=max2tg.placement='+restore_owner)
             # Only remove contents of this fresh isolated mount, not a caller-supplied path.
             if a.native_volumes:
                 for v in vol.values():
