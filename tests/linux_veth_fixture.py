@@ -137,12 +137,13 @@ async def exercise(cert, expiry):
 
 
 
-def main(rotation=False):
+def main(rotation=False, clients=False):
     isolated([], {'lo'})
     assert os.getuid() == 0 and 'NoNewPrivs:\t1' in Path('/proc/self/status').read_text()
     assert not json.loads(call('ip', '-j', '-4', 'route', 'show', 'table', 'main'))
     keeper = subprocess.Popen(['unshare', '--net', 'sleep', '50'])
     mock = None
+    client_root = None
     try:
         for _ in range(50):
             if os.readlink('/proc/self/ns/net') != os.readlink(f'/proc/{keeper.pid}/ns/net'):
@@ -171,11 +172,17 @@ def main(rotation=False):
                  '-addext', 'subjectAltName=DNS:api.oneme.ru,DNS:api.telegram.org',
                  '-keyout', d+'/key.pem', '-out', d+'/cert.pem')
             os.chmod(d+'/key.pem', 0o644)  # ephemeral synthetic key only
-            mock = subprocess.Popen([*DROP, sys.executable, '-m', 'tests.linux_veth_fixture',
-                                     'server', d], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+            if clients:
+                client_root=call(*DROP,sys.executable,'-c',
+                    'import tempfile;from pathlib import Path;p=Path(tempfile.mkdtemp(prefix="client-rotation-"));[(p/n).mkdir(mode=0o700) for n in ("max","tg")];print(p)').strip()
+                args=['tests.linux_client_rotation_fixture','server',d,client_root]
+            else:
+                args=['tests.linux_veth_fixture','server',d]
+            mock = subprocess.Popen([*DROP, sys.executable, '-m', *args],
+                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
             assert select.select([mock.stdout], [], [], 5)[0], 'Mock readiness timeout'
             assert mock.stdout.readline().strip() == 'MOCK READY'
-            expiry = int(time.time()) + 14
+            expiry = int(time.time()) + (30 if clients else 14)
             pins = BrokerPins.parse({'max-text': [IPS[0]], 'telegram': [IPS[1]],
                                      'expires_at': expiry})
             result = prepare_fresh_policy(
@@ -183,7 +190,10 @@ def main(rotation=False):
                 install=lambda rules: call(*ns, 'nft', '-f', '-', data=rules))
             assert result['verified'] and not result['live_launch_authorized']
             print('VETH EXACT KERNEL GATE PASS', flush=True)
-            if rotation:
+            if clients:
+                from tests.linux_client_rotation_fixture import controller
+                controller(ns,d,pins,client_root)
+            elif rotation:
                 from tests.linux_live_rotation_fixture import controller
                 controller(ns, d, pins)
             else:
@@ -192,20 +202,32 @@ def main(rotation=False):
             counts = [e['counter']['packets'] for i in json.loads(call(
                 *ns, 'nft', '-j', 'list', 'chain', 'inet', 'm2tg_egress', 'output'))['nftables']
                       if 'rule' in i for e in i['rule']['expr'] if 'counter' in e]
-            assert counts[0] > 2 and counts[1] >= (1 if rotation else 4), counts
+            assert counts[0] > 2 and counts[1] >= (1 if rotation or clients else 4), counts
             print('VETH KERNEL COUNTERS PASS', counts, flush=True)
     finally:
-        if mock is not None:
-            mock.stdin.close()
-            assert mock.wait(timeout=3) == 0
-            mock.stdout.close()
-        keeper.terminate()
-        keeper.wait(timeout=3)
+        try:
+            if mock is not None:
+                mock.stdin.close()
+                assert mock.wait(timeout=5) == 0
+                out=mock.stdout.read()
+                if clients:
+                    assert 'CLIENT EFFECTS PASS' in out
+                    print(out,flush=True)
+                mock.stdout.close()
+        finally:
+            try:
+                if client_root is not None:
+                    call(*DROP,sys.executable,'-c','import shutil,sys;shutil.rmtree(sys.argv[1])',client_root)
+            finally:
+                keeper.terminate()
+                keeper.wait(timeout=3)
 
 
 if __name__ == '__main__':
     if len(sys.argv) == 1:
         main()
+    elif sys.argv[1] == '--clients':
+        main(clients=True)
     elif sys.argv[1] == '--rotation':
         main(rotation=True)
     elif sys.argv[1] == 'server':
