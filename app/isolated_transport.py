@@ -80,7 +80,7 @@ async def run_isolated_worker(stop,*,socket_path,secret_dir,sid,state,channel,ke
         await runtime.run(stop)
 
 
-async def run_isolated_gateway(stop,*,socket_path,registry,channels,context=None,token=None,secret_dir=None,secret_key_path=None,bot_id=None,profile=None,wal_maintenance=False,balanced=False):
+async def run_isolated_gateway(stop,*,socket_path,registry,channels,context=None,token=None,secret_dir=None,secret_key_path=None,bot_id=None,profile=None,wal_maintenance=False,balanced=False,experimental_64=False):
     """Trusted composition; no public entrypoint or production supervisor."""
     from app.shared_gateway_runtime import SharedGatewayRuntime
     if any(x is not None for x in (secret_dir,secret_key_path,bot_id)):
@@ -88,10 +88,11 @@ async def run_isolated_gateway(stop,*,socket_path,registry,channels,context=None
         from app.encrypted_credentials import load_encrypted_bot
         token=load_encrypted_bot(secret_dir,bot_id,secret_key_path)
     elif token is None:raise ValueError('Gateway credentials required')
+    if experimental_64 and (not balanced or len(channels)!=64):raise ValueError('Explicit 64-session balanced rehearsal required')
     if balanced:
         from app.weighted_budget import WeightedBudget
-        if not 1<=len(channels)<=32:raise ValueError('Experimental cohort limited to 32')
-        budget=WeightedBudget(registry.db,profile=profile,verify_weight=2)
+        if not 1<=len(channels)<= (64 if experimental_64 else 32):raise ValueError('Experimental cohort limit exceeded')
+        budget=WeightedBudget(registry.db,profile=profile,verify_weight=4 if experimental_64 else 2)
     else:budget=TelegramBudget(registry.db,profile=profile)
     async with isolated_telegram_bot(socket_path,token,context=context,budget=budget,pool_size=12 if balanced else 8) as bot:
         runtime=SharedGatewayRuntime(registry,bot,channels=channels,external_only=True,managed=True,profile=profile,balanced=balanced)

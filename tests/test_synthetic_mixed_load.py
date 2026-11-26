@@ -28,3 +28,12 @@ def test_32_tenant_mixed_exact_effects():
     result=summarize(32,effects,verified,samples)
     assert result['messages']==720 and result['min_ready_sample']==32
     with pytest.raises(ValueError):summarize(32,effects[:-1],verified,samples)
+
+
+def test_64_paced_rehearsal_is_bounded():
+    waves=schedule(64);assert len(waves)==16 and waves[-1][0]==74
+    assert all(len(pairs)==8 for _,pairs in waves)
+    assert Counter(i for _,pairs in waves for i,j in pairs)=={i:2 for i in range(64)}
+    effects=[[f'mixed-{d}-{i}-{j}',.5,at+.5] for at,pairs in waves for i,j in pairs for d in ('in','out')]
+    assert summarize(64,effects,{str(i):[10,35,60] for i in range(64)},[{'at':t,'pending_in':0,'pending_out':0,'ready':64} for t in (34,45,75)])['messages']==256
+    with pytest.raises(ValueError):schedule(64,2)
