@@ -42,3 +42,10 @@ def test_balanced_cooldown_and_overload_remain_safe():
     assert fault['drained'] and fault['sent']==360 and fault['held_tenant_fraction']>0
     overload=run(64,8,latency=.04,scheduler='balanced',concurrency=8,send_concurrency=4)
     assert overload['pending_at_120s']>200 and overload['terminal'].get('UNKNOWN',0)==0
+
+
+def test_64_sustained_envelope_and_overload():
+    moderate=run(64,3,latency=.35,scheduler='balanced',concurrency=8,send_concurrency=4,duration=240)
+    assert moderate['min_ready']==64 and moderate['sent']==720 and moderate['min_lease_margin_s']>=2 and moderate['pending_at_end']<20
+    excessive=run(64,5,latency=.35,scheduler='balanced',concurrency=8,send_concurrency=4,duration=240)
+    assert excessive['pending_at_end']>50 and excessive['terminal'].get('UNKNOWN',0)==0
