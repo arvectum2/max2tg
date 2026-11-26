@@ -29,7 +29,7 @@ def crash(folder,pid,identity,expiry,request_fd,receipt_fd):
     raise AssertionError('Controller survived')
 
 
-def controller(ns,cert,old,root):
+def controller(ns,cert,old,root,recovery=False):
     pid=int(ns[2])
     info=os.stat(f'/proc/{pid}/ns/net')
     identity=(info.st_dev,info.st_ino)
@@ -85,6 +85,15 @@ def controller(ns,cert,old,root):
             call(*DROP,sys.executable,'-c',
                  'from pathlib import Path;import sys;p=Path(sys.argv[1]);assert (p/"broker-failed").is_file() and (p/"done").is_file()',root)
             print('LIVE CONTROLLER SIGKILL PASS: EOF, broker fail closed, durable fence retained',flush=True)
+            if recovery:
+                from tests.linux_fresh_recovery_fixture import recover
+                recover(ns,cert,root,handle,client_ns,anchor)
+                with RotationFence(anchor,handle) as retained:
+                    assert retained.inspect()==evidence
+                    try:retained.arm(old,candidate(old))
+                    except EgressDenied:pass
+                    else:raise AssertionError('Retired grant reopened')
+
     finally:
         for fd in list(fds):close(fd)
         try:

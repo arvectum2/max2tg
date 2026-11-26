@@ -137,7 +137,7 @@ async def exercise(cert, expiry):
 
 
 
-def main(rotation=False, clients=False, journals=False, crash=False):
+def main(rotation=False, clients=False, journals=False, crash=False, recovery=False):
     isolated([], {'lo'})
     assert os.getuid() == 0 and 'NoNewPrivs:\t1' in Path('/proc/self/status').read_text()
     assert not json.loads(call('ip', '-j', '-4', 'route', 'show', 'table', 'main'))
@@ -175,7 +175,7 @@ def main(rotation=False, clients=False, journals=False, crash=False):
             if clients:
                 client_root=call(*DROP,sys.executable,'-c',
                     'import tempfile;from pathlib import Path;p=Path(tempfile.mkdtemp(prefix="client-rotation-"));[(p/n).mkdir(mode=0o700) for n in ("max","tg")];print(p)').strip()
-                args=['tests.linux_client_rotation_fixture','server',d,client_root,*(['journals'] if journals else []),*(['crash'] if crash else [])]
+                args=['tests.linux_client_rotation_fixture','server',d,client_root,*(['journals'] if journals else []),*(['crash'] if crash and not recovery else [])]
             else:
                 args=['tests.linux_veth_fixture','server',d]
             mock = subprocess.Popen([*DROP, sys.executable, '-m', *args],
@@ -192,7 +192,7 @@ def main(rotation=False, clients=False, journals=False, crash=False):
             print('VETH EXACT KERNEL GATE PASS', flush=True)
             if crash:
                 from tests.linux_live_controller_crash_fixture import controller
-                controller(ns,d,pins,client_root)
+                controller(ns,d,pins,client_root,recovery=recovery)
             elif clients:
                 from tests.linux_client_rotation_fixture import controller
                 controller(ns,d,pins,client_root,journals=journals)
@@ -229,6 +229,8 @@ def main(rotation=False, clients=False, journals=False, crash=False):
 if __name__ == '__main__':
     if len(sys.argv) == 1:
         main()
+    elif sys.argv[1] == '--fresh-recovery':
+        main(clients=True,journals=True,crash=True,recovery=True)
     elif sys.argv[1] == '--controller-crash':
         main(clients=True,journals=True,crash=True)
     elif sys.argv[1] == '--journals':
