@@ -1,17 +1,17 @@
 """Synthetic live broker rotation; controller uses only an exact pre-reviewed bundle."""
 import asyncio
-import json
+import os
 from pathlib import Path
-import select
 import ssl
 import subprocess
 import sys
 import tempfile
 
 from app.linux_egress_policy import BrokerPins
-from app.linux_pin_rotation import rotate_quiesced_policy
+from app.egress_policy import EgressDenied
+from app.operator_pin_rotation import NamespaceHandle, RotationGrant, frame, request as grant_request, read_frame_fd, read_receipt
 from app.pinned_broker import PinnedBroker
-from tests.linux_veth_fixture import IPS, DROP, call, denied, isolated, unprivileged
+from tests.linux_veth_fixture import IPS, DROP, denied, isolated, unprivileged
 from tests.pinned_broker_linux_fixture import request
 
 
@@ -20,7 +20,11 @@ def candidate(old):
                              'expires_at': old.expires_at + 8})
 
 
-async def exercise(cert, expiry):
+async def exercise(cert, expiry, nonce, identity, inherited_fd):
+    # No namespace descriptor retained by the broker.
+    os.close(inherited_fd)
+    info=os.stat("/proc/self/ns/net")
+    assert (info.st_dev,info.st_ino)==identity
     unprivileged()
     isolated([], {'lo', 'eth0'})
     old = BrokerPins.parse({'max-text': [IPS[0]], 'telegram': [IPS[1]],
@@ -55,9 +59,9 @@ async def exercise(cert, expiry):
             async def update(current,replacement):
                 assert current==old and replacement==new and not b.ready.is_set()
                 # No mutation arguments cross the pipe. Parent has both bundles.
-                print('ROTATE',flush=True)
-                line=await asyncio.to_thread(sys.stdin.readline)
-                return json.loads(line)
+                os.write(sys.stdout.fileno(),frame(grant_request(nonce,current,replacement)))
+                raw=await asyncio.to_thread(read_frame_fd,sys.stdin.fileno())
+                return read_receipt(raw,nonce,current,replacement)
             await b.rotate(new,verified_update=update)
             assert b.ready.is_set() and b.pins==new
             try:
@@ -81,29 +85,47 @@ async def exercise(cert, expiry):
 
 
 def controller(ns, cert, old):
-    # This is a fixture-only trusted controller in the private network-none lab.
-    # It accepts exactly one fixed signal and applies the predetermined candidate.
-    new = candidate(old)
-    child = subprocess.Popen([*ns,*DROP,sys.executable,'-m','tests.linux_live_rotation_fixture',
-                              cert,str(old.expires_at)],stdin=subprocess.PIPE,
-                             stdout=subprocess.PIPE,text=True)
+    # The trusted launcher owns the keeper; no caller-supplied PID or commands.
+    pid=int(ns[2])
+    info=os.stat(f'/proc/{pid}/ns/net')
+    identity=(info.st_dev,info.st_ino)
     try:
-        assert select.select([child.stdout],[],[],6)[0], 'Rotation request timeout'
-        assert child.stdout.readline().strip()=='ROTATE'
-        def observe():
-            return json.loads(call(*ns,'nft','-j','list','ruleset'))
-        receipt=rotate_quiesced_policy(old,new,observe=observe,
-                                      apply=lambda batch:call(*ns,'nft','-f','-',data=batch))
-        out,_=child.communicate(json.dumps(receipt)+'\n',timeout=12)
-        print(out,flush=True)
-        assert child.returncode==0 and 'LIVE ROTATION TLS PASS' in out
+        NamespaceHandle(pid,expected=(0,0))
+    except EgressDenied:
+        pass
+    else:
+        raise AssertionError('Foreign namespace accepted')
+    handle=NamespaceHandle(pid,expected=identity)
+    new=candidate(old)
+    grant=RotationGrant(handle,old,new)
+    child=None
+    try:
+        child=subprocess.Popen(
+            ['/usr/bin/nsenter',f'--net=/proc/self/fd/{handle.fd}','--',
+             *DROP,sys.executable,'-m','tests.linux_live_rotation_fixture',
+             cert,str(old.expires_at),grant.nonce,str(identity[0]),str(identity[1]),str(handle.fd)],
+            pass_fds=(handle.fd,),stdin=subprocess.PIPE,stdout=subprocess.PIPE)
+        raw=read_frame_fd(child.stdout.fileno(),timeout=6)
+        receipt=grant.execute(raw)
+        try:
+            grant.execute(raw)
+        except EgressDenied:
+            pass
+        else:
+            raise AssertionError('Replay accepted')
+        out,_=child.communicate(receipt,timeout=12)
+        print(out.decode(),flush=True)
+        assert child.returncode==0 and b'LIVE ROTATION TLS PASS' in out
+        print('BOUND ROTATION PASS: held namespace FD, exact grant, replay denied',flush=True)
     finally:
-        if child.poll() is None:
-            # No CAP_KILL needed: EOF closes the fixture control protocol.
-            if not child.stdin.closed:
-                child.stdin.close()
-            child.wait(timeout=8)
+        try:
+            if child is not None and child.poll() is None:
+                if not child.stdin.closed:child.stdin.close()
+                child.wait(timeout=8)
+        finally:
+            handle.close()
 
 
 if __name__=='__main__':
-    asyncio.run(exercise(sys.argv[1],int(sys.argv[2])))
+    asyncio.run(exercise(sys.argv[1],int(sys.argv[2]),sys.argv[3],
+                         (int(sys.argv[4]),int(sys.argv[5])),int(sys.argv[6])))
