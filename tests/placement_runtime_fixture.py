@@ -60,9 +60,16 @@ async def placed_worker(sid,enabled=False,wal=False):
     ctx=ssl.create_default_context(cafile='/state/test-ca.pem')
     await run_isolated_worker(stop_event(),socket_path='/network/proxy.sock',secret_dir='/secret',sid=sid,state='/state',channel='/channel',key_file='/state/key',forum=cfg['forum'],actor=cfg['actor'],context=ctx,secret_key_path='/keys/worker.key',profile=profile_sink(enabled),wal_maintenance=wal)
 
-async def placed_gateway(sessions,enabled=False,wal=False,balanced=False,fault=False):
+async def placed_gateway(sessions,enabled=False,wal=False,balanced=False,fault=False,operator=False):
     assert_sandbox();assert sorted(p.name for p in Path('/keys').iterdir())==['bot.key'];assert sorted(p.name for p in Path('/secret').iterdir())==['telegram.enc'];r=CapsuleRegistry('/registry')
     try:
+        if operator:
+            from app.shared_gateway_runtime import SharedGatewayRuntime
+            from tests.supervised_bridge_fixture import atomic
+            original_snapshot=SharedGatewayRuntime.lifecycle_snapshot
+            def operator_snapshot(runtime):
+                result=original_snapshot(runtime);atomic(Path('/registry/operator-health.json'),result);return result
+            SharedGatewayRuntime.lifecycle_snapshot=operator_snapshot
         if fault:
             from app.shared_gateway_runtime import SharedGatewayRuntime
             original_drain=SharedGatewayRuntime.drain_once
@@ -97,11 +104,18 @@ async def placed_gateway(sessions,enabled=False,wal=False,balanced=False,fault=F
         await run_isolated_gateway(stop_event(),socket_path='/network/proxy.sock',registry=r,channels={sid:Path('/channels')/sid for sid,_,_ in sessions},context=ssl.create_default_context(cafile='/registry/test-ca.pem'),secret_dir='/secret',secret_key_path='/keys/bot.key',bot_id=123456,profile=profile_sink(enabled),wal_maintenance=wal,balanced=balanced,experimental_64=len(sessions)==64)
     finally:r.close()
 
+async def placed_broker(sessions,args):
+    marker=Path('/network/telegram/stop-broker')
+    if 'operator' in args:
+        marker.unlink(missing_ok=True)
+        asyncio.get_running_loop().add_signal_handler(signal.SIGTERM,marker.touch)
+    await broker(['/network/'+sid for sid,_,_ in sessions]+['/network/telegram'],long_poll='long-poll' in args,mixed='mixed' in args,cycles=(2 if len(sessions)==64 else 3) if 'soak' in args else 1,delay=.15 if 'delay150' in args else 0,fault='balanced-fault' in args)
+
 if __name__=='__main__':
     mode=sys.argv[1]
     if mode=='init':asyncio.run(prepare())
     elif mode=='broker':
-        sessions=json.loads(sys.argv[2]);asyncio.run(broker(['/network/'+sid for sid,_,_ in sessions]+['/network/telegram'],long_poll='long-poll' in sys.argv[3:],mixed='mixed' in sys.argv[3:],cycles=(2 if len(sessions)==64 else 3) if 'soak' in sys.argv[3:] else 1,delay=.15 if 'delay150' in sys.argv[3:] else 0,fault='balanced-fault' in sys.argv[3:]))
-    elif mode=='gateway':asyncio.run(placed_gateway(json.loads(sys.argv[2]),'profile' in sys.argv[3:],'wal' in sys.argv[3:],'balanced' in sys.argv[3:],'balanced-fault' in sys.argv[3:]))
+        asyncio.run(placed_broker(json.loads(sys.argv[2]),sys.argv[3:]))
+    elif mode=='gateway':asyncio.run(placed_gateway(json.loads(sys.argv[2]),'profile' in sys.argv[3:],'wal' in sys.argv[3:],'balanced' in sys.argv[3:],'balanced-fault' in sys.argv[3:],'operator' in sys.argv[3:]))
     elif mode=='worker':asyncio.run(placed_worker(sys.argv[2],'profile' in sys.argv[3:],'wal' in sys.argv[3:]))
     else:raise SystemExit(78)
