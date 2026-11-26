@@ -34,11 +34,14 @@ class ProxySessionFactory:
 
 
 @asynccontextmanager
-async def isolated_max_client(socket_path,secret_dir,sid,*,context=None,key_path=None):
+async def isolated_max_client(socket_path,secret_dir,sid,*,context=None,key_path=None,require_account_binding=False):
+    from app.max_account_binding import bound_viewer
+    if require_account_binding and key_path is None:raise PermissionError('Encrypted account binding required')
+    viewer=bound_viewer(secret_dir,sid,key_path,required=require_account_binding) if key_path is not None else None
     ctx=verified_context(context);values=load_worker_secret(secret_dir,sid,key_path=key_path);proxy=LoopbackProxy(socket_path);factory=None
     try:
         url=await proxy.start();factory=ProxySessionFactory(url,ctx)
-        yield MaxClient(token=values['MAX_TOKEN'],device_id=values['MAX_DEVICE_ID'],debug=False,session_factory=factory)
+        yield MaxClient(token=values['MAX_TOKEN'],device_id=values['MAX_DEVICE_ID'],debug=False,session_factory=factory,expected_viewer=viewer)
     finally:
         if factory:factory.closed=True
         await proxy.close()
@@ -67,10 +70,10 @@ async def isolated_telegram_bot(socket_path,token,*,context=None,budget=None,poo
         yield BudgetedBot(bot,budget) if budget is not None else bot
 
 
-async def run_isolated_worker(stop,*,socket_path,secret_dir,sid,state,channel,key_file,forum,actor,context=None,secret_key_path=None,profile=None,wal_maintenance=False):
+async def run_isolated_worker(stop,*,socket_path,secret_dir,sid,state,channel,key_file,forum,actor,context=None,secret_key_path=None,profile=None,wal_maintenance=False,require_account_binding=False):
     """Trusted composition; caller owns stop event and container isolation."""
     from app.isolated_worker_runtime import IsolatedWorkerRuntime
-    async with isolated_max_client(socket_path,secret_dir,sid,context=context,key_path=secret_key_path) as client:
+    async with isolated_max_client(socket_path,secret_dir,sid,context=context,key_path=secret_key_path,require_account_binding=require_account_binding) as client:
         runtime=IsolatedWorkerRuntime(sid,state,channel,key_file,forum,actor,client)
         runtime.profile=profile;runtime.listener.profile=profile
         if wal_maintenance:
@@ -101,3 +104,22 @@ async def run_isolated_gateway(stop,*,socket_path,registry,channels,context=None
             except BaseException:
                 await runtime.close();raise
         await runtime.run(stop)
+
+
+async def probe_max_identity(socket_path,values,*,context=None):
+    """Trusted proxy-only authentication probe, no worker, journals or handlers."""
+    ctx=verified_context(context);proxy=LoopbackProxy(socket_path);factory=None;task=None
+    try:
+        url=await proxy.start();factory=ProxySessionFactory(url,ctx)
+        client=MaxClient(token=values['MAX_TOKEN'],device_id=values['MAX_DEVICE_ID'],debug=False,session_factory=factory)
+        ready=asyncio.get_running_loop().create_future()
+        async def observed(_):
+            if not ready.done() and client._authorized:ready.set_result(client._my_id)
+        client.on_ready(observed);task=asyncio.create_task(client.run())
+        done,_=await asyncio.wait((ready,task),timeout=10,return_when=asyncio.FIRST_COMPLETED)
+        if ready not in done or not client._authorized or client._my_id!=ready.result():raise PermissionError('MAX identity not confirmed')
+        return ready.result()
+    finally:
+        if task:task.cancel();await asyncio.gather(task,return_exceptions=True)
+        if factory:factory.closed=True
+        await proxy.close()

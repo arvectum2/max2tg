@@ -13,7 +13,7 @@ from app.worker_secrets import install_worker_secret,load_worker_secret,build_ma
 
 UID=65532
 
-async def _prepare(*,defer_second=False,encrypted=False,tenants=2):
+async def _prepare(*,defer_second=False,encrypted=False,tenants=2,defer_all=False):
     assert tenants in (2,4,8,16,32,64)
     dirs=['registry']+[f'{part}{i}' for i in range(tenants) for part in ('channel','state','secret')]
     for name in dirs:
@@ -38,7 +38,7 @@ async def _prepare(*,defer_second=False,encrypted=False,tenants=2):
         assert prepare_worker(*folders,sid,actor,forum,key,key_path=kp) # idempotent local provisioning
         def check(s,a,f,k):return check_worker(*folders,s,a,f,k.read_bytes(),key_path=kp)
         onboarding.confirm_provisioned(req,check=check);assert not r.get(sid)['desired_active']
-        if not (defer_second and i==1):
+        if not defer_all and not (defer_second and i==1):
             assert await onboarding.activate(req,bot,check=check)==sid
             onboarding.plane.bind_topic(sid,42,77,actor)
         sessions.append([sid,actor,forum])
@@ -51,7 +51,7 @@ async def _prepare(*,defer_second=False,encrypted=False,tenants=2):
     print(json.dumps(sessions),flush=True)
 
 
-def prepare(*,defer_second=False,encrypted=False,tenants=2):asyncio.run(_prepare(defer_second=defer_second,encrypted=encrypted,tenants=tenants))
+def prepare(*,defer_second=False,encrypted=False,tenants=2,defer_all=False):asyncio.run(_prepare(defer_second=defer_second,encrypted=encrypted,tenants=tenants,defer_all=defer_all))
 
 
 def assert_sandbox():
