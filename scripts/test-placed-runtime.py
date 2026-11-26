@@ -8,7 +8,8 @@ from app.deployment_plan import build_plan,_verify_stopped,validate_bind_sources
 from app.container_supervisor import DockerBackend
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--image',required=True);p.add_argument('--native-volumes',action='store_true');p.add_argument('--load',type=int,choices=range(1,26));p.add_argument('--tenants',type=int,choices=(2,4,8,16,32,64),default=2);p.add_argument('--profile',action='store_true');p.add_argument('--long-poll',action='store_true');p.add_argument('--mixed',action='store_true');p.add_argument('--soak',action='store_true');p.add_argument('--storage-check',action='store_true');p.add_argument('--wal-maintenance',action='store_true');p.add_argument('--delay150',action='store_true');p.add_argument('--balanced',action='store_true');p.add_argument('--balanced-fault',action='store_true');p.add_argument('--reconcile-revoked',action='store_true');p.add_argument('--operator-lifecycle',action='store_true');p.add_argument('--operator-recovery',action='store_true');p.add_argument('--operator-backup',action='store_true');p.add_argument('--operator-restore',action='store_true');p.add_argument('--operator-sessions',action='store_true');a=p.parse_args();
+    p=argparse.ArgumentParser();p.add_argument('--image',required=True);p.add_argument('--native-volumes',action='store_true');p.add_argument('--load',type=int,choices=range(1,26));p.add_argument('--tenants',type=int,choices=(2,4,8,16,32,64),default=2);p.add_argument('--profile',action='store_true');p.add_argument('--long-poll',action='store_true');p.add_argument('--mixed',action='store_true');p.add_argument('--soak',action='store_true');p.add_argument('--storage-check',action='store_true');p.add_argument('--wal-maintenance',action='store_true');p.add_argument('--delay150',action='store_true');p.add_argument('--balanced',action='store_true');p.add_argument('--balanced-fault',action='store_true');p.add_argument('--reconcile-revoked',action='store_true');p.add_argument('--operator-lifecycle',action='store_true');p.add_argument('--operator-recovery',action='store_true');p.add_argument('--operator-backup',action='store_true');p.add_argument('--operator-restore',action='store_true');p.add_argument('--operator-sessions',action='store_true');p.add_argument('--account-binding',action='store_true');a=p.parse_args();
+    if a.account_binding and not (a.native_volumes and a.tenants==2 and not (a.load or a.mixed or a.balanced_fault or a.operator_lifecycle)):p.error('Account binding requires separate two-session native fixture')
     if a.operator_sessions and not (a.operator_lifecycle and not a.operator_backup):p.error('Session operations require a separate stopped lifecycle fixture')
     if a.operator_restore and not a.operator_backup:p.error('Restore requires operator backup fixture')
     if a.operator_backup and not a.operator_lifecycle:p.error('Backup requires operator lifecycle fixture')
@@ -60,7 +61,7 @@ def main():
                     vol[n]=d.call('volume','create','--label',label,'m2tg-placement-'+owner+'-'+n)
                     v=d.volume(vol[n]);assert v.get('Labels',{}).get('max2tg.placement')==owner and v['Driver']=='local' and not v.get('Options')
                 args=args[:-3]+[z for n,v in vol.items() for z in ('--mount',f'type=volume,source={v},target=/{n}')]+args[-3:]
-            d.call('run','-d','--name',initname,*args,'-m',module,'init',*([str(a.tenants)] if a.native_volumes else []));wait(lambda:d.inspect(initname)['State']['Status']=='exited',timeout=150 if a.tenants==64 else 100 if a.tenants==32 else 75)
+            d.call('run','-d','--name',initname,*args,'-m',module,'init',*([str(a.tenants)] if a.native_volumes else []),*(['account-binding'] if a.account_binding else []));wait(lambda:d.inspect(initname)['State']['Status']=='exited',timeout=150 if a.tenants==64 else 100 if a.tenants==32 else 75)
             assert d.inspect(initname)['State']['ExitCode']==0,d.call('logs',initname)
             sessions=json.loads(d.call('logs',initname));assert len(sessions)==a.tenants
             sids=[x[0] for x in sessions];plan=build_plan(owner,image,sids,data=fixture/'data',keys=fixture/'keys',backup=fixture/'backup')
@@ -75,6 +76,7 @@ def main():
             for role,s in plan['services'].items():
                 s['profiles']=['acceptance-only'];s['command']=['-m','tests.placement_runtime_fixture',role if not role.startswith('worker-') else 'worker',json.dumps(sessions) if role in ('gateway','broker') else role[7:]];s['volumes'].append(bind(code/'tests','/app/tests'))
                 if a.operator_lifecycle:s['command'].append('operator')
+                if a.account_binding:s['command'].append('account-binding')
                 if role=='broker':
                     s['volumes'].append(bind(cert,'/cert'))
                     if a.long_poll:s['command'].append('long-poll')
@@ -234,7 +236,16 @@ def main():
                     print('OPERATOR LIFECYCLE PASS '+json.dumps({'containers':4,'cycles':2,'same_ids':True,'max_effects':4,'tg_effects':2,'clean_stop':True,'live_launch_authorized':False},sort_keys=True),flush=True)
                 finally:ctl.close()
                 return
-            start_broker();d.start(gateway);wait(ready,timeout=90 if a.tenants==64 else 45 if a.tenants==32 else 20)
+            start_broker()
+            def account_action(i,action):
+                assert d.inspect(plan['services']['gateway']['container_name'])['State']['Running'] is False
+                assert d.inspect(plan['services']['worker-'+sids[i]]['container_name'])['State']['Running'] is False
+                mounts=[z for n,target,ro in [('registry','registry',False),(f'state{i}','state',False),(f'channel{i}','channel',False),(f'secret{i}','secret',False),(f'keys{i}','keys',True),(f'net{i}','network',True)] for z in ('--mount',f'type=volume,source={vol[n]},target=/{target}'+(',readonly' if ro else ''))]
+                return json.loads(d.call('run','--rm','--name',adminname,'--network','none','--read-only','--pull','never','--user','65532:65532','--cap-drop','ALL','--security-opt','no-new-privileges','--memory','256m','--pids-limit','64','--label',label,*mounts,'--mount',f'type=bind,source={code / "tests"},target=/app/tests,readonly','--entrypoint','python',image,'-m','tests.account_binding_fixture',action,sids[i]))
+            if a.account_binding:
+                for i in range(2):assert account_action(i,'bind')=={'bound':True}
+                assert not counts()['tg'] and not counts()['max']
+            d.start(gateway);wait(ready,timeout=90 if a.tenants==64 else 45 if a.tenants==32 else 20)
             for i,cid in enumerate(workers):
                 d.start(cid)
                 if a.tenants==64 and (i+1)%16==0:
@@ -243,6 +254,20 @@ def main():
                     if sum(_mib(x['MemUsage'].split('/')[0]) for x in running)>ram_cap or sum(float(x['CPUPerc'].rstrip('%')) for x in running)>cpu_cap:raise RuntimeError('Cohort startup resource stop limit exceeded')
             touch('phase1');wait(lambda:receipts(a.tenants) and len(counts().get('tg',[]))==a.tenants and len(counts().get('max',[]))==a.tenants,timeout=120 if a.tenants==64 else 75 if a.tenants==32 else 45)
             print(f'Actual run_isolated_gateway/worker: {a.tenants}+{a.tenants} confirmed on '+('native volume' if a.native_volumes else 'bind')+' placement',flush=True)
+            if a.account_binding:
+                wait(lambda:all(ledger(cid,'/state/to-telegram.sqlite3','worker_telegram_intents')=={'SENT':1} for cid in workers),timeout=15)
+                d.stop(workers[0]);d.stop(gateway)
+                assert account_action(0,'renew')=={'foreign_refused':True,'same_account_renewed':True,'receipts_unchanged':True}
+                assert sorted(counts()['tg'])==[[-10001,'outgoing-1'],[-10000,'outgoing-0']] and len(counts()['max'])==2
+                baseline=counts()['auth'][0];d.start(gateway);wait(ready);d.start(workers[0]);wait(lambda:counts()['auth'][0]>baseline and 0 in (read(broker,'/network/telegram/broker-health.json') or {}).get('connected',[]))
+                touch('phase2');wait(lambda:receipts(4) and len(counts()['max'])==4,timeout=35)
+                exec_py(broker,'from pathlib import Path;Path("/network/telegram/load-count").write_text("1")')
+                wait(lambda:ledger(gateway,'/registry/inbox.sqlite3','telegram_ingress')=={'ACKED':6} and ledger(gateway,'/registry/telegram-egress.sqlite3','telegram_egress')=={'SENT':4},timeout=40)
+                wait(lambda:all(ledger(cid,'/state/to-telegram.sqlite3','worker_telegram_intents')=={'SENT':2} for cid in workers),timeout=15)
+                assert sorted(counts()['tg'])==sorted([[-10000-i,t] for i in range(2) for t in (f'outgoing-{i}',f'load-out-{i}-0')])
+                assert sorted(counts()['max'])==sorted([[i,t] for i in range(2) for t in (f'incoming-{i}-0',f'incoming-{i}-1',f'load-in-{i}-0')])
+                print('ACCOUNT BINDING PASS '+json.dumps({'bound_accounts':2,'foreign_refused':True,'same_account_renewed':True,'previous_effects':4,'new_effects':6,'receipts_unchanged_on_renewal':True},sort_keys=True),flush=True)
+                return
             if a.load or a.mixed:
                 from app.load_metrics import summarize_load,_mib
                 samples=[]
@@ -432,7 +457,7 @@ def main():
                 for v in vol.values():
                     if d.volume(v).get('Labels',{}).get('max2tg.placement')==owner:d.call('volume','rm',v)
                 assert not d.call('volume','ls','-q','--filter','label='+label)
-                if a.load or a.mixed or a.balanced_fault or a.operator_lifecycle:print('LOAD CLEANUP PASS',flush=True)
+                if a.load or a.mixed or a.balanced_fault or a.operator_lifecycle or a.account_binding:print('LOAD CLEANUP PASS',flush=True)
             else:subprocess.run(['docker','run','--rm',*setup_args(),'-c','import shutil;from pathlib import Path;[(shutil.rmtree(p) if p.is_dir() else p.unlink()) for p in Path("/fixture").iterdir()]'],check=True,capture_output=True,timeout=60)
     print('PLACED RUNTIME PASS; disposable resources removed',flush=True)
 if __name__=='__main__':main()

@@ -118,7 +118,9 @@ class MaxClient:
     APP_VERSION = "26.11.9"
     HEARTBEAT_SEC = 30
     RECONNECT_SEC = 5
-    def __init__(self, token: str, device_id: str, chat_ids: str | None = None, debug: bool = False, *, session_factory=None):
+    def __init__(self, token: str, device_id: str, chat_ids: str | None = None, debug: bool = False, *, session_factory=None, expected_viewer=None):
+        if expected_viewer is not None and (type(expected_viewer) is not int or not 0<expected_viewer<2**63):raise ValueError('Invalid pinned MAX viewer')
+        self._expected_viewer = expected_viewer
         self._session_factory = session_factory
         self.token = token
         self.device_id = device_id
@@ -175,6 +177,7 @@ class MaxClient:
     async def _send(self, opcode: int, payload: dict, *, pending=None) -> int:
         if not self._ws or self._ws.closed:
             return -1
+        if getattr(self,'_expected_viewer',None) is not None and not self._authorized and opcode not in (OpCode.HANDSHAKE,OpCode.AUTH_SNAPSHOT,OpCode.HEARTBEAT_PING):return -1
         seq = self._seq
         if self._binary_transport and seq >= 32767:
             # The web protocol uses signed 16-bit sequence numbers. Reconnect
@@ -347,6 +350,8 @@ class MaxClient:
         seq = data.get("seq")
         payload = data.get("payload", {})
 
+        if getattr(self,'_expected_viewer',None) is not None and not self._authorized and op not in (OpCode.HANDSHAKE,OpCode.AUTH_SNAPSHOT,OpCode.HEARTBEAT_PING,OpCode.LOGOUT):return
+
         # cmd=1 is a response to our request — resolve the pending future
         if cmd == 1 and seq in self._pending:
             fut = self._pending.pop(seq)
@@ -386,6 +391,11 @@ class MaxClient:
                     log.error("MAX auth response has no valid viewer; refusing unsafe readiness")
                     if self._ws is not None:
                         await self._ws.close()
+                    return
+                if getattr(self,'_expected_viewer',None) is not None and viewer!=self._expected_viewer:
+                    self._authorized=False;self._auth_required=True;self._my_id=None
+                    log.error('MAX account identity mismatch; refusing readiness')
+                    if self._ws is not None:await self._ws.close()
                     return
                 self._my_id = viewer
                 self._authorized = True

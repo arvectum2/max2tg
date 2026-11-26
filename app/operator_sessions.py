@@ -1,5 +1,5 @@
 """Trusted offline operator metadata/provisioning interface for shared sessions.
-No public authentication, live container operations or credential replacement.
+No public authentication or live container operations.
 Caller stops gateway and affected worker and excludes other provisioning writers.
 """
 from contextlib import ExitStack,contextmanager
@@ -14,9 +14,10 @@ from app.worker_provision import prepare_worker,check_worker
 
 
 class OperatorSessions:
-    def __init__(self,registry,*,provisioning_stopped=False):
+    def __init__(self,registry,*,provisioning_stopped=False,require_account_binding=False):
         if provisioning_stopped is not True:raise PermissionError('Exclusive provisioning window required')
-        self.registry=registry;self.stack=ExitStack();self.closed=False
+        if type(require_account_binding) is not bool:raise ValueError('Explicit account binding mode required')
+        self.require_account_binding=require_account_binding;self.registry=registry;self.stack=ExitStack();self.closed=False
         try:
             for n,shared in [('shared-gateway.lock',False),('operator-sessions.lock',False),('shared-provisioning.lock',True)]:
                 lock=RuntimeLock(registry.root/n,shared=shared);self.stack.callback(lock.close)
@@ -58,8 +59,27 @@ class OperatorSessions:
         if not prepare_worker(*paths,row['sid'],int(row['actor']),int(row['forum']),self.onboarding.ipc_key(request).read_bytes(),key_path=key):raise PermissionError('Worker preparation failed')
         with self._stopped_worker(request,*paths,key):self.onboarding.confirm_provisioned(request,check=self._check(paths,key))
         return self.status(request)
+    async def bind_account(self,request,state,channel,secret,key_path,*,probe):
+        from app.max_account_binding import bind_initial
+        row=self.status(request)
+        if row['state']!='PROVISIONED':raise PermissionError('Initial account binding requires a fresh provisioned session')
+        paths,key=self._layout(state,channel,secret,key_path)
+        with self._stopped_worker(request,*paths,key):pass
+        await bind_initial(paths[0],paths[2],row['sid'],key,probe=probe)
+        return self.status(request)
+    async def reauthenticate(self,request,state,channel,secret,key_path,candidate,*,probe):
+        from app.max_account_binding import replace_bound_credentials
+        row=self.status(request)
+        if row['state']!='PAUSED':raise PermissionError('Paused session required')
+        paths,key=self._layout(state,channel,secret,key_path)
+        with self._stopped_worker(request,*paths,key):pass
+        await replace_bound_credentials(paths[0],paths[2],row['sid'],key,candidate,probe=probe)
+        return self.status(request)
     async def activate(self,request,bot,state,channel,secret,key_path):
-        with self._stopped_worker(request,state,channel,secret,key_path) as (paths,key):await self.onboarding.activate(request,bot,check=self._check(paths,key))
+        from app.max_account_binding import bound_viewer
+        with self._stopped_worker(request,state,channel,secret,key_path) as (paths,key):
+            sid=self.onboarding.row(request)['sid'];bound_viewer(paths[2],sid,key,required=self.require_account_binding)
+            await self.onboarding.activate(request,bot,check=self._check(paths,key))
         return self.status(request)
     def pause(self,request,state,channel,secret,key_path):
         with self._stopped_worker(request,state,channel,secret,key_path,require_secret=False):
