@@ -60,6 +60,13 @@ class NamespaceHandle:
                 or _identity(os.stat(f'/proc/{self.pid}/ns/net'))!=self.identity):
             _deny('Held namespace identity changed')
 
+    def binding(self):
+        self.check()
+        with open('/proc/sys/kernel/random/boot_id',encoding='ascii') as stream:
+            boot=stream.read().strip()
+        if not re.fullmatch('[0-9a-f-]{36}',boot):_deny('Invalid boot identity')
+        return {'boot':boot,'pid':self.pid,'start':self.started,'namespace':list(self.identity)}
+
     def _nft(self,args,*,data=None):
         self.check()
         result=subprocess.run(

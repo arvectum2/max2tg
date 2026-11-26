@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import ssl
 import subprocess
+import tempfile
 import time
 import sys
 
@@ -16,6 +17,7 @@ from app.max_client import OpCode
 from app.max_wire import encode, decode
 from app.operator_pin_rotation import NamespaceHandle, RotationGrant, frame, request, read_frame_fd, read_receipt
 from app.pinned_broker import PinnedBroker
+from app.rotation_fence import RotationFence
 from tests.linux_live_rotation_fixture import candidate
 from tests.linux_veth_fixture import IPS, DROP, call, isolated, unprivileged, denied
 
@@ -206,10 +208,19 @@ def controller(ns,cert,old,root,journals=False):
     info=os.stat(f'/proc/{pid}/ns/net')
     identity=(info.st_dev,info.st_ino)
     handle=NamespaceHandle(pid,expected=identity)
-    grant=RotationGrant(handle,old,candidate(old))
+    anchor=None;fence=None
     keeper=subprocess.Popen(['unshare','--net','sleep','45'])
     broker_process=None;client_process=None
     try:
+        if journals:
+            anchor=tempfile.TemporaryDirectory(prefix='rotation-fence-')
+            fence=RotationFence(anchor.name,handle)
+            nonce=fence.arm(old,candidate(old))
+            execute=fence.execute
+        else:
+            grant=RotationGrant(handle,old,candidate(old))
+            nonce=grant.nonce
+            execute=grant.execute
         for _ in range(50):
             if os.readlink('/proc/self/ns/net')!=os.readlink(f'/proc/{keeper.pid}/ns/net'):
                 break
@@ -223,15 +234,21 @@ def controller(ns,cert,old,root,journals=False):
         broker_process=subprocess.Popen(
             ['/usr/bin/nsenter',f'--net=/proc/self/fd/{handle.fd}','--',
              *DROP,sys.executable,'-m','tests.linux_client_rotation_fixture','broker',
-             root,str(old.expires_at),grant.nonce,str(identity[0]),str(identity[1]),str(handle.fd),*(['journals'] if journals else [])],
+             root,str(old.expires_at),nonce,str(identity[0]),str(identity[1]),str(handle.fd),*(['journals'] if journals else [])],
             pass_fds=(handle.fd,),stdin=subprocess.PIPE,stdout=subprocess.PIPE)
         client_process=subprocess.Popen([*client_ns,*DROP,sys.executable,'-m',
             'tests.linux_client_rotation_fixture','client',cert,root,*(['journals'] if journals else [])])
-        receipt=grant.execute(read_frame_fd(broker_process.stdout.fileno(),timeout=20 if journals else 12))
+        receipt=execute(read_frame_fd(broker_process.stdout.fileno(),timeout=20 if journals else 12))
         out,_=broker_process.communicate(receipt,timeout=25 if journals else 20)
         print(out.decode(),flush=True)
         assert broker_process.returncode==0 and b'ACTUAL CLIENT ROTATION BROKER PASS' in out
         assert client_process.wait(timeout=3)==0
+        if journals:
+            fence.close();fence=None
+            with RotationFence(anchor.name,handle) as recovered:
+                assert recovered.inspect()['state']=='KERNEL_VERIFIED'
+                assert recovered.inspect()['matches']==['replacement']
+            print('DURABLE CONTROLLER FENCE PASS',flush=True)
     finally:
         try:
             if broker_process is not None and broker_process.poll() is None:
@@ -240,6 +257,8 @@ def controller(ns,cert,old,root,journals=False):
             if client_process is not None and client_process.poll() is None:
                 client_process.wait(timeout=20)
         finally:
+            if fence is not None:fence.close()
+            if anchor is not None:anchor.cleanup()
             handle.close()
             keeper.terminate()
             keeper.wait(timeout=3)
