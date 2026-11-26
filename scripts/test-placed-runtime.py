@@ -8,7 +8,8 @@ from app.deployment_plan import build_plan,_verify_stopped,validate_bind_sources
 from app.container_supervisor import DockerBackend
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--image',required=True);p.add_argument('--native-volumes',action='store_true');p.add_argument('--load',type=int,choices=range(1,26));p.add_argument('--tenants',type=int,choices=(2,4,8,16,32,64),default=2);p.add_argument('--profile',action='store_true');p.add_argument('--long-poll',action='store_true');p.add_argument('--mixed',action='store_true');p.add_argument('--soak',action='store_true');p.add_argument('--storage-check',action='store_true');p.add_argument('--wal-maintenance',action='store_true');p.add_argument('--delay150',action='store_true');p.add_argument('--balanced',action='store_true');p.add_argument('--balanced-fault',action='store_true');p.add_argument('--reconcile-revoked',action='store_true');p.add_argument('--operator-lifecycle',action='store_true');p.add_argument('--operator-recovery',action='store_true');p.add_argument('--operator-backup',action='store_true');p.add_argument('--operator-restore',action='store_true');a=p.parse_args();
+    p=argparse.ArgumentParser();p.add_argument('--image',required=True);p.add_argument('--native-volumes',action='store_true');p.add_argument('--load',type=int,choices=range(1,26));p.add_argument('--tenants',type=int,choices=(2,4,8,16,32,64),default=2);p.add_argument('--profile',action='store_true');p.add_argument('--long-poll',action='store_true');p.add_argument('--mixed',action='store_true');p.add_argument('--soak',action='store_true');p.add_argument('--storage-check',action='store_true');p.add_argument('--wal-maintenance',action='store_true');p.add_argument('--delay150',action='store_true');p.add_argument('--balanced',action='store_true');p.add_argument('--balanced-fault',action='store_true');p.add_argument('--reconcile-revoked',action='store_true');p.add_argument('--operator-lifecycle',action='store_true');p.add_argument('--operator-recovery',action='store_true');p.add_argument('--operator-backup',action='store_true');p.add_argument('--operator-restore',action='store_true');p.add_argument('--operator-sessions',action='store_true');a=p.parse_args();
+    if a.operator_sessions and not (a.operator_lifecycle and not a.operator_backup):p.error('Session operations require a separate stopped lifecycle fixture')
     if a.operator_restore and not a.operator_backup:p.error('Restore requires operator backup fixture')
     if a.operator_backup and not a.operator_lifecycle:p.error('Backup requires operator lifecycle fixture')
     if a.operator_recovery and not a.operator_lifecycle:p.error('Recovery requires operator lifecycle fixture')
@@ -131,6 +132,12 @@ def main():
                         at=snap.get('at',0);return type(at) in (int,float) and start<=at and -1<=time.time()-at<=5
                     except subprocess.CalledProcessError:return False
                 def controller():return SyntheticLifecycle(lifecycle_root,plan,d,probe,observe=observation)
+                def session_action(action):
+                    assert ctl.status()['state']=='STOPPED'
+                    assert all(d.inspect(s['container_name'])['State']['Status']=='exited' for s in plan['services'].values())
+                    mounts=[z for n,target,ro in [('registry','registry',False),('state0','state',False),('channel0','channel',False),('secret0','secret',True),('keys0','keys',True)] for z in ('--mount',f'type=volume,source={vol[n]},target=/{target}'+(',readonly' if ro else ''))]
+                    return json.loads(d.call('run','--rm','--name',adminname,'--network','none','--read-only','--pull','never','--user','65532:65532','--cap-drop','ALL','--security-opt','no-new-privileges','--memory','256m','--pids-limit','64','--label',label,*mounts,'--mount',f'type=bind,source={code / "tests"},target=/app/tests,readonly','--entrypoint','python',image,'-m','tests.operator_sessions_fixture',action,sids[0]))
+
                 ctl=controller()
                 try:
                     ctl.register();assert ctl.status()['state']=='HELD';assert ctl.start()['state']=='RUNNING'
@@ -149,6 +156,10 @@ def main():
                             assert all(d.inspect(s['container_name'])['Id']==ids[r] for r,s in plan['services'].items())
                         print('OPERATOR RECOVERY PASS '+json.dumps({'recovered_roles':3,'same_ids':True,'exact_effects_unchanged':True,'persisted_attempts':3},sort_keys=True),flush=True)
                     auth_baseline[:]=counts()['auth'];assert ctl.start()['state']=='RUNNING';assert ctl.stop()['state']=='STOPPED'
+                    if a.operator_sessions:
+                        assert session_action('pause')=={'state':'PAUSED','receipts_unchanged':True,'other_active':True}
+                        assert session_action('resume')=={'state':'ACTIVE','receipts_unchanged':True,'other_active':True}
+
                 finally:ctl.close()
                 ctl=controller()
                 try:
@@ -158,6 +169,9 @@ def main():
                     assert all(d.inspect(s['container_name'])['Id']==ids[role] for role,s in plan['services'].items())
                     assert all(ledger(cid,'/state/to-telegram.sqlite3','worker_telegram_intents')=={'SENT':1} for cid in workers)
                     auth_baseline[:]=counts()['auth'];assert ctl.stop()['state']=='STOPPED'
+                    if a.operator_sessions:
+                        assert session_action('revoke')=={'state':'REVOKED','receipts_unchanged':True,'other_active':True}
+                        print('OPERATOR SESSIONS PASS '+json.dumps({'paused':True,'resumed':True,'revoked':True,'receipts_unchanged':True,'other_active':True,'new_deliveries_after_resume':2},sort_keys=True),flush=True)
                     if a.operator_backup:
                         names=('snapshots','archive','backupkeys','anchor','restores')
                         for n in names:
