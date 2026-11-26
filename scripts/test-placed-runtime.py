@@ -7,8 +7,10 @@ from app.deployment_plan import build_plan,_verify_stopped,validate_bind_sources
 from app.container_supervisor import DockerBackend
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--image',required=True);p.add_argument('--native-volumes',action='store_true');p.add_argument('--load',type=int,choices=range(1,26));p.add_argument('--tenants',type=int,choices=(2,4,8,16,32),default=2);p.add_argument('--profile',action='store_true');p.add_argument('--long-poll',action='store_true');p.add_argument('--mixed',action='store_true');p.add_argument('--soak',action='store_true');p.add_argument('--storage-check',action='store_true');p.add_argument('--wal-maintenance',action='store_true');p.add_argument('--delay150',action='store_true');p.add_argument('--balanced',action='store_true');a=p.parse_args();
-    if (a.delay150 or a.balanced) and not (a.mixed and a.profile and a.long_poll and a.native_volumes):p.error('Experimental comparison requires native profiled mixed long polling')
+    p=argparse.ArgumentParser();p.add_argument('--image',required=True);p.add_argument('--native-volumes',action='store_true');p.add_argument('--load',type=int,choices=range(1,26));p.add_argument('--tenants',type=int,choices=(2,4,8,16,32),default=2);p.add_argument('--profile',action='store_true');p.add_argument('--long-poll',action='store_true');p.add_argument('--mixed',action='store_true');p.add_argument('--soak',action='store_true');p.add_argument('--storage-check',action='store_true');p.add_argument('--wal-maintenance',action='store_true');p.add_argument('--delay150',action='store_true');p.add_argument('--balanced',action='store_true');p.add_argument('--balanced-fault',action='store_true');a=p.parse_args();
+    if a.balanced_fault and not (a.native_volumes and a.tenants==2 and not (a.mixed or a.load or a.profile or a.long_poll or a.wal_maintenance)):p.error('Fault mode requires two native sessions without load flags')
+    if a.balanced_fault:a.balanced=True
+    if (a.delay150 or a.balanced) and not a.balanced_fault and not (a.mixed and a.profile and a.long_poll and a.native_volumes):p.error('Experimental comparison requires native profiled mixed long polling')
     if a.storage_check and not a.mixed:p.error('Storage check requires mixed workload')
     if a.wal_maintenance and not (a.storage_check or a.soak):p.error('WAL candidate requires resource checkpoints')
     if a.soak and not a.mixed:p.error('Soak requires mixed workload')
@@ -69,6 +71,7 @@ def main():
                     if a.mixed:s['command'].append('mixed')
                     if a.soak:s['command'].append('soak')
                     if a.delay150:s['command'].append('delay150')
+                    if a.balanced_fault:s['command'].append('balanced-fault')
                 else:
                     if a.profile:s['command'].append('profile')
                     if a.wal_maintenance:s['command'].append('wal')
@@ -199,6 +202,38 @@ def main():
             for sid,cid in zip(sids,workers):
                 c=d.inspect(plan['services']['worker-'+sid]['container_name']);assert c['Id']==cid and c['State']['StartedAt']==worker_starts[sid] and c['State']['Running'] and c['RestartCount']==0
             print('4 ACKED + 2 SENT + 1 UNKNOWN; exact external effects, same workers',flush=True)
+            if a.balanced_fault:
+                def persisted_until():return float(exec_py(gateway,'import sqlite3;d=sqlite3.connect("file:/registry/capsules.sqlite3?mode=ro",uri=True);print(d.execute("SELECT until FROM telegram_api_budget").fetchone()[0])'))
+                touch('rate-trigger');wait(lambda:counts().get('rate_until',0)>time.time() and persisted_until()>time.time(),timeout=15)
+                observed=time.time();d.call('kill','--signal','KILL',gateway);d.start(gateway)
+                wait(lambda:ready() and counts().get('after_rate'),timeout=35)
+                rate=counts();assert not any(t>=observed for t in rate.get('early_at',[]))
+                assert len(rate['tg'])==2 and len(rate['max'])==5
+                print('Balanced RetryAfter: persisted cooldown across gateway kill, no calls in observed cooldown interval',flush=True)
+                def central_rows():
+                    return json.loads(exec_py(gateway,'import sqlite3,json;d=sqlite3.connect("file:/registry/telegram-egress.sqlite3?mode=ro",uri=True);print(json.dumps(dict(d.execute("SELECT text,status FROM telegram_egress"))))'))
+                touch('crash-send')
+                def crash_boundary():
+                    rows=central_rows();return counts().get('crash_effect_observed') and rows.get('crash-out-0-0')=='SENDING' and rows.get('crash-out-1-0')=='SENT'
+                wait(crash_boundary,timeout=15)
+                d.call('kill','--signal','KILL',gateway);d.start(gateway);wait(ready,timeout=30)
+                wait(lambda:ledger(workers[0],'/state/to-telegram.sqlite3','worker_telegram_intents')=={'SENT':1,'UNKNOWN':1} and ledger(workers[1],'/state/to-telegram.sqlite3','worker_telegram_intents')=={'SENT':2},timeout=20)
+                assert central_rows()['crash-out-0-0']=='UNKNOWN' and central_rows()['crash-out-1-0']=='SENT'
+                assert counts()['tg'].count([-10000,'crash-out-0-0'])==1 and counts()['tg'].count([-10001,'crash-out-1-0'])==1
+                print('Balanced gateway killed during actual send: one UNKNOWN, other tenant SENT, no replay',flush=True)
+                touch('fault-send')
+                def revoked():return exec_py(gateway,'import sqlite3;d=sqlite3.connect("file:/registry/capsules.sqlite3?mode=ro",uri=True);print(d.execute("SELECT stage FROM shared_onboarding WHERE forum=\'-10000\'").fetchone()[0])')=='REVOKED'
+                wait(revoked,timeout=20)
+                during=counts();assert during.get('revocation_emitted') and not during.get('revocation_response_released'),'Revocation not observed before response release'
+                wait(lambda:counts().get('revocation_response_released') and counts()['tg'].count([-10001,'fault-out-1-1'])==1,timeout=20)
+                wait(lambda:ledger(workers[1],'/state/to-telegram.sqlite3','worker_telegram_intents')=={'SENT':4},timeout=15)
+                wait(lambda:exec_py(gateway,f'from pathlib import Path;print(not Path("/channels/{sids[0]}/egress.sock").exists() and Path("/channels/{sids[1]}/egress.sock").is_socket())')=='True')
+                result=counts();assert result.get('parallel_during_revoke') and not result.get('forbidden_calls'),result.get('tg')
+                assert sorted(result['tg'])==sorted([[-10000,'outgoing-0'],[-10001,'outgoing-1'],[-10000,'crash-out-0-0'],[-10001,'crash-out-1-0'],[-10000,'fault-out-0-0'],[-10001,'fault-out-1-0'],[-10001,'fault-out-1-1']])
+                out=ledger(gateway,'/registry/telegram-egress.sqlite3','telegram_egress');assert out=={'SENT':6,'UNKNOWN':1,'BLOCKED':1};rows=central_rows();assert rows['fault-out-0-0']=='SENT' and rows['fault-out-0-1']=='BLOCKED'
+                assert ledger(gateway,'/registry/inbox.sqlite3','telegram_ingress')=={'ACKED':4,'UNKNOWN':1}
+                print('BALANCED FAULT RESULT '+json.dumps({'cooldown_early_after_observation':0,'crash_during_send':True,'revoked_before_response':True,'other_tenant_parallel':True,'central_egress':out,'worker_b':ledger(workers[1],'/state/to-telegram.sqlite3','worker_telegram_intents'),'worker_a':ledger(workers[0],'/state/to-telegram.sqlite3','worker_telegram_intents'),'max_effects':len(result['max']),'tg_effects':len(result['tg'])},sort_keys=True),flush=True)
+
         except Exception as exc:
             if isinstance(exc,subprocess.CalledProcessError):print(exc.stdout,exc.stderr,flush=True)
             for cid in [initname,*ids.values()]:
@@ -216,7 +251,7 @@ def main():
                 for v in vol.values():
                     if d.volume(v).get('Labels',{}).get('max2tg.placement')==owner:d.call('volume','rm',v)
                 assert not d.call('volume','ls','-q','--filter','label='+label)
-                if a.load or a.mixed:print('LOAD CLEANUP PASS',flush=True)
+                if a.load or a.mixed or a.balanced_fault:print('LOAD CLEANUP PASS',flush=True)
             else:subprocess.run(['docker','run','--rm',*setup_args(),'-c','import shutil;from pathlib import Path;[(shutil.rmtree(p) if p.is_dir() else p.unlink()) for p in Path("/fixture").iterdir()]'],check=True,capture_output=True,timeout=60)
     print('PLACED RUNTIME PASS; disposable resources removed',flush=True)
 if __name__=='__main__':main()

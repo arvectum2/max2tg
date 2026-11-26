@@ -96,3 +96,5 @@ jobs:
         run: python3 scripts/test-placed-runtime.py --image max2tg:ci --native-volumes --tenants 4 --profile --long-poll --mixed --storage-check --wal-maintenance
       - name: Verify opt-in balanced gateway with delayed synthetic API
         run: python3 scripts/test-placed-runtime.py --image max2tg:ci --native-volumes --tenants 4 --profile --long-poll --mixed --storage-check --wal-maintenance --delay150 --balanced
+      - name: Verify balanced gateway cooldown crash and revocation
+        run: python3 scripts/test-placed-runtime.py --image max2tg:ci --native-volumes --balanced-fault
