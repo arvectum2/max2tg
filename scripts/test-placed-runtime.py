@@ -7,7 +7,8 @@ from app.deployment_plan import build_plan,_verify_stopped,validate_bind_sources
 from app.container_supervisor import DockerBackend
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--image',required=True);p.add_argument('--native-volumes',action='store_true');p.add_argument('--load',type=int,choices=range(1,26));p.add_argument('--tenants',type=int,choices=(2,4,8,16,32,64),default=2);p.add_argument('--profile',action='store_true');p.add_argument('--long-poll',action='store_true');p.add_argument('--mixed',action='store_true');p.add_argument('--soak',action='store_true');p.add_argument('--storage-check',action='store_true');p.add_argument('--wal-maintenance',action='store_true');p.add_argument('--delay150',action='store_true');p.add_argument('--balanced',action='store_true');p.add_argument('--balanced-fault',action='store_true');p.add_argument('--reconcile-revoked',action='store_true');a=p.parse_args();
+    p=argparse.ArgumentParser();p.add_argument('--image',required=True);p.add_argument('--native-volumes',action='store_true');p.add_argument('--load',type=int,choices=range(1,26));p.add_argument('--tenants',type=int,choices=(2,4,8,16,32,64),default=2);p.add_argument('--profile',action='store_true');p.add_argument('--long-poll',action='store_true');p.add_argument('--mixed',action='store_true');p.add_argument('--soak',action='store_true');p.add_argument('--storage-check',action='store_true');p.add_argument('--wal-maintenance',action='store_true');p.add_argument('--delay150',action='store_true');p.add_argument('--balanced',action='store_true');p.add_argument('--balanced-fault',action='store_true');p.add_argument('--reconcile-revoked',action='store_true');p.add_argument('--operator-lifecycle',action='store_true');a=p.parse_args();
+    if a.operator_lifecycle and not (a.native_volumes and a.tenants==2 and not (a.load or a.mixed or a.balanced_fault or a.balanced or a.profile or a.long_poll or a.wal_maintenance or a.delay150 or a.storage_check or a.soak)):p.error('Operator lifecycle requires simple two-session native fixture')
     if a.reconcile_revoked and not a.balanced_fault:p.error('Reconciliation requires balanced fault fixture')
     if a.balanced_fault and not (a.native_volumes and a.tenants==2 and not (a.mixed or a.load or a.profile or a.long_poll or a.wal_maintenance)):p.error('Fault mode requires two native sessions without load flags')
     if a.balanced_fault:a.balanced=True
@@ -68,6 +69,7 @@ def main():
             else:assert validate_bind_sources(plan)==14
             for role,s in plan['services'].items():
                 s['profiles']=['acceptance-only'];s['command']=['-m','tests.placement_runtime_fixture',role if not role.startswith('worker-') else 'worker',json.dumps(sessions) if role in ('gateway','broker') else role[7:]];s['volumes'].append(bind(code/'tests','/app/tests'))
+                if a.operator_lifecycle:s['command'].append('operator')
                 if role=='broker':
                     s['volumes'].append(bind(cert,'/cert'))
                     if a.long_poll:s['command'].append('long-poll')
@@ -99,6 +101,37 @@ def main():
             def touch(name):exec_py(broker,f'from pathlib import Path;Path("/network/telegram/{name}").touch()')
             def start_broker():
                 at=time.time();d.start(broker);wait(lambda:(read(broker,'/network/telegram/broker-health.json') or {}).get('at',0)>=at)
+            if a.operator_lifecycle:
+                from app.operator_lifecycle import SyntheticLifecycle
+                from datetime import datetime
+                lifecycle_root=root/'lifecycle';lifecycle_root.mkdir(mode=0o700)
+                auth_baseline=[0,0]
+                def probe(role,cid,state):
+                    try:
+                        start=datetime.fromisoformat(state['StartedAt'].replace('Z','+00:00')).timestamp()
+                        if role=='broker':return (read(cid,'/network/telegram/broker-health.json') or {}).get('at',0)>=start
+                        if role=='gateway':
+                            snap=read(cid,'/registry/operator-health.json') or {};return snap.get('at',0)>=start and set(snap.get('sessions',{}))==set(sids) and all(v=={'active':True,'ready':True} for v in snap['sessions'].values())
+                        i=sids.index(role[7:]);return counts().get('auth',[0,0])[i]>auth_baseline[i] and exec_py(cid,'from pathlib import Path;print(Path("/channel/ingress.sock").is_socket())')=='True'
+                    except subprocess.CalledProcessError:return False
+                def controller():return SyntheticLifecycle(lifecycle_root,plan,d,probe)
+                ctl=controller()
+                try:
+                    ctl.register();assert ctl.status()['state']=='HELD';assert ctl.start()['state']=='RUNNING'
+                    touch('phase1');wait(lambda:receipts(2) and len(counts().get('tg',[]))==len(counts().get('max',[]))==2,timeout=45)
+                    wait(lambda:all(ledger(cid,'/state/to-telegram.sqlite3','worker_telegram_intents')=={'SENT':1} for cid in workers),timeout=15)
+                    auth_baseline[:]=counts()['auth'];assert ctl.start()['state']=='RUNNING';assert ctl.stop()['state']=='STOPPED'
+                finally:ctl.close()
+                ctl=controller()
+                try:
+                    assert ctl.status()['state']=='STOPPED';assert ctl.start()['state']=='RUNNING';touch('phase2');wait(lambda:receipts(4) and len(counts().get('max',[]))==4,timeout=35)
+                    assert sorted(counts()['tg'])==[[-10001,'outgoing-1'],[-10000,'outgoing-0']]
+                    assert sorted(counts()['max'])==sorted([[i,f'incoming-{i}-{j}'] for i in range(2) for j in range(2)])
+                    assert all(d.inspect(s['container_name'])['Id']==ids[role] for role,s in plan['services'].items())
+                    assert all(ledger(cid,'/state/to-telegram.sqlite3','worker_telegram_intents')=={'SENT':1} for cid in workers)
+                    assert ctl.stop()['state']=='STOPPED';print('OPERATOR LIFECYCLE PASS '+json.dumps({'containers':4,'cycles':2,'same_ids':True,'max_effects':4,'tg_effects':2,'clean_stop':True,'live_launch_authorized':False},sort_keys=True),flush=True)
+                finally:ctl.close()
+                return
             start_broker();d.start(gateway);wait(ready,timeout=90 if a.tenants==64 else 45 if a.tenants==32 else 20)
             for i,cid in enumerate(workers):
                 d.start(cid)
@@ -292,7 +325,7 @@ def main():
                 for v in vol.values():
                     if d.volume(v).get('Labels',{}).get('max2tg.placement')==owner:d.call('volume','rm',v)
                 assert not d.call('volume','ls','-q','--filter','label='+label)
-                if a.load or a.mixed or a.balanced_fault:print('LOAD CLEANUP PASS',flush=True)
+                if a.load or a.mixed or a.balanced_fault or a.operator_lifecycle:print('LOAD CLEANUP PASS',flush=True)
             else:subprocess.run(['docker','run','--rm',*setup_args(),'-c','import shutil;from pathlib import Path;[(shutil.rmtree(p) if p.is_dir() else p.unlink()) for p in Path("/fixture").iterdir()]'],check=True,capture_output=True,timeout=60)
     print('PLACED RUNTIME PASS; disposable resources removed',flush=True)
 if __name__=='__main__':main()
