@@ -28,7 +28,7 @@ async def marker(path, timeout=12):
             await asyncio.sleep(.05)
 
 
-async def server(cert, root):
+async def server(cert, root, journals=False):
     unprivileged()
     isolated([], {'lo','m2server'})
     ctx=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -59,6 +59,11 @@ async def server(cert, root):
                     await asyncio.sleep(12)
                 payload={'message':{'id':100+len(effects)}}
             await w.send_bytes(encode({'cmd':1,'seq':pkt['seq'],'opcode':op,'payload':payload}))
+            if journals and op==OpCode.AUTH_SNAPSHOT:
+                # Replayed pre-rotation event on reconnect is deliberately identical.
+                for i,text in ([(1,'before')] if ip==IPS[0] else [(1,'before'),(2,'after')]):
+                    await w.send_bytes(encode({'cmd':0,'seq':0,'opcode':OpCode.DISPATCH,
+                        'payload':{'chatId':42,'message':{'id':300+i,'sender':999,'text':text}}}))
         return w
 
     async def api(req):
@@ -66,14 +71,37 @@ async def server(cert, root):
         method=req.match_info['method']
         if method=='getMe':
             data={'id':900,'is_bot':True,'first_name':'Synthetic','username':'synthetic_bot'}
+        elif journals and method=='getChat':
+            data={'id':-10001,'type':'supergroup','title':'Synthetic','is_forum':True,
+                  'accent_color_id':0,'max_reaction_count':1,'accepted_gift_types':{
+                      'unlimited_gifts':False,'limited_gifts':False,'unique_gifts':False,
+                      'premium_subscription':False,'gifts_from_channels':False}}
+        elif journals and method=='getChatMemberCount':
+            data=2
+        elif journals and method=='getChatMember':
+            form=await req.post();uid=int(form['user_id'])
+            data={'user':{'id':uid,'is_bot':uid==900,'first_name':'Synthetic'},
+                  'status':'creator' if uid==100 else 'administrator','is_anonymous':False}
+            if uid==900:
+                data.update({k:True for k in ('can_be_edited','can_manage_chat','can_delete_messages','can_manage_video_chats','can_restrict_members','can_promote_members','can_change_info','can_invite_users','can_post_stories','can_edit_stories','can_delete_stories','can_manage_topics')})
         elif method=='getUpdates':
             data=[]
+            if journals:
+                form=await req.post()
+                for i,text in enumerate(('before','ambiguous','after'),1):
+                    if (root/f'phase{i}').exists() and i>=int(form.get('offset',0)):
+                        data.append({'update_id':i,'message':{'message_id':100+i,'date':1700000000,
+                            'from':{'id':100,'is_bot':False,'first_name':'Synthetic'},
+                            'chat':{'id':-10001,'type':'supergroup','is_forum':True},
+                            'message_thread_id':77,'text':text,'is_topic_message':True}})
         elif method=='sendMessage':
             form=await req.post()
             assert int(form['chat_id'])==-10001
+            if journals:assert int(form['message_thread_id'])==77
             tg.append(form['text']);transports.append(req.transport)
             data={'message_id':200+len(tg),'date':1700000000,
                   'chat':{'id':-10001,'type':'supergroup'},'text':form['text']}
+            if journals:data['message_thread_id']=77
         else:
             raise AssertionError('Unexpected Bot API method')
         return web.json_response({'ok':True,'result':data})
@@ -90,13 +118,13 @@ async def server(cert, root):
         assert auth==[IPS[0],IPS[2]],auth
         assert effects==[(IPS[0],'before'),(IPS[0],'ambiguous'),(IPS[2],'after')],effects
         assert tg==['before','after'],tg
-        assert len(transports)==2 and transports[0] is transports[1]
-        print('CLIENT EFFECTS PASS: 3 exact MAX effects, 2 exact TG effects, same TG TLS transport',flush=True)
+        if not journals:assert len(transports)==2 and transports[0] is transports[1]
+        print('CLIENT EFFECTS PASS: 3 exact MAX effects, 2 exact TG effects',flush=True)
     finally:
         await runner.cleanup()
 
 
-async def broker(root,expiry,nonce,identity,inherited_fd):
+async def broker(root,expiry,nonce,identity,inherited_fd,journals=False):
     os.close(inherited_fd)
     stat=os.stat('/proc/self/ns/net')
     assert (stat.st_dev,stat.st_ino)==identity
@@ -104,7 +132,9 @@ async def broker(root,expiry,nonce,identity,inherited_fd):
     isolated([],{'lo','eth0'})
     old=BrokerPins.parse({'max-text':[IPS[0]],'telegram':[IPS[1]],'expires_at':expiry})
     new=candidate(old)
-    b=PinnedBroker(old,{SID:root/'max','telegram':root/'tg'})
+    if journals:await marker(root/'sid')
+    sid=(root/'sid').read_text() if journals else SID
+    b=PinnedBroker(old,{sid:root/'max','telegram':root/'tg'})
     stop=asyncio.Event()
     task=asyncio.create_task(b.serve(stop))
     try:
@@ -171,7 +201,7 @@ async def client(cert,root):
     print('ACTUAL CLIENT PASS: same MAX account, same Bot object, uncertain send not replayed',flush=True)
 
 
-def controller(ns,cert,old,root):
+def controller(ns,cert,old,root,journals=False):
     pid=int(ns[2])
     info=os.stat(f'/proc/{pid}/ns/net')
     identity=(info.st_dev,info.st_ino)
@@ -193,12 +223,12 @@ def controller(ns,cert,old,root):
         broker_process=subprocess.Popen(
             ['/usr/bin/nsenter',f'--net=/proc/self/fd/{handle.fd}','--',
              *DROP,sys.executable,'-m','tests.linux_client_rotation_fixture','broker',
-             root,str(old.expires_at),grant.nonce,str(identity[0]),str(identity[1]),str(handle.fd)],
+             root,str(old.expires_at),grant.nonce,str(identity[0]),str(identity[1]),str(handle.fd),*(['journals'] if journals else [])],
             pass_fds=(handle.fd,),stdin=subprocess.PIPE,stdout=subprocess.PIPE)
         client_process=subprocess.Popen([*client_ns,*DROP,sys.executable,'-m',
-            'tests.linux_client_rotation_fixture','client',cert,root])
-        receipt=grant.execute(read_frame_fd(broker_process.stdout.fileno(),timeout=12))
-        out,_=broker_process.communicate(receipt,timeout=20)
+            'tests.linux_client_rotation_fixture','client',cert,root,*(['journals'] if journals else [])])
+        receipt=grant.execute(read_frame_fd(broker_process.stdout.fileno(),timeout=20 if journals else 12))
+        out,_=broker_process.communicate(receipt,timeout=25 if journals else 20)
         print(out.decode(),flush=True)
         assert broker_process.returncode==0 and b'ACTUAL CLIENT ROTATION BROKER PASS' in out
         assert client_process.wait(timeout=3)==0
@@ -218,11 +248,14 @@ def controller(ns,cert,old,root):
 if __name__=='__main__':
     mode=sys.argv[1]
     if mode=='server':
-        asyncio.run(server(sys.argv[2],Path(sys.argv[3])))
+        asyncio.run(server(sys.argv[2],Path(sys.argv[3]),'journals' in sys.argv[4:]))
     elif mode=='broker':
         asyncio.run(broker(Path(sys.argv[2]),int(sys.argv[3]),sys.argv[4],
-                           (int(sys.argv[5]),int(sys.argv[6])),int(sys.argv[7])))
+                           (int(sys.argv[5]),int(sys.argv[6])),int(sys.argv[7]),'journals' in sys.argv[8:]))
     elif mode=='client':
-        asyncio.run(client(sys.argv[2],Path(sys.argv[3])))
+        if 'journals' in sys.argv[4:]:
+            from tests.linux_journal_rotation_fixture import client as journal_client
+            asyncio.run(journal_client(sys.argv[2],Path(sys.argv[3])))
+        else:asyncio.run(client(sys.argv[2],Path(sys.argv[3])))
     else:
         raise ValueError('Unknown fixture action')

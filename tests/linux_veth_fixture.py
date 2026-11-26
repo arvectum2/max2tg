@@ -137,7 +137,7 @@ async def exercise(cert, expiry):
 
 
 
-def main(rotation=False, clients=False):
+def main(rotation=False, clients=False, journals=False):
     isolated([], {'lo'})
     assert os.getuid() == 0 and 'NoNewPrivs:\t1' in Path('/proc/self/status').read_text()
     assert not json.loads(call('ip', '-j', '-4', 'route', 'show', 'table', 'main'))
@@ -175,14 +175,14 @@ def main(rotation=False, clients=False):
             if clients:
                 client_root=call(*DROP,sys.executable,'-c',
                     'import tempfile;from pathlib import Path;p=Path(tempfile.mkdtemp(prefix="client-rotation-"));[(p/n).mkdir(mode=0o700) for n in ("max","tg")];print(p)').strip()
-                args=['tests.linux_client_rotation_fixture','server',d,client_root]
+                args=['tests.linux_client_rotation_fixture','server',d,client_root,*(['journals'] if journals else [])]
             else:
                 args=['tests.linux_veth_fixture','server',d]
             mock = subprocess.Popen([*DROP, sys.executable, '-m', *args],
                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
             assert select.select([mock.stdout], [], [], 5)[0], 'Mock readiness timeout'
             assert mock.stdout.readline().strip() == 'MOCK READY'
-            expiry = int(time.time()) + (30 if clients else 14)
+            expiry = int(time.time()) + (40 if journals else 30 if clients else 14)
             pins = BrokerPins.parse({'max-text': [IPS[0]], 'telegram': [IPS[1]],
                                      'expires_at': expiry})
             result = prepare_fresh_policy(
@@ -192,7 +192,7 @@ def main(rotation=False, clients=False):
             print('VETH EXACT KERNEL GATE PASS', flush=True)
             if clients:
                 from tests.linux_client_rotation_fixture import controller
-                controller(ns,d,pins,client_root)
+                controller(ns,d,pins,client_root,journals=journals)
             elif rotation:
                 from tests.linux_live_rotation_fixture import controller
                 controller(ns, d, pins)
@@ -226,6 +226,8 @@ def main(rotation=False, clients=False):
 if __name__ == '__main__':
     if len(sys.argv) == 1:
         main()
+    elif sys.argv[1] == '--journals':
+        main(clients=True,journals=True)
     elif sys.argv[1] == '--clients':
         main(clients=True)
     elif sys.argv[1] == '--rotation':
