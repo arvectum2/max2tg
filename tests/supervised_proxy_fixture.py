@@ -116,7 +116,7 @@ async def broker(network_paths=None,*,long_poll=False,mixed=False,cycles=1,delay
         report();atomic(control/'broker-boot.json',{'boot':sum(counts['auth'])});print('READY',flush=True)
         previous=None
         while not (control/'stop-broker').exists():
-            atomic(control/'broker-health.json',{'pid':os.getpid(),'at':time.time()})
+            atomic(control/'broker-health.json',{'pid':os.getpid(),'at':time.time(),'connected':sorted(i for i,w in load_sockets.items() if not w.closed)})
             if (control/'cut-a').exists() and servers[0].server:await servers[0].close();(control/'cut-confirmed').touch()
             if (control/'restore-a').exists() and not servers[0].server and (control/'cut-confirmed').exists():
                 (control/'cut-a').unlink(missing_ok=True);await servers[0].start();(control/'restore-a').unlink()
