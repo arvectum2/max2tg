@@ -36,4 +36,11 @@ def test_64_paced_rehearsal_is_bounded():
     assert Counter(i for _,pairs in waves for i,j in pairs)=={i:2 for i in range(64)}
     effects=[[f'mixed-{d}-{i}-{j}',.5,at+.5] for at,pairs in waves for i,j in pairs for d in ('in','out')]
     assert summarize(64,effects,{str(i):[10,35,60] for i in range(64)},[{'at':t,'pending_in':0,'pending_out':0,'ready':64} for t in (34,45,75)])['messages']==256
-    with pytest.raises(ValueError):schedule(64,2)
+    extended=schedule(64,2);assert len(extended)==32 and extended[-1][0]==164
+    assert Counter(i for _,pairs in extended for i,j in pairs)=={i:4 for i in range(64)}
+    assert len({(i,j) for _,pairs in extended for i,j in pairs})==256
+    effects=[[f'mixed-{d}-{i}-{j}',.5,at+.5] for at,pairs in extended for i,j in pairs for d in ('in','out')]
+    checks={str(i):[10,35,60,125,150] for i in range(64)};samples=[{'at':t,'pending_in':0,'pending_out':0,'ready':64} for t in (34,45,125,135,165)]
+    assert summarize(64,effects,checks,samples,cycles=2)['messages']==512
+    with pytest.raises(ValueError):summarize(64,effects,checks,samples[:2],cycles=2)
+    with pytest.raises(ValueError):schedule(64,3)

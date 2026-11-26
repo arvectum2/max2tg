@@ -85,6 +85,12 @@ async def placed_gateway(sessions,enabled=False,wal=False,balanced=False,fault=F
                 result=original(runtime)
                 if marker.exists():
                     ready=sum(v['ready'] for v in result['sessions'].values());tally['samples']+=1;tally['min_ready']=min(tally['min_ready'],ready);tally['all_ready']+=ready==len(sessions)
+                    if len(sessions)==64:
+                        now=runtime.guard.clock()
+                        margin=min(runtime.guard.valid.get(sid,now)-now for sid,_,_ in sessions)
+                        value=round(margin*1000)
+                        tally['min_lease_margin_ms']=min(value,tally.get('min_lease_margin_ms',value))
+                        tally['below_2s']=tally.get('below_2s',0)+(value<2000)
                     atomic(Path('/registry/lease-observation.json'),tally)
                 return result
             SharedGatewayRuntime.lifecycle_snapshot=snapshot
@@ -95,7 +101,7 @@ if __name__=='__main__':
     mode=sys.argv[1]
     if mode=='init':asyncio.run(prepare())
     elif mode=='broker':
-        sessions=json.loads(sys.argv[2]);asyncio.run(broker(['/network/'+sid for sid,_,_ in sessions]+['/network/telegram'],long_poll='long-poll' in sys.argv[3:],mixed='mixed' in sys.argv[3:],cycles=3 if 'soak' in sys.argv[3:] else 1,delay=.15 if 'delay150' in sys.argv[3:] else 0,fault='balanced-fault' in sys.argv[3:]))
+        sessions=json.loads(sys.argv[2]);asyncio.run(broker(['/network/'+sid for sid,_,_ in sessions]+['/network/telegram'],long_poll='long-poll' in sys.argv[3:],mixed='mixed' in sys.argv[3:],cycles=(2 if len(sessions)==64 else 3) if 'soak' in sys.argv[3:] else 1,delay=.15 if 'delay150' in sys.argv[3:] else 0,fault='balanced-fault' in sys.argv[3:]))
     elif mode=='gateway':asyncio.run(placed_gateway(json.loads(sys.argv[2]),'profile' in sys.argv[3:],'wal' in sys.argv[3:],'balanced' in sys.argv[3:],'balanced-fault' in sys.argv[3:]))
     elif mode=='worker':asyncio.run(placed_worker(sys.argv[2],'profile' in sys.argv[3:],'wal' in sys.argv[3:]))
     else:raise SystemExit(78)

@@ -20,7 +20,7 @@ def main():
     if a.profile and not (a.load or a.mixed):p.error('Profile requires bounded load mode')
     if a.tenants!=2 and (not a.native_volumes or not (a.load or a.mixed)):p.error('Larger cohorts require native volumes and bounded load mode')
     if a.tenants==32 and not (a.mixed and a.native_volumes and a.profile and a.long_poll and a.storage_check and a.wal_maintenance and not a.soak):p.error('32 tenants require single mixed cycle with WAL and storage observations')
-    if a.tenants==64 and not (a.balanced and a.delay150 and a.mixed and a.native_volumes and a.profile and a.long_poll and a.storage_check and a.wal_maintenance and not a.soak):p.error('64 requires paced delayed balanced single cycle with storage observations')
+    if a.tenants==64 and not (a.balanced and a.delay150 and a.mixed and a.native_volumes and a.profile and a.long_poll and a.storage_check and a.wal_maintenance):p.error('64 requires paced delayed balanced workload with storage observations')
     ram_cap={32:2048,64:3584}.get(a.tenants,1024);cpu_cap={32:350,64:450}.get(a.tenants,250)
     d=DockerBackend()
     if a.tenants>=32:
@@ -131,7 +131,7 @@ def main():
                     from collections import Counter
                     from tests.synthetic_mixed_load import schedule,summarize
                     from app.stage_profile import aggregate_profiles
-                    cycles=3 if a.soak else 1;waves=schedule(a.tenants,cycles);per=Counter(i for _,pairs in waves for i,j in pairs);n=sum(per.values());target=a.tenants+n
+                    cycles=(2 if a.tenants==64 else 3) if a.soak else 1;waves=schedule(a.tenants,cycles);per=Counter(i for _,pairs in waves for i,j in pairs);n=sum(per.values());target=a.tenants+n
                     def resources_snapshot():
                         by_role={}
                         for role,cid in ids.items():
@@ -157,9 +157,9 @@ def main():
                     wait(lambda:all(ledger(cid,'/state/to-telegram.sqlite3','worker_telegram_intents')=={'SENT':per[i]+1} for i,cid in enumerate(workers)),timeout=15)
                     result=counts();
                     if a.tenants==64:
-                        print("COHORT OBSERVATION "+json.dumps({"effects":len(result["mixed_effects"]),"lease":read(gateway,"/registry/lease-observation.json"),"idle_samples":[v for v in observations if 32<=v["at"]<=50],"verified_min":min(map(len,result["mixed_verified"].values()),default=0)},sort_keys=True),flush=True)
+                        print("COHORT OBSERVATION "+json.dumps({"effects":len(result["mixed_effects"]),"lease":read(gateway,"/registry/lease-observation.json"),"idle_samples":[v for v in observations if any(32+90*c<=v["at"]<=50+90*c for c in range(cycles))],"verified_min":min(map(len,result["mixed_verified"].values()),default=0)},sort_keys=True),flush=True)
                     metrics=summarize(a.tenants,result['mixed_effects'],result['mixed_verified'],observations,cycles=cycles)
-                    metrics['elapsed_s']=round(time.monotonic()-begin,3);metrics['samples']=len(samples);metrics['max_sampled_total_ram_mib']=round(max(sum(_mib(r['MemUsage'].split('/')[0]) for r in s['resources']) for s in samples),2)
+                    metrics['cycles']=cycles;metrics['elapsed_s']=round(time.monotonic()-begin,3);metrics['samples']=len(samples);metrics['max_sampled_total_ram_mib']=round(max(sum(_mib(r['MemUsage'].split('/')[0]) for r in s['resources']) for s in samples),2)
                     stages=aggregate_profiles(before,profiles(2));assert stages['gateway']['api.send.call']['count']==n and stages['gateway']['ingress.ipc']['count']>=n
                     metrics['api_calls']={k:v['count'] for k,v in stages['gateway'].items() if k.startswith('api.') and k.endswith('.call')}
                     if a.soak or a.storage_check:
@@ -169,7 +169,9 @@ def main():
                     if a.tenants>=32:
                         metrics['lease_observation']=read(gateway,'/registry/lease-observation.json')
                         assert metrics['lease_observation']['samples']>0
-                        if a.tenants==64:assert metrics['lease_observation']['min_ready']==64, "Sampled lease readiness regression"
+                        if a.tenants==64:
+                            assert metrics['lease_observation']['min_ready']==64, 'Sampled lease readiness regression'
+                            assert metrics['lease_observation']['min_lease_margin_ms']>=2000 and metrics['lease_observation']['below_2s']==0, 'Sampled lease margin below 2 seconds'
                     metrics['wal_maintenance']=a.wal_maintenance;metrics['balanced']=a.balanced;metrics['delay_ms']=150 if a.delay150 else 0
                     print('MIXED RESULT '+json.dumps(metrics,sort_keys=True),flush=True)
                     print('PROFILE RESULT '+json.dumps(stages,sort_keys=True),flush=True)

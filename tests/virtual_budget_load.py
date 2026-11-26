@@ -48,9 +48,10 @@ class SyntheticBot:
         finally:self.sending.remove(chat_id)
         return NS(message_id=mid,chat=NS(id=chat_id),message_thread_id=77)
 
-async def scenario(root,tenants,rate,*,fault=False,latency=.04,scheduler="wave",concurrency=4,send_concurrency=1,weight=None):
+async def scenario(root,tenants,rate,*,fault=False,latency=.04,scheduler="wave",concurrency=4,send_concurrency=1,weight=None,duration=120):
     if scheduler not in ("wave","rolling","balanced") or concurrency not in (4,8) or send_concurrency not in (1,4):raise ValueError("Unreviewed scheduler")
-    if tenants not in (32,48,64) or rate not in (3,8) or latency not in (.04,.15,.25,.35):raise ValueError("Unreviewed scenario")
+    if tenants not in (32,48,64) or rate not in (2,3,4,5,8) or latency not in (.04,.15,.25,.35):raise ValueError("Unreviewed scenario")
+    if duration not in (120,240):raise ValueError("Unreviewed duration")
     clock=asyncio.get_running_loop().time;r=CapsuleRegistry(root/'registry');o=SharedOnboarding(r);raw=SyntheticBot(clock);raw.latency=latency;sids=[];tasks=[];e=None
     try:
         for i in range(tenants):
@@ -86,13 +87,13 @@ async def scenario(root,tenants,rate,*,fault=False,latency=.04,scheduler="wave",
                 assert not raw.sent and all(y[0]-x[0]>=.05-1e-7 for x,y in zip(raw.calls,raw.calls[1:]))
                 return {'tenants':tenants,'scheduler':scheduler,'concurrency':concurrency,'send_concurrency':send_concurrency,'weight':weight,'offered_per_s':rate,'api_latency_s':latency,'fault':fault,'warmup':'FAIL','ready_at_deadline':sum(guard.allowed(s) for s in active),'warmup_limit_s':60,'sent':0}
             await asyncio.sleep(.1)
-        warmup=clock()-start;raw.origin=clock();arrived={};samples=[];peak=0;total=rate*120
-        for tick in range(1200):
+        warmup=clock()-start;raw.origin=clock();arrived={};samples=[];margins=[];peak=0;total=rate*duration;ticks=10*duration
+        for tick in range(ticks):
             # Deterministic evenly spaced arrivals, round robin owners.
-            target=(tick+1)*total//1200
+            target=(tick+1)*total//ticks
             for j in range(len(arrived),target):
                 key=f'msg-{j:05d}';sid=sids[j%tenants];assert e.enqueue(sid,key,key,max_chat_id=42)=='QUEUED';arrived[key]=clock();raw.by_message[key]=sid
-            ready=sum(guard.allowed(s) for s in active);counts=e.counts();pending=counts.get('QUEUED',0)+counts.get('SENDING',0);peak=max(peak,pending);samples.append((ready,pending))
+            ready=sum(guard.allowed(s) for s in active);counts=e.counts();pending=counts.get('QUEUED',0)+counts.get('SENDING',0);peak=max(peak,pending);samples.append((ready,pending));margins.append(min(guard.valid.get(s,clock())-clock() for s in active))
             await asyncio.sleep(.1)
         end_pending=e.counts().get('QUEUED',0)+e.counts().get('SENDING',0);end=clock();deadline=end+90
         while e.counts().get('SENT',0)!=total and clock()<deadline:await asyncio.sleep(.1)
@@ -104,7 +105,7 @@ async def scenario(root,tenants,rate,*,fault=False,latency=.04,scheduler="wave",
             assert raw.cooldown is not None;lo,hi=raw.cooldown;assert not any(lo<t<hi-1e-7 for t,_ in raw.calls)
             assert r.db.execute('SELECT until FROM telegram_api_budget').fetchone()[0]==hi
         delivered=[raw.sent[k]-arrived[k] for k in raw.sent];assert all(v>=0 for v in delivered)
-        interval=[g for t,g in raw.calls if raw.origin<=t<end];return {'tenants':tenants,'scheduler':scheduler,'concurrency':concurrency,'send_concurrency':send_concurrency,'weight':weight,'offered_per_s':rate,'api_latency_s':latency,'fault':fault,'warmup':'PASS','warmup_s':round(warmup,3),'offered':total,'sent':confirmed,'invoked':len(raw.sent),'drained':confirmed==total,'pending_at_120s':end_pending,'peak_pending':peak,'drain_after_s':round(clock()-end,3),'min_ready':min(a for a,_ in samples),'all_ready_fraction':round(sum(a==tenants for a,_ in samples)/len(samples),4),'held_tenant_fraction':round(sum(tenants-a for a,_ in samples)/(tenants*len(samples)),5),'p95_to_api_start_s':round(sorted(delivered)[math.ceil(len(delivered)*.95)-1],3) if confirmed==total and delivered else None,'starts':{k:interval.count(k) for k in ('verify','poll','send')},'cooldown_s':12 if fault else 0,'terminal':counts,'peak_concurrent_sends':raw.peak_sending}
+        interval=[g for t,g in raw.calls if raw.origin<=t<end];return {'tenants':tenants,'scheduler':scheduler,'concurrency':concurrency,'send_concurrency':send_concurrency,'weight':weight,'offered_per_s':rate,'api_latency_s':latency,'fault':fault,'warmup':'PASS','warmup_s':round(warmup,3),'offered':total,'sent':confirmed,'invoked':len(raw.sent),'drained':confirmed==total,'pending_at_120s':end_pending if duration==120 else None,'duration_s':duration,'pending_at_end':end_pending,'min_lease_margin_s':round(min(margins),3),'p05_min_lease_margin_s':round(sorted(margins)[max(0,math.ceil(len(margins)*.05)-1)],3),'peak_pending':peak,'drain_after_s':round(clock()-end,3),'min_ready':min(a for a,_ in samples),'all_ready_fraction':round(sum(a==tenants for a,_ in samples)/len(samples),4),'held_tenant_fraction':round(sum(tenants-a for a,_ in samples)/(tenants*len(samples)),5),'p95_to_api_start_s':round(sorted(delivered)[math.ceil(len(delivered)*.95)-1],3) if confirmed==total and delivered else None,'starts':{k:interval.count(k) for k in ('verify','poll','send')},'cooldown_s':12 if fault else 0,'terminal':counts,'peak_concurrent_sends':raw.peak_sending}
     finally:
         for task in tasks:task.cancel()
         outcomes=await asyncio.gather(*tasks,return_exceptions=True) if tasks else []
@@ -114,8 +115,8 @@ async def scenario(root,tenants,rate,*,fault=False,latency=.04,scheduler="wave",
             if isinstance(x,Exception):raise x
 
 
-def run(tenants,rate,fault=False,latency=.04,*,scheduler="wave",concurrency=4,send_concurrency=1,weight=None):
-    with tempfile.TemporaryDirectory(prefix='m2budget64-') as td:return virtual_run(scenario(Path(td),tenants,rate,fault=fault,latency=latency,scheduler=scheduler,concurrency=concurrency,send_concurrency=send_concurrency,weight=weight))
+def run(tenants,rate,fault=False,latency=.04,*,scheduler="wave",concurrency=4,send_concurrency=1,weight=None,duration=120):
+    with tempfile.TemporaryDirectory(prefix='m2budget64-') as td:return virtual_run(scenario(Path(td),tenants,rate,fault=fault,latency=latency,scheduler=scheduler,concurrency=concurrency,send_concurrency=send_concurrency,weight=weight,duration=duration))
 
 if __name__=='__main__':
     import argparse
