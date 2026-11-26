@@ -68,3 +68,64 @@ def test_real_command_rejected(tmp_path):
     root,p,d=fixture(tmp_path);p['services']['gateway']['command']=['-m','app.main']
     with pytest.raises(PermissionError):SyntheticLifecycle(root,p,d,lambda *_:True)
     assert not d.events
+
+
+def crash(d,p,role,code=137,oom=False):
+    d.containers[p['services'][role]['container_name']]['State']={'Running':False,'Status':'exited','ExitCode':code,'OOMKilled':oom}
+
+
+def test_recovery_budget_persists_and_quarantines(tmp_path):
+    root,p,d=fixture(tmp_path);now=[100];s=SyntheticLifecycle(root,p,d,lambda *_:True,wall=lambda:now[0])
+    try:
+        s.register();s.start()
+        for i in range(4):
+            crash(d,p,'broker');assert not s.monitor()['healthy'];assert s.recover_once()=='RECOVERED'
+            assert s.monitor()['roles']['broker']['attempts']==i+1
+            s.close();s=SyntheticLifecycle(root,p,d,lambda *_:True,wall=lambda:now[0])
+            crash(d,p,'broker');assert s.recover_once()==('QUARANTINED' if i==3 else 'BACKOFF');now[0]+=60
+        assert len([e for e in d.events if e==('start','broker')])==5
+    finally:s.close()
+
+
+@pytest.mark.parametrize('code,oom',[(0,False),(1,False),(137,True),(137,None)])
+def test_other_exits_require_review(tmp_path,code,oom):
+    root,p,d=fixture(tmp_path);s=SyntheticLifecycle(root,p,d,lambda *_:True)
+    try:
+        s.register();s.start();before=d.events[:];crash(d,p,'broker',code,oom)
+        assert s.recover_once()=='BLOCKED_EXIT' and d.events==before
+    finally:s.close()
+
+
+def test_unready_dependency_never_killed_or_restarted(tmp_path):
+    root,p,d=fixture(tmp_path);s=SyntheticLifecycle(root,p,d,lambda *_:True,observe=lambda role,*_:role!='broker')
+    try:
+        s.register();s.start();before=d.events[:];crash(d,p,'gateway')
+        assert not s.monitor()['healthy'] and s.recover_once()=='WAITING_READINESS' and d.events==before
+    finally:s.close()
+
+
+def test_ambiguous_restart_blocks_across_reopen(tmp_path):
+    root,p,d=fixture(tmp_path);s=SyntheticLifecycle(root,p,d,lambda *_:True)
+    try:
+        s.register();s.start();crash(d,p,'broker');original=d.start
+        def ambiguous(cid):original(cid);raise TimeoutError('ambiguous Docker response')
+        d.start=ambiguous
+        with pytest.raises(TimeoutError):s.recover_once()
+        assert s.monitor()['roles']['broker']['attempts']==1 and not s.monitor()['healthy']
+    finally:s.close()
+    s=SyntheticLifecycle(root,p,d,lambda *_:True)
+    try:
+        before=d.events[:]
+        with pytest.raises(PermissionError):s.recover_once()
+        assert d.events==before and s.status()['state']=='BLOCKED'
+        assert s.stop()['state']=='STOPPED'
+    finally:s.close()
+
+
+def test_interrupted_recovery_is_not_replayed(tmp_path):
+    root,p,d=fixture(tmp_path);s=SyntheticLifecycle(root,p,d,lambda *_:True)
+    try:
+        s.register();s.start();crash(d,p,'broker');m=s._load();m['phase']='RECOVERING';m['recovery']['broker']={'attempts':1,'retry_at':100};s._save(m);before=d.events[:]
+        with pytest.raises(PermissionError):s.recover_once()
+        assert s.status()['state']=='BLOCKED' and d.events==before
+    finally:s.close()

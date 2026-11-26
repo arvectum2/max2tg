@@ -1,9 +1,10 @@
 """Trusted host-side lifecycle rehearsal for pre-created synthetic containers.
-No public entrypoint, live credentials, create, delete or automatic retry.
+No public entrypoint, live credentials, create or delete. Bounded recovery
+only for confirmed synthetic abnormal exits; no retry of ambiguous commands.
 Only the reviewed network-none fixture commands are supported. Readiness is
 an observation, not permission for production launch.
 """
-import hashlib,json,time,sys
+import hashlib,json,time,sys,math
 from copy import deepcopy
 from app.deployment_plan import HEX,_verify_stopped,plan_digest
 from app.operator_stage import CID,_daemon
@@ -12,8 +13,9 @@ from app.runtime_lock import RuntimeLock
 
 
 class SyntheticLifecycle:
-    def __init__(self,root,plan,backend,probe,*,clock=time.monotonic,sleep=time.sleep):
-        self.root=_private_dir(root);self.plan=deepcopy(plan);self.d=backend;self.probe=probe;self.clock=clock;self.sleep=sleep
+    MAX_ATTEMPTS=4
+    def __init__(self,root,plan,backend,probe,*,clock=time.monotonic,sleep=time.sleep,wall=time.time,observe=None):
+        self.root=_private_dir(root);self.plan=deepcopy(plan);self.d=backend;self.probe=probe;self.clock=clock;self.sleep=sleep;self.wall=wall;self.observe=observe or probe
         self.roles=self.plan['services'];self.order=['broker','gateway',*sorted(r for r in self.roles if r.startswith('worker-'))]
         if len(self.order)!=4 or set(self.order)!=set(self.roles):raise ValueError('Two synthetic workers required')
         sids=[r[7:] for r in self.order[2:]]
@@ -58,10 +60,14 @@ class SyntheticLifecycle:
             if status!='created':raise PermissionError('Fresh held fixture required')
             inventory[role]=item
         if len({v['id'] for v in inventory.values()})!=4:raise PermissionError('Duplicate container identity')
-        self._save({'version':1,'digest':plan_digest(self.plan),'daemon':_daemon(self.d),'inventory':inventory,'phase':'HELD'})
+        self._save({'version':1,'digest':plan_digest(self.plan),'daemon':_daemon(self.d),'inventory':inventory,'phase':'HELD','recovery':{r:{'attempts':0,'retry_at':0} for r in self.order}})
     def _load(self):
         m=json.loads(_file(self.root,'lifecycle.json').read_text())
-        if set(m)!={'version','digest','daemon','inventory','phase'} or m['version']!=1 or m['digest']!=plan_digest(self.plan) or m['daemon']!=_daemon(self.d) or set(m['inventory'])!=set(self.roles) or m['phase'] not in ('HELD','STARTING','RUNNING','STOPPING','STOPPED','BLOCKED'):raise PermissionError('Lifecycle inventory changed')
+        if set(m)!={'version','digest','daemon','inventory','phase','recovery'} or m['version']!=1 or m['digest']!=plan_digest(self.plan) or m['daemon']!=_daemon(self.d) or set(m['inventory'])!=set(self.roles) or m['phase'] not in ('HELD','STARTING','RUNNING','STOPPING','STOPPED','BLOCKED','RECOVERING'):raise PermissionError('Lifecycle inventory changed')
+        recovery=m['recovery']
+        if not isinstance(recovery,dict) or set(recovery)!=set(self.roles):raise PermissionError('Invalid recovery inventory')
+        for entry in recovery.values():
+            if not isinstance(entry,dict) or set(entry)!={'attempts','retry_at'} or type(entry['attempts']) is not int or not 0<=entry['attempts']<=self.MAX_ATTEMPTS or type(entry['retry_at']) not in (int,float) or not math.isfinite(entry['retry_at']) or entry['retry_at']<0:raise PermissionError('Invalid recovery budget')
         return m
     def _check(self,m):
         result={}
@@ -72,13 +78,13 @@ class SyntheticLifecycle:
         return result
     def status(self):
         m=self._load();observed=self._check(m);n=sum(s=='running' for s,_ in observed.values());phase=m['phase']
-        if phase in ('STARTING','STOPPING','BLOCKED') or (phase=='RUNNING' and n!=4) or (phase in ('HELD','STOPPED') and n!=0):phase='BLOCKED'
+        if phase in ('STARTING','STOPPING','BLOCKED','RECOVERING') or (phase=='RUNNING' and n!=4) or (phase in ('HELD','STOPPED') and n!=0):phase='BLOCKED'
         return {'state':phase,'running':n,'containers':4,'live_launch_authorized':False}
     def start(self):
         m=self._load();observed=self._check(m)
         if m['phase']=='RUNNING' and all(s=='running' for s,_ in observed.values()):return self.status()
         if m['phase'] not in ('HELD','STOPPED') or any(s=='running' for s,_ in observed.values()):raise PermissionError('Explicit clean stopped boundary required')
-        m['phase']='STARTING';self._save(m)
+        m['phase']='STARTING';m['recovery']={r:{'attempts':0,'retry_at':0} for r in self.order};self._save(m)
         try:
             for role in self.order:
                 states=self._check(m);idx=self.order.index(role)
@@ -94,6 +100,51 @@ class SyntheticLifecycle:
             m['phase']='RUNNING';self._save(m);return self.status()
         except BaseException:
             m['phase']='BLOCKED';self._save(m);raise
+    def monitor(self):
+        """Read-only fresh observations; not a continuous health guarantee."""
+        m=self._load();states=self._check(m);out={}
+        for role,(status,state) in states.items():
+            ready=status=='running' and self.observe(role,m['inventory'][role]['id'],state) is True
+            budget=m['recovery'][role]
+            out[role]={'state':status,'ready':ready,'attempts':budget['attempts']}
+        phase=m['phase'];healthy=phase=='RUNNING' and all(v['ready'] for v in out.values())
+        return {'state':phase,'healthy':healthy,'roles':out,'live_launch_authorized':False}
+
+    def recover_once(self):
+        """At most one definite abnormal exit, never kill a running role.
+
+        Persist attempt before action. Interrupted/ambiguous start blocks all
+        further recovery. Explicit operator invocation, no background daemon.
+        """
+        m=self._load();states=self._check(m)
+        if m['phase']!='RUNNING':raise PermissionError('Recovery requires explicit running intent')
+        for role in self.order:
+            status,state=states[role];cid=m['inventory'][role]['id']
+            if status=='running':
+                if self.observe(role,cid,state) is not True:return 'WAITING_READINESS'
+                continue
+            if status!='exited' or state.get('ExitCode')!=137 or state.get('OOMKilled') is not False:return 'BLOCKED_EXIT'
+            entry=m['recovery'][role]
+            if entry['attempts']>=self.MAX_ATTEMPTS:return 'QUARANTINED'
+            now=self.wall()
+            if not math.isfinite(now) or now<0:raise ValueError('Invalid recovery clock')
+            if now<entry['retry_at']:return 'BACKOFF'
+            current=self._check(m)[role]
+            if current!=(status,state):raise PermissionError('Recovery observation changed')
+            entry['attempts']+=1;entry['retry_at']=now+2**entry['attempts'];m['phase']='RECOVERING';self._save(m)
+            try:
+                self.d.start(cid);deadline=self.clock()+25
+                while True:
+                    item,actual,info=self._observed(role)
+                    if item!=m['inventory'][role] or actual!='running':raise RuntimeError('Restart not confirmed')
+                    if self.probe(role,cid,info) is True:break
+                    if self.clock()>=deadline:raise TimeoutError('Restart readiness not confirmed')
+                    self.sleep(.25)
+                m['phase']='RUNNING';self._save(m);return 'RECOVERED'
+            except BaseException:
+                m['phase']='BLOCKED';self._save(m);raise
+        return 'NO_ACTION'
+
     def stop(self):
         m=self._load();self._check(m)
         # Explicit stop is also the recovery path from an incomplete start; no restart.

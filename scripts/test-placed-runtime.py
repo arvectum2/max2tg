@@ -7,7 +7,8 @@ from app.deployment_plan import build_plan,_verify_stopped,validate_bind_sources
 from app.container_supervisor import DockerBackend
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--image',required=True);p.add_argument('--native-volumes',action='store_true');p.add_argument('--load',type=int,choices=range(1,26));p.add_argument('--tenants',type=int,choices=(2,4,8,16,32,64),default=2);p.add_argument('--profile',action='store_true');p.add_argument('--long-poll',action='store_true');p.add_argument('--mixed',action='store_true');p.add_argument('--soak',action='store_true');p.add_argument('--storage-check',action='store_true');p.add_argument('--wal-maintenance',action='store_true');p.add_argument('--delay150',action='store_true');p.add_argument('--balanced',action='store_true');p.add_argument('--balanced-fault',action='store_true');p.add_argument('--reconcile-revoked',action='store_true');p.add_argument('--operator-lifecycle',action='store_true');a=p.parse_args();
+    p=argparse.ArgumentParser();p.add_argument('--image',required=True);p.add_argument('--native-volumes',action='store_true');p.add_argument('--load',type=int,choices=range(1,26));p.add_argument('--tenants',type=int,choices=(2,4,8,16,32,64),default=2);p.add_argument('--profile',action='store_true');p.add_argument('--long-poll',action='store_true');p.add_argument('--mixed',action='store_true');p.add_argument('--soak',action='store_true');p.add_argument('--storage-check',action='store_true');p.add_argument('--wal-maintenance',action='store_true');p.add_argument('--delay150',action='store_true');p.add_argument('--balanced',action='store_true');p.add_argument('--balanced-fault',action='store_true');p.add_argument('--reconcile-revoked',action='store_true');p.add_argument('--operator-lifecycle',action='store_true');p.add_argument('--operator-recovery',action='store_true');a=p.parse_args();
+    if a.operator_recovery and not a.operator_lifecycle:p.error('Recovery requires operator lifecycle fixture')
     if a.operator_lifecycle and not (a.native_volumes and a.tenants==2 and not (a.load or a.mixed or a.balanced_fault or a.balanced or a.profile or a.long_poll or a.wal_maintenance or a.delay150 or a.storage_check or a.soak)):p.error('Operator lifecycle requires simple two-session native fixture')
     if a.reconcile_revoked and not a.balanced_fault:p.error('Reconciliation requires balanced fault fixture')
     if a.balanced_fault and not (a.native_volumes and a.tenants==2 and not (a.mixed or a.load or a.profile or a.long_poll or a.wal_maintenance)):p.error('Fault mode requires two native sessions without load flags')
@@ -114,12 +115,36 @@ def main():
                             snap=read(cid,'/registry/operator-health.json') or {};return snap.get('at',0)>=start and set(snap.get('sessions',{}))==set(sids) and all(v=={'active':True,'ready':True} for v in snap['sessions'].values())
                         i=sids.index(role[7:]);return counts().get('auth',[0,0])[i]>auth_baseline[i] and exec_py(cid,'from pathlib import Path;print(Path("/channel/ingress.sock").is_socket())')=='True'
                     except subprocess.CalledProcessError:return False
-                def controller():return SyntheticLifecycle(lifecycle_root,plan,d,probe)
+                def observation(role,cid,state):
+                    try:
+                        start=datetime.fromisoformat(state['StartedAt'].replace('Z','+00:00')).timestamp()
+                        if role=='broker':snap=read(cid,'/network/telegram/broker-health.json') or {}
+                        elif role=='gateway':
+                            snap=read(cid,'/registry/operator-health.json') or {}
+                            if set(snap.get('sessions',{}))!=set(sids) or not all(v=={'active':True,'ready':True} for v in snap['sessions'].values()):return False
+                        else:
+                            snap=read(broker,'/network/telegram/broker-health.json') or {}
+                            if sids.index(role[7:]) not in snap.get('connected',[]) or exec_py(cid,'from pathlib import Path;print(Path("/channel/ingress.sock").is_socket())')!='True':return False
+                        at=snap.get('at',0);return type(at) in (int,float) and start<=at and -1<=time.time()-at<=5
+                    except subprocess.CalledProcessError:return False
+                def controller():return SyntheticLifecycle(lifecycle_root,plan,d,probe,observe=observation)
                 ctl=controller()
                 try:
                     ctl.register();assert ctl.status()['state']=='HELD';assert ctl.start()['state']=='RUNNING'
                     touch('phase1');wait(lambda:receipts(2) and len(counts().get('tg',[]))==len(counts().get('max',[]))==2,timeout=45)
                     wait(lambda:all(ledger(cid,'/state/to-telegram.sqlite3','worker_telegram_intents')=={'SENT':1} for cid in workers),timeout=15)
+                    if a.operator_recovery:
+                        wait(lambda:ctl.monitor()['healthy']);assert ctl.recover_once()=='NO_ACTION'
+                        for role,cid in [('broker',broker),('gateway',gateway),('worker-'+sids[0],workers[0])]:
+                            auth_baseline[:]=counts()['auth'];d.call('kill','--signal','KILL',cid)
+                            assert not ctl.monitor()['healthy']
+                            ctl.close();ctl=controller()
+                            wait(lambda:all(v['ready'] for r,v in ctl.monitor()['roles'].items() if r in ctl.order[:ctl.order.index(role)]),timeout=25)
+                            assert ctl.recover_once()=='RECOVERED';wait(lambda:ctl.monitor()['healthy'],timeout=30)
+                            assert ctl.monitor()['roles'][role]['attempts']==1
+                            assert receipts(2) and len(counts()['tg'])==len(counts()['max'])==2
+                            assert all(d.inspect(s['container_name'])['Id']==ids[r] for r,s in plan['services'].items())
+                        print('OPERATOR RECOVERY PASS '+json.dumps({'recovered_roles':3,'same_ids':True,'exact_effects_unchanged':True,'persisted_attempts':3},sort_keys=True),flush=True)
                     auth_baseline[:]=counts()['auth'];assert ctl.start()['state']=='RUNNING';assert ctl.stop()['state']=='STOPPED'
                 finally:ctl.close()
                 ctl=controller()

@@ -85,7 +85,7 @@ jobs:
       - name: Verify persistent held operator staging
         run: python3 scripts/test-operator-stage.py --image max2tg:ci
       - name: Verify persistent operator-controlled synthetic lifecycle
-        run: python3 scripts/test-placed-runtime.py --image max2tg:ci --native-volumes --operator-lifecycle
+        run: python3 scripts/test-placed-runtime.py --image max2tg:ci --native-volumes --operator-lifecycle --operator-recovery
       - name: Verify actual runtime loops on planned native-volume placement
         run: python3 scripts/test-placed-runtime.py --image max2tg:ci --native-volumes
       - name: Verify actual runtime loops on Linux bind placement
