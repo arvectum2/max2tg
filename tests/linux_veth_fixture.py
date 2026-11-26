@@ -137,7 +137,7 @@ async def exercise(cert, expiry):
 
 
 
-def main():
+def main(rotation=False):
     isolated([], {'lo'})
     assert os.getuid() == 0 and 'NoNewPrivs:\t1' in Path('/proc/self/status').read_text()
     assert not json.loads(call('ip', '-j', '-4', 'route', 'show', 'table', 'main'))
@@ -183,12 +183,16 @@ def main():
                 install=lambda rules: call(*ns, 'nft', '-f', '-', data=rules))
             assert result['verified'] and not result['live_launch_authorized']
             print('VETH EXACT KERNEL GATE PASS', flush=True)
-            subprocess.run([*ns, *DROP, sys.executable, '-m', 'tests.linux_veth_fixture',
-                            'exercise', d, str(expiry)], check=True, timeout=25)
+            if rotation:
+                from tests.linux_live_rotation_fixture import controller
+                controller(ns, d, pins)
+            else:
+                subprocess.run([*ns, *DROP, sys.executable, '-m', 'tests.linux_veth_fixture',
+                                'exercise', d, str(expiry)], check=True, timeout=25)
             counts = [e['counter']['packets'] for i in json.loads(call(
                 *ns, 'nft', '-j', 'list', 'chain', 'inet', 'm2tg_egress', 'output'))['nftables']
                       if 'rule' in i for e in i['rule']['expr'] if 'counter' in e]
-            assert counts[0] > 2 and counts[1] >= 4, counts
+            assert counts[0] > 2 and counts[1] >= (1 if rotation else 4), counts
             print('VETH KERNEL COUNTERS PASS', counts, flush=True)
     finally:
         if mock is not None:
@@ -202,6 +206,8 @@ def main():
 if __name__ == '__main__':
     if len(sys.argv) == 1:
         main()
+    elif sys.argv[1] == '--rotation':
+        main(rotation=True)
     elif sys.argv[1] == 'server':
         asyncio.run(server(sys.argv[2]))
     elif sys.argv[1] == 'exercise':

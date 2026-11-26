@@ -1,6 +1,7 @@
 """Trusted, offline kernel pin rotation contract.
 
-Caller must hold exclusive namespace ownership and keep the broker stopped.
+Caller must hold exclusive namespace ownership and keep the broker stopped
+or quiesce admission, fence dials and abort revoked streams before rotation.
 Callbacks are trusted; an ambiguous mutation must be investigated, not retried.
 No namespace selection, DNS resolution, privileges or live launch authorization.
 """
@@ -36,7 +37,7 @@ def _handles(observed):
                   for kind, obj in entry.items() if kind != 'metainfo')
 
 
-def rotate_stopped_policy(current, replacement, *, observe, apply, clock=time.time):
+def rotate_quiesced_policy(current, replacement, *, observe, apply, clock=time.time):
     """Verify old policy, apply once, verify new policy. Never retry/rollback."""
     now = clock()
     rotation_batch(current, replacement, now=now)
@@ -50,3 +51,8 @@ def rotate_stopped_policy(current, replacement, *, observe, apply, clock=time.ti
     if _handles(after) != handles:
         raise EgressDenied('Kernel object identity changed during rotation')
     return dict(result, rotated=True)
+
+
+def rotate_stopped_policy(current, replacement, *, observe, apply, clock=time.time):
+    """Stopped-broker caller contract, same verified transaction."""
+    return rotate_quiesced_policy(current, replacement, observe=observe, apply=apply, clock=clock)
