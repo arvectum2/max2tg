@@ -6,7 +6,7 @@ sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 from app.container_supervisor import DockerBackend
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--image',required=True);args=p.parse_args();d=DockerBackend();root=Path(__file__).resolve().parents[1];image=d.call('image','inspect','--format','{{.Id}}',args.image);owner=uuid.uuid4().hex[:16];prefix='m2tg-net-'+owner;vol=[];names=[]
+    p=argparse.ArgumentParser();p.add_argument('--image',required=True);p.add_argument('--pinned',action='store_true');args=p.parse_args();d=DockerBackend();root=Path(__file__).resolve().parents[1];image=d.call('image','inspect','--format','{{.Id}}',args.image);owner=uuid.uuid4().hex[:16];prefix='m2tg-net-'+owner;vol=[];names=[]
     with tempfile.TemporaryDirectory(prefix='m2net-') as td:
         folder=Path(td);cert=folder/'cert';cert.mkdir();client=folder/'client';client.mkdir()
         subprocess.run(['openssl','req','-x509','-newkey','rsa:2048','-nodes','-days','1','-subj','/CN=synthetic','-addext','subjectAltName=DNS:api.oneme.ru,DNS:api.telegram.org','-keyout',str(cert/'key.pem'),'-out',str(cert/'cert.pem')],check=True,capture_output=True)
@@ -21,7 +21,7 @@ def main():
             return a+['--entrypoint','python',image,'-m','tests.network_tunnel_fixture',role]
         try:
             for i in range(3):vol.append(d.call('volume','create','--label',f'max2tg.nettest={owner}',prefix+f'-{i}'))
-            both=[(n,f'channel{i}') for i,n in enumerate(vol[:2])];d.call(*cmd(prefix+'-init','init',both+[(vol[2],'secret')],init=True));broker=d.call(*cmd(prefix+'-broker','broker',both,cert,detach=True))
+            both=[(n,f'channel{i}') for i,n in enumerate(vol[:2])];d.call(*cmd(prefix+'-init','init',both+[(vol[2],'secret')],init=True));broker=d.call(*cmd(prefix+'-broker','broker-pinned' if args.pinned else 'broker',both,cert,detach=True))
             for _ in range(40):
                 if 'READY' in d.call('logs',broker):break
                 time.sleep(.1)

@@ -1,5 +1,5 @@
 """No-network Docker fixture: real TLS/HTTPS/WSS over Unix channel."""
-import asyncio,os,ssl,sys
+import asyncio,os,ssl,sys,time
 from pathlib import Path
 import aiohttp,httpx
 from aiohttp import web
@@ -11,7 +11,7 @@ from app.max_client import OpCode
 from telegram.error import NetworkError
 from tests.isolated_container_fixture import assert_sandbox
 
-async def broker():
+async def broker(pinned=False):
     assert_sandbox();ctx=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER);ctx.load_cert_chain('/cert/cert.pem','/cert/key.pem')
     async def hello(req):return web.json_response({'synthetic':True})
     evidence={'handshake':0,'auth':0,'max_send':0,'getMe':0,'getUpdates':0,'sendMessage':0}
@@ -39,9 +39,24 @@ async def broker():
     calls=[]
     async def local(role,target):
         calls.append((role,target));return await asyncio.open_connection('127.0.0.1',port)
-    servers=[TunnelServer(role,f'/channel{i}/egress.sock',connector=local) for i,role in enumerate(('max-text','telegram'))]
+    task=None;stop=asyncio.Event()
+    if pinned:
+        from app.linux_egress_policy import BrokerPins
+        from app.pinned_broker import PinnedBroker
+        pins=BrokerPins.parse({'max-text':['8.8.8.8'],'telegram':['9.9.9.9'],'expires_at':int(time.time())+120})
+        async def dial(address,port,*,family,flags):
+            import socket
+            assert family==socket.AF_INET and flags==socket.AI_NUMERICHOST and port==443
+            role={'8.8.8.8':'max-text','9.9.9.9':'telegram'}[address];target={'max-text':'api.oneme.ru:443','telegram':'api.telegram.org:443'}[role]
+            return await local(role,target)
+        controller=PinnedBroker(pins,{'a'*24:'/channel0','telegram':'/channel1'},dial=dial)
+        servers=list(controller.servers.values())
+    else:servers=[TunnelServer(role,f'/channel{i}/proxy.sock',connector=local) for i,role in enumerate(('max-text','telegram'))]
     try:
-        for s in servers:await s.start()
+        if pinned:
+            task=asyncio.create_task(controller.serve(stop));await asyncio.wait_for(controller.ready.wait(),3)
+        else:
+            for s in servers:await s.start()
         print('READY',flush=True)
         for _ in range(300):
             for i,server in enumerate(servers):
@@ -54,14 +69,18 @@ async def broker():
         assert evidence=={'handshake':1,'auth':1,'max_send':1,'getMe':1,'getUpdates':1,'sendMessage':1},evidence
         print('BROKER PASS: actual client handshake/auth/send + Bot API receipts; no fallback',flush=True)
     finally:
-        for s in servers:await s.close()
+        if task:
+            stop.set();assert await task=='STOPPED';assert not controller.ready.is_set()
+        else:
+            for s in servers:await s.close()
         await runner.cleanup()
+    if pinned:print('PINNED BROKER PASS: numeric role pins, verified TLS, separate clients',flush=True)
 
 async def client(role):
     assert_sandbox();assert not Path('/channel0').exists() and not Path('/channel1').exists() and not Path('/cert/key.pem').exists()
     ctx=ssl.create_default_context(cafile='/cert/cert.pem');assert ctx.check_hostname and ctx.verify_mode==ssl.CERT_REQUIRED
     host='api.oneme.ru' if role=='max-text' else 'api.telegram.org';foreign='api.telegram.org' if role=='max-text' else 'api.oneme.ru'
-    proxy=LoopbackProxy('/channel/egress.sock');url=await proxy.start()
+    proxy=LoopbackProxy('/channel/proxy.sock');url=await proxy.start()
     try:
         # All container network interfaces except loopback are down.
         if role=='max-text':
@@ -89,7 +108,7 @@ async def client(role):
             raise AssertionError('Broker did not disconnect')
         if role=='max-text':
             sid='a'*24
-            async with isolated_max_client('/channel/egress.sock','/secret',sid,context=ctx) as max_client:
+            async with isolated_max_client('/channel/proxy.sock','/secret',sid,context=ctx) as max_client:
                 ready=asyncio.Event()
                 @max_client.on_ready
                 async def on_ready(_):ready.set()
@@ -104,7 +123,7 @@ async def client(role):
                     except aiohttp.ClientError:pass
                     else:raise AssertionError('Unexpected success without broker')
         else:
-            async with isolated_telegram_bot('/channel/egress.sock','123456:synthetic',context=ctx) as bot:
+            async with isolated_telegram_bot('/channel/proxy.sock','123456:synthetic',context=ctx) as bot:
                 assert bot.id==900;assert not await bot.get_updates(timeout=0)
                 receipt=await bot.send_message(chat_id=-10001,text='synthetic tg');assert receipt.message_id==17 and receipt.chat.id==-10001
                 await disconnect()
@@ -118,5 +137,5 @@ if __name__=='__main__':
     if sys.argv[1]=='init':
         for p in ('/channel0','/channel1'):os.chmod(p,0o700);os.chown(p,65532,65532)
         os.chmod('/secret',0o700);install_worker_secret('/secret','a'*24,{'session_id':'a'*24,'MAX_TOKEN':'synthetic-max','MAX_DEVICE_ID':'synthetic-device'});os.chown('/secret/max.json',65532,65532);os.chown('/secret',65532,65532)
-    elif sys.argv[1]=='broker':asyncio.run(broker())
+    elif sys.argv[1] in ('broker','broker-pinned'):asyncio.run(broker(sys.argv[1]=='broker-pinned'))
     else:asyncio.run(client(sys.argv[1]))
