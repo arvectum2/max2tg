@@ -68,3 +68,24 @@ async def test_invalidation_during_inflight_check_cannot_restore_lease(tmp_path)
         t=asyncio.create_task(g.refresh({sid}));await asyncio.wait_for(entered.wait(),2);g.invalidate(FORUM);resume.set();await t
         assert not g.allowed(sid) and g.status[sid]=='RECHECK';b.get_chat_member_count.side_effect=None;await g.refresh({sid});assert g.allowed(sid)
     finally:r.close()
+
+@pytest.mark.asyncio
+async def test_rolling_pool_removal_and_cancel_release_owned_checks(tmp_path):
+    r=CapsuleRegistry(tmp_path/'registry');o=SharedOnboarding(r);b=bot();sid=o.reserve(REQ,ACTOR,FORUM);await o.verify_forum(REQ,b);o.confirm_provisioned(REQ,check=lambda *_:True);await o.activate(REQ,b,check=lambda *_:True)
+    c=Clock();g=ForumGuard(r,b,clock=c);g.bot.clock=c;g.bot.sleep=c.sleep
+    entered=asyncio.Event();cancelled=asyncio.Event();active={sid};stop=asyncio.Event()
+    async def count(*args):
+        entered.set()
+        try:await asyncio.Event().wait()
+        finally:cancelled.set()
+    b.get_chat_member_count.side_effect=count
+    task=asyncio.create_task(g.run_rolling(lambda:active,stop))
+    try:
+        await asyncio.wait_for(entered.wait(),2);active.clear();await asyncio.wait_for(cancelled.wait(),2)
+        assert not g.allowed(sid) and g.generation[sid]>0
+        entered.clear();cancelled.clear();active.add(sid);await asyncio.wait_for(entered.wait(),2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):await task
+        assert cancelled.is_set() and not g.allowed(sid) and not g.lock.locked()
+    finally:
+        task.cancel();await asyncio.gather(task,return_exceptions=True);r.close()

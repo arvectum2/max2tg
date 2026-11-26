@@ -7,7 +7,8 @@ from app.deployment_plan import build_plan,_verify_stopped,validate_bind_sources
 from app.container_supervisor import DockerBackend
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--image',required=True);p.add_argument('--native-volumes',action='store_true');p.add_argument('--load',type=int,choices=range(1,26));p.add_argument('--tenants',type=int,choices=(2,4,8,16,32),default=2);p.add_argument('--profile',action='store_true');p.add_argument('--long-poll',action='store_true');p.add_argument('--mixed',action='store_true');p.add_argument('--soak',action='store_true');p.add_argument('--storage-check',action='store_true');p.add_argument('--wal-maintenance',action='store_true');a=p.parse_args();
+    p=argparse.ArgumentParser();p.add_argument('--image',required=True);p.add_argument('--native-volumes',action='store_true');p.add_argument('--load',type=int,choices=range(1,26));p.add_argument('--tenants',type=int,choices=(2,4,8,16,32),default=2);p.add_argument('--profile',action='store_true');p.add_argument('--long-poll',action='store_true');p.add_argument('--mixed',action='store_true');p.add_argument('--soak',action='store_true');p.add_argument('--storage-check',action='store_true');p.add_argument('--wal-maintenance',action='store_true');p.add_argument('--delay150',action='store_true');p.add_argument('--balanced',action='store_true');a=p.parse_args();
+    if (a.delay150 or a.balanced) and not (a.mixed and a.profile and a.long_poll and a.native_volumes):p.error('Experimental comparison requires native profiled mixed long polling')
     if a.storage_check and not a.mixed:p.error('Storage check requires mixed workload')
     if a.wal_maintenance and not (a.storage_check or a.soak):p.error('WAL candidate requires resource checkpoints')
     if a.soak and not a.mixed:p.error('Soak requires mixed workload')
@@ -67,9 +68,11 @@ def main():
                     if a.long_poll:s['command'].append('long-poll')
                     if a.mixed:s['command'].append('mixed')
                     if a.soak:s['command'].append('soak')
+                    if a.delay150:s['command'].append('delay150')
                 else:
                     if a.profile:s['command'].append('profile')
                     if a.wal_maintenance:s['command'].append('wal')
+                    if role=='gateway' and a.balanced:s['command'].append('balanced')
             path=root/'compose.json';path.write_text(json.dumps(plan));cmd=('compose','-f',str(path),'--profile','acceptance-only');d.call(*cmd,'config','--quiet');d.call(*cmd,'create','--no-build','--pull','never')
             for role,s in plan['services'].items():
                 c=d.inspect(s['container_name'])
@@ -151,7 +154,7 @@ def main():
                     if a.tenants==32:
                         metrics['lease_observation']=read(gateway,'/registry/lease-observation.json')
                         assert metrics['lease_observation']['samples']>0
-                    metrics['wal_maintenance']=a.wal_maintenance
+                    metrics['wal_maintenance']=a.wal_maintenance;metrics['balanced']=a.balanced;metrics['delay_ms']=150 if a.delay150 else 0
                     print('MIXED RESULT '+json.dumps(metrics,sort_keys=True),flush=True)
                     print('PROFILE RESULT '+json.dumps(stages,sort_keys=True),flush=True)
                     return

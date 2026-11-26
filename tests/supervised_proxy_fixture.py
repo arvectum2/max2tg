@@ -21,7 +21,7 @@ def user(uid):return {'id':uid,'is_bot':uid==900,'first_name':'Synthetic','usern
 def chat(gid):return {'id':gid,'type':'supergroup','title':'Synthetic','is_forum':True}
 def message(gid,mid,text,actor=900):return {'message_id':mid,'date':1700000000,'chat':chat(gid),'from':user(actor),'message_thread_id':77,'text':text,'is_topic_message':True}
 
-async def broker(network_paths=None,*,long_poll=False,mixed=False,cycles=1):
+async def broker(network_paths=None,*,long_poll=False,mixed=False,cycles=1,delay=0):
     assert_sandbox();assert not any(Path(p).exists() for p in ('/keys','/secret','/registry','/keys0','/keys1','/botkeys','/botsecret'));ctx=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER);ctx.load_cert_chain('/cert/cert.pem','/cert/key.pem');paths=network_paths or ['/net0','/net1','/nettg'];tenants=len(paths)-1;assert tenants in (2,4,8,16,32);control=Path(paths[-1])
     evidence=control/'counts.json';counts=json.loads(evidence.read_text()) if evidence.exists() else {'max':[],'tg':[],'auth':[0]*tenants};servers=[];load_sockets={};load_n=0
     (control/'cut-a').unlink(missing_ok=True);(control/'cut-confirmed').unlink(missing_ok=True)
@@ -63,6 +63,7 @@ async def broker(network_paths=None,*,long_poll=False,mixed=False,cycles=1):
             if text in mixed_at:counts['mixed_effects'].append([text,time.monotonic()-mixed_at[text],time.monotonic()-mixed_started])
             report();data=message(gid,5000+len(counts['tg']),text)
         else:raise AssertionError('Unexpected method '+method)
+        if delay and method!='getUpdates':await asyncio.sleep(delay)
         return web.json_response({'ok':True,'result':data})
     def handler(i):
         async def ws(req):

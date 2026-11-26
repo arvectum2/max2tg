@@ -30,8 +30,12 @@ async def remove_dead_socket(path):
     writer.close();await writer.wait_closed();raise RuntimeError('IPC listener already active')
 
 class SharedGatewayRuntime:
-    def __init__(self,registry,bot,*,channels=None,external_only=False,managed=False,profile=None):
+    def __init__(self,registry,bot,*,channels=None,external_only=False,managed=False,profile=None,balanced=False):
         if managed and (channels is None or not external_only):raise ValueError("Managed mode requires external dedicated channels")
+        if balanced:
+            from app.weighted_budget import WeightedBudget
+            if not managed or not isinstance(bot,BudgetedBot) or not isinstance(bot.budget,WeightedBudget):raise ValueError("Explicit weighted managed budget required")
+        self.balanced=balanced
         self.wal_maintenance=None;self.profile=profile;self.managed=managed;self._opened=set();self.bot_id=None;self.poll_failures=0
         self.registry=registry;self.bot=bot;self.lock=RuntimeLock(registry.root/'shared-gateway.lock')
         self.inbox=None;self.egress=None;self.server=None;self.servers=[];self.started=False;self._poll_lock=asyncio.Lock();self._drain_lock=asyncio.Lock()
@@ -47,7 +51,7 @@ class SharedGatewayRuntime:
                 self.bot=bot if isinstance(bot,BudgetedBot) else BudgetedBot(bot,TelegramBudget(registry.db,profile=profile))
             self.plane=TelegramControlPlane(registry)
             self.provisioner=SharedTopicProvisioner(self.plane)
-            self.guard=ForumGuard(registry,self.bot) if managed else None
+            self.guard=ForumGuard(registry,self.bot,concurrency=8 if balanced else 4) if managed else None
             allowed=self._dispatch_allowed if self.guard else None
             self.inbox=TelegramInbox(registry.root/'inbox.sqlite3',self.plane,dispatch_allowed=allowed,profile=profile)
             self.egress=TelegramEgress(registry.root/'telegram-egress.sqlite3',self.plane,topic_scoped=True,dispatch_allowed=allowed,profile=profile)
@@ -118,11 +122,11 @@ class SharedGatewayRuntime:
         for r in self.plane.db.execute("SELECT forum FROM shared_onboarding WHERE stage='ACTIVE'"):
             self.guard.invalidate(int(r[0]))
 
-    async def reconcile_channels(self):
+    async def reconcile_channels(self,*,refresh=True):
         """Only pre-mounted channels; never mounts paths or accepts tenant input."""
         if not self.managed or not self.started:raise RuntimeError('Managed gateway not started')
         with measure(self.profile,"gateway.forum_refresh"):
-            await self.guard.refresh(self._desired_channels())
+            if refresh:await self.guard.refresh(self._desired_channels())
         at=started(self.profile)
         async with self._drain_lock:
             finished(self.profile,"gateway.lifecycle_lock",at)
@@ -192,11 +196,11 @@ class SharedGatewayRuntime:
             held=(self._desired_channels() if self.poll_failures else self.guard.held_sessions()) if self.guard else ()
             if self.managed:
                 # Small rounds release the lifecycle lock often. Only separate
-                # worker IPCs run concurrently; Bot API sends remain serial.
+                # worker IPCs run concurrently; parallel sends are opt-in.
                 with measure(self.profile,'gateway.ingress_round'):
                     ingress=await self.engine.drain(32,exclude=held,concurrency=4,fair=True)
                 with measure(self.profile,'gateway.egress_round'):
-                    egress=await self.engine.drain_egress(self.bot,16,exclude=held,fair=True)
+                    egress=await self.engine.drain_egress(self.bot,16,exclude=held,fair=True,concurrency=4 if self.balanced else 1)
                 return {'ingress':ingress,'egress':egress}
             return {'ingress':await self.engine.drain(exclude=held),'egress':await self.engine.drain_egress(self.bot,exclude=held)}
 
@@ -229,7 +233,7 @@ class SharedGatewayRuntime:
                 except asyncio.TimeoutError:pass
         async def checks():
             while not stop.is_set():
-                await self.reconcile_channels()
+                await self.reconcile_channels(refresh=not self.balanced)
                 try:await asyncio.wait_for(stop.wait(),.2)
                 except asyncio.TimeoutError:pass
         tasks=[]
@@ -237,6 +241,7 @@ class SharedGatewayRuntime:
             await self.start()
             tasks=[asyncio.create_task(polls()),asyncio.create_task(drains()),asyncio.create_task(stop.wait())]
             if self.managed:tasks.append(asyncio.create_task(checks()))
+            if self.balanced:tasks.append(asyncio.create_task(self.guard.run_rolling(self._desired_channels,stop)))
             done,_=await asyncio.wait(tasks,return_when=asyncio.FIRST_COMPLETED)
             for task in done:await task
         finally:
