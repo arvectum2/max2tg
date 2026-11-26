@@ -14,7 +14,7 @@ from app.isolated_worker_runtime import IsolatedWorkerRuntime
 from tests.isolated_container_fixture import prepare,assert_sandbox
 from tests.supervised_bridge_fixture import atomic
 from tests.synthetic_long_poll import UpdateWakeup
-from tests.synthetic_mixed_load import schedule
+from tests.synthetic_mixed_load import schedule,phase_anchor_ready
 
 
 def user(uid):return {'id':uid,'is_bot':uid==900,'first_name':'Synthetic','username':'synthetic_bot' if uid==900 else 'synthetic_user'}
@@ -28,6 +28,7 @@ async def broker(network_paths=None,*,long_poll=False,mixed=False,cycles=1,delay
     def report():atomic(control/'counts.json',counts)
     wakeup=UpdateWakeup();mixed_started=None;mixed_index=0;mixed_updates=[];mixed_at={};waves=schedule(tenants,cycles) if mixed else []
     fault_emitted=False;fault_waiting=False;crash_emitted=False
+    phase_checks={}
     def updates(offset):
         phase=2 if (control/'phase2').exists() else 1 if (control/'phase1').exists() else 0
         data=[{'update_id':tenants*j+i+1,'message':message(-10000-i,100+tenants*j+i,f'incoming-{i}-{j}',100+i)} for j in range(phase) for i in range(tenants) if tenants*j+i+1>=offset]
@@ -55,6 +56,8 @@ async def broker(network_paths=None,*,long_poll=False,mixed=False,cycles=1,delay
             data=2
             if mixed_started is not None:
                 counts['mixed_verified'].setdefault(str(-10000-gid),[]).append(time.monotonic()-mixed_started);report()
+            elif mixed and tenants==4 and (control/'mixed-start').exists():
+                phase_checks[-10000-gid]=time.monotonic()
         elif method=='getChatMember':
             data={'user':user(uid),'status':'creator' if uid!=900 else 'administrator','is_anonymous':False}
             if uid==900:data.update({k:True for k in ('can_be_edited','can_manage_chat','can_delete_messages','can_manage_video_chats','can_restrict_members','can_promote_members','can_change_info','can_invite_users','can_post_stories','can_edit_stories','can_delete_stories','can_manage_topics')})
@@ -128,9 +131,13 @@ async def broker(network_paths=None,*,long_poll=False,mixed=False,cycles=1,delay
                 for j in range(n):
                     for i,w in load_sockets.items():
                         await w.send_bytes(encode({'cmd':0,'seq':0,'opcode':OpCode.DISPATCH,'payload':{'chatId':42,'message':{'id':1000+j,'sender':999,'text':f'load-out-{i}-{j}'}}}))
-            if mixed and mixed_started is None and (control/'mixed-start').exists():
+            if (mixed and mixed_started is None and (control/'mixed-start').exists()
+                    and (tenants!=4 or phase_anchor_ready(tenants,phase_checks,time.monotonic()))):
                 assert not load_n and set(load_sockets)==set(range(tenants)) and all(not w.closed for w in load_sockets.values())
-                mixed_started=time.monotonic();counts['mixed_effects']=[];counts['mixed_verified']={};counts['mixed_emitted']=0;report()
+                mixed_started=time.monotonic()
+                if tenants==4:
+                    counts['mixed_phase_anchor']={'age_s':round(mixed_started-min(phase_checks.values()),3),'span_s':round(max(phase_checks.values())-min(phase_checks.values()),3)}
+                counts['mixed_effects']=[];counts['mixed_verified']={};counts['mixed_emitted']=0;report()
             if mixed_started is not None:
                 while mixed_index<len(waves) and time.monotonic()-mixed_started>=waves[mixed_index][0]:
                     _,pairs=waves[mixed_index]

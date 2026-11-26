@@ -4,6 +4,20 @@ import math
 
 IDLE=(32,50)
 
+def phase_anchor_ready(tenants, checks, now):
+    """Only align a small synthetic cohort; never alter runtime check policy.
+
+    All tenants must have a recent completed check from one tightly grouped
+    wave after explicit arming. No deadline or acceptance-window extension.
+    """
+    if tenants!=4 or set(checks)!=set(range(tenants)):
+        return False
+    if type(now) not in (int,float) or not math.isfinite(now):
+        return False
+    return all(type(at) in (int,float) and math.isfinite(at)
+               and 0<=now-at<=4 for at in checks.values())
+
+
 def schedule(tenants,cycles=1):
     if type(cycles) is not int or not 1<=cycles<=3:raise ValueError('Invalid cycle count')
     if tenants not in (2,4,8,16,32,64):raise ValueError('Invalid cohort')
