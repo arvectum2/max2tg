@@ -63,7 +63,7 @@ class SyntheticLifecycle:
         self._save({'version':1,'digest':plan_digest(self.plan),'daemon':_daemon(self.d),'inventory':inventory,'phase':'HELD','recovery':{r:{'attempts':0,'retry_at':0} for r in self.order}})
     def _load(self):
         m=json.loads(_file(self.root,'lifecycle.json').read_text())
-        if set(m)!={'version','digest','daemon','inventory','phase','recovery'} or m['version']!=1 or m['digest']!=plan_digest(self.plan) or m['daemon']!=_daemon(self.d) or set(m['inventory'])!=set(self.roles) or m['phase'] not in ('HELD','STARTING','RUNNING','STOPPING','STOPPED','BLOCKED','RECOVERING'):raise PermissionError('Lifecycle inventory changed')
+        if set(m)!={'version','digest','daemon','inventory','phase','recovery'} or m['version']!=1 or m['digest']!=plan_digest(self.plan) or m['daemon']!=_daemon(self.d) or set(m['inventory'])!=set(self.roles) or m['phase'] not in ('HELD','STARTING','RUNNING','STOPPING','STOPPED','BLOCKED','RECOVERING','BACKING_UP','BACKUP_BLOCKED','ARCHIVED'):raise PermissionError('Lifecycle inventory changed')
         recovery=m['recovery']
         if not isinstance(recovery,dict) or set(recovery)!=set(self.roles):raise PermissionError('Invalid recovery inventory')
         for entry in recovery.values():
@@ -78,7 +78,7 @@ class SyntheticLifecycle:
         return result
     def status(self):
         m=self._load();observed=self._check(m);n=sum(s=='running' for s,_ in observed.values());phase=m['phase']
-        if phase in ('STARTING','STOPPING','BLOCKED','RECOVERING') or (phase=='RUNNING' and n!=4) or (phase in ('HELD','STOPPED') and n!=0):phase='BLOCKED'
+        if phase in ('STARTING','STOPPING','BLOCKED','RECOVERING','BACKING_UP','BACKUP_BLOCKED') or (phase=='RUNNING' and n!=4) or (phase in ('HELD','STOPPED','ARCHIVED') and n!=0):phase='BLOCKED'
         return {'state':phase,'running':n,'containers':4,'live_launch_authorized':False}
     def start(self):
         m=self._load();observed=self._check(m)
@@ -145,8 +145,26 @@ class SyntheticLifecycle:
                 m['phase']='BLOCKED';self._save(m);raise
         return 'NO_ACTION'
 
+    def checkpoint(self,capture):
+        """Terminal synthetic handoff. Trusted offline capture callback only.
+
+        Ordinary start/stop cannot reopen this checkpoint. A separate reviewed
+        restore gate is required before any further external effects.
+        """
+        m=self._load();states=self._check(m)
+        if m['phase']!='STOPPED' or any(status!='exited' or state.get('ExitCode')!=0 for status,state in states.values()):raise PermissionError('Clean stopped cohort required')
+        m['phase']='BACKING_UP';self._save(m)
+        try:
+            evidence=capture()
+            if type(evidence) is not dict or evidence.get('verified') is not True:raise RuntimeError('Checkpoint evidence not confirmed')
+            if any(status!='exited' or state.get('ExitCode')!=0 for status,state in self._check(m).values()):raise RuntimeError('Checkpoint quiescence changed')
+            m['phase']='ARCHIVED';self._save(m);return evidence
+        except BaseException:
+            m['phase']='BACKUP_BLOCKED';self._save(m);raise
+
     def stop(self):
         m=self._load();self._check(m)
+        if m['phase'] in ('BACKING_UP','BACKUP_BLOCKED','ARCHIVED'):raise PermissionError('Checkpoint handoff requires separate review')
         # Explicit stop is also the recovery path from an incomplete start; no restart.
         m['phase']='STOPPING';self._save(m)
         try:
