@@ -60,9 +60,20 @@ async def placed_worker(sid,enabled=False,wal=False):
     ctx=ssl.create_default_context(cafile='/state/test-ca.pem')
     await run_isolated_worker(stop_event(),socket_path='/network/proxy.sock',secret_dir='/secret',sid=sid,state='/state',channel='/channel',key_file='/state/key',forum=cfg['forum'],actor=cfg['actor'],context=ctx,secret_key_path='/keys/worker.key',profile=profile_sink(enabled),wal_maintenance=wal)
 
-async def placed_gateway(sessions,enabled=False,wal=False,balanced=False):
+async def placed_gateway(sessions,enabled=False,wal=False,balanced=False,fault=False):
     assert_sandbox();assert sorted(p.name for p in Path('/keys').iterdir())==['bot.key'];assert sorted(p.name for p in Path('/secret').iterdir())==['telegram.enc'];r=CapsuleRegistry('/registry')
     try:
+        if fault:
+            from app.shared_gateway_runtime import SharedGatewayRuntime
+            original_drain=SharedGatewayRuntime.drain_once
+            pause=Path('/registry/test-drain-pause');paused=Path('/registry/test-drain-paused')
+            async def controlled_drain(runtime):
+                if pause.exists():
+                    paused.touch(mode=0o600)
+                    return {'ingress':{},'egress':{}}
+                paused.unlink(missing_ok=True)
+                return await original_drain(runtime)
+            SharedGatewayRuntime.drain_once=controlled_drain
         if len(sessions)==32:
             # Fixture-only observation of actual lease-aware lifecycle result,
             # not a replacement for the authorization or dispatch check.
@@ -85,6 +96,6 @@ if __name__=='__main__':
     if mode=='init':asyncio.run(prepare())
     elif mode=='broker':
         sessions=json.loads(sys.argv[2]);asyncio.run(broker(['/network/'+sid for sid,_,_ in sessions]+['/network/telegram'],long_poll='long-poll' in sys.argv[3:],mixed='mixed' in sys.argv[3:],cycles=3 if 'soak' in sys.argv[3:] else 1,delay=.15 if 'delay150' in sys.argv[3:] else 0,fault='balanced-fault' in sys.argv[3:]))
-    elif mode=='gateway':asyncio.run(placed_gateway(json.loads(sys.argv[2]),'profile' in sys.argv[3:],'wal' in sys.argv[3:],'balanced' in sys.argv[3:]))
+    elif mode=='gateway':asyncio.run(placed_gateway(json.loads(sys.argv[2]),'profile' in sys.argv[3:],'wal' in sys.argv[3:],'balanced' in sys.argv[3:],'balanced-fault' in sys.argv[3:]))
     elif mode=='worker':asyncio.run(placed_worker(sys.argv[2],'profile' in sys.argv[3:],'wal' in sys.argv[3:]))
     else:raise SystemExit(78)
