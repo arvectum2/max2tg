@@ -63,7 +63,7 @@ def rows(path,query):
         return db.execute(query).fetchall()
 
 
-async def client(cert,root):
+async def client(cert,root,crash=False):
     unprivileged()
     isolated([],{'lo'})
     sid=await provision(root)
@@ -97,35 +97,56 @@ async def client(cert,root):
                     assert (await g.drain_once())['ingress']=={'UNKNOWN':1}
                     assert g.inbox.row(2)['status']=='UNKNOWN'
                     assert w.ledger.row(FORUM,102)['status']=='UNKNOWN'
-                    await until((root/'rotated').is_file)
-                    # A new update while disconnected is durably queued, not falsely ACKed.
-                    (root/'phase3').touch()
-                    assert await g.poll_once()==1
-                    assert not m._authorized
-                    assert (await g.drain_once())['ingress']=={'RECEIVED':1}
-                    assert g.inbox.row(3)['status']=='RECEIVED'
-                    assert w.ledger.row(FORUM,103) is None
-                    await until(lambda:m._authorized and m._my_id==101)
-                    assert (await g.drain_once())['ingress']=={'ACKED':1}
-                    # Explicit re-dispatch of terminal UNKNOWN and ACKED rows must not invoke MAX.
-                    assert await g.inbox.dispatch(2,g.engine.deliver)=='UNKNOWN'
-                    assert await g.inbox.dispatch(1,g.engine.deliver)=='ACKED'
-                    # Even a direct repeat through the existing signed worker IPC
-                    # cannot replay either terminal worker journal entry.
-                    assert await g.engine.deliver(sid,json.loads(g.inbox.row(2)['payload'])) is False
-                    assert await g.engine.deliver(sid,json.loads(g.inbox.row(1)['payload'])) is True
-                    await until(lambda:w.egress.counts().get('ACCEPTED',0)+w.egress.counts().get('SENT',0)==2)
-                    await g.drain_once()
-                    await until(lambda:w.egress.counts()=={'SENT':2})
-                    assert g.inbox.counts()=={'ACKED':2,'UNKNOWN':1}
-                    assert w.ledger.counts()=={'SENT':2,'UNKNOWN':1}
-                    assert g.egress.counts()=={'SENT':2}
-                    assert g._offset()==4
+                    if crash:
+                        await until((root/'broker-failed').is_file)
+                        assert not m._authorized
+                        (root/'phase3').touch()
+                        assert await g.poll_once()==0
+                        assert g.poll_failures==1 and g._offset()==3
+                        assert g.inbox.row(3) is None
+                        assert g.inbox.counts()=={'ACKED':1,'UNKNOWN':1}
+                        assert w.ledger.counts()=={'SENT':1,'UNKNOWN':1}
+                        assert await g.inbox.dispatch(2,g.engine.deliver)=='UNKNOWN'
+                        assert await g.inbox.dispatch(1,g.engine.deliver)=='ACKED'
+                        assert g.egress.counts()==w.egress.counts()=={'SENT':1}
+                    else:
+                        await until((root/'rotated').is_file)
+                        # A new update while disconnected is durably queued, not falsely ACKed.
+                        (root/'phase3').touch()
+                        assert await g.poll_once()==1
+                        assert not m._authorized
+                        assert (await g.drain_once())['ingress']=={'RECEIVED':1}
+                        assert g.inbox.row(3)['status']=='RECEIVED'
+                        assert w.ledger.row(FORUM,103) is None
+                        await until(lambda:m._authorized and m._my_id==101)
+                        assert (await g.drain_once())['ingress']=={'ACKED':1}
+                        # Explicit re-dispatch of terminal UNKNOWN and ACKED rows must not invoke MAX.
+                        assert await g.inbox.dispatch(2,g.engine.deliver)=='UNKNOWN'
+                        assert await g.inbox.dispatch(1,g.engine.deliver)=='ACKED'
+                        # Even a direct repeat through the existing signed worker IPC
+                        # cannot replay either terminal worker journal entry.
+                        assert await g.engine.deliver(sid,json.loads(g.inbox.row(2)['payload'])) is False
+                        assert await g.engine.deliver(sid,json.loads(g.inbox.row(1)['payload'])) is True
+                        await until(lambda:w.egress.counts().get('ACCEPTED',0)+w.egress.counts().get('SENT',0)==2)
+                        await g.drain_once()
+                        await until(lambda:w.egress.counts()=={'SENT':2})
+                        assert g.inbox.counts()=={'ACKED':2,'UNKNOWN':1}
+                        assert w.ledger.counts()=={'SENT':2,'UNKNOWN':1}
+                        assert g.egress.counts()=={'SENT':2}
+                        assert g._offset()==4
                 finally:
                     stop.set()
                     await asyncio.wait_for(task,5)
         finally:await g.close()
     reg.close()
+    if crash:
+        assert rows(root/'registry'/'inbox.sqlite3','SELECT update_id,status FROM telegram_ingress ORDER BY update_id')==[(1,'ACKED'),(2,'UNKNOWN')]
+        assert rows(root/'state'/'tg-outbound.sqlite3','SELECT telegram_id,status,max_id FROM outbound ORDER BY telegram_id')==[(101,'SENT','101'),(102,'UNKNOWN',None)]
+        assert rows(root/'registry'/'telegram-egress.sqlite3','SELECT status,count(*) FROM telegram_egress GROUP BY status')==[('SENT',1)]
+        assert rows(root/'state'/'to-telegram.sqlite3','SELECT status,count(*) FROM worker_telegram_intents GROUP BY status')==[('SENT',1)]
+        (root/'done').touch()
+        print('LIVE CRASH JOURNALS PASS: confirmed and UNKNOWN retained, polling offset unchanged',flush=True)
+        return
     assert rows(root/'registry'/'inbox.sqlite3','SELECT update_id,status FROM telegram_ingress ORDER BY update_id')==[(1,'ACKED'),(2,'UNKNOWN'),(3,'ACKED')]
     assert rows(root/'state'/'tg-outbound.sqlite3','SELECT telegram_id,status,max_id FROM outbound ORDER BY telegram_id')==[(101,'SENT','101'),(102,'UNKNOWN',None),(103,'SENT','103')]
     assert rows(root/'registry'/'telegram-egress.sqlite3','SELECT status,count(*) FROM telegram_egress GROUP BY status')==[('SENT',2)]

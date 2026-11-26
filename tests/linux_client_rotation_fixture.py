@@ -30,7 +30,7 @@ async def marker(path, timeout=12):
             await asyncio.sleep(.05)
 
 
-async def server(cert, root, journals=False):
+async def server(cert, root, journals=False, crash=False):
     unprivileged()
     isolated([], {'lo','m2server'})
     ctx=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -117,16 +117,18 @@ async def server(cert, root, journals=False):
             await web.TCPSite(runner,ip,443,ssl_context=ctx).start()
         print('MOCK READY',flush=True)
         await asyncio.to_thread(sys.stdin.buffer.read,1)
-        assert auth==[IPS[0],IPS[2]],auth
-        assert effects==[(IPS[0],'before'),(IPS[0],'ambiguous'),(IPS[2],'after')],effects
-        assert tg==['before','after'],tg
+        assert auth==([IPS[0]] if crash else [IPS[0],IPS[2]]),auth
+        expected=[(IPS[0],'before'),(IPS[0],'ambiguous')]
+        if not crash:expected.append((IPS[2],'after'))
+        assert effects==expected,effects
+        assert tg==(['before'] if crash else ['before','after']),tg
         if not journals:assert len(transports)==2 and transports[0] is transports[1]
-        print('CLIENT EFFECTS PASS: 3 exact MAX effects, 2 exact TG effects',flush=True)
+        print('CLIENT EFFECTS PASS:',len(effects),'exact MAX effects,',len(tg),'exact TG effects',flush=True)
     finally:
         await runner.cleanup()
 
 
-async def broker(root,expiry,nonce,identity,inherited_fd,journals=False):
+async def broker(root,expiry,nonce,identity,inherited_fd,journals=False,crash=False):
     os.close(inherited_fd)
     stat=os.stat('/proc/self/ns/net')
     assert (stat.st_dev,stat.st_ino)==identity
@@ -147,6 +149,20 @@ async def broker(root,expiry,nonce,identity,inherited_fd,journals=False):
             os.write(sys.stdout.fileno(),frame(request(nonce,current,replacement)))
             raw=await asyncio.to_thread(read_frame_fd,sys.stdin.fileno())
             return read_receipt(raw,nonce,current,replacement)
+        if crash:
+            from app.egress_policy import EgressDenied
+            try:
+                await b.rotate(new,verified_update=update)
+            except EgressDenied as exc:
+                assert str(exc)=='Rotation channel closed',str(exc)
+            else:raise AssertionError('Rotation accepted without controller receipt')
+            assert await asyncio.wait_for(task,3)=='ROTATION_FAILED'
+            assert not b.ready.is_set() and not b._accepting
+            assert not b._streams
+            assert not any((root/name/'proxy.sock').exists() for name in ('max','tg'))
+            await denied(IPS[0],443)
+            (root/'broker-failed').touch()
+            return
         await b.rotate(new,verified_update=update)
         await denied(IPS[0],443)
         (root/'rotated').touch()
@@ -267,14 +283,14 @@ def controller(ns,cert,old,root,journals=False):
 if __name__=='__main__':
     mode=sys.argv[1]
     if mode=='server':
-        asyncio.run(server(sys.argv[2],Path(sys.argv[3]),'journals' in sys.argv[4:]))
+        asyncio.run(server(sys.argv[2],Path(sys.argv[3]),'journals' in sys.argv[4:],'crash' in sys.argv[4:]))
     elif mode=='broker':
         asyncio.run(broker(Path(sys.argv[2]),int(sys.argv[3]),sys.argv[4],
-                           (int(sys.argv[5]),int(sys.argv[6])),int(sys.argv[7]),'journals' in sys.argv[8:]))
+                           (int(sys.argv[5]),int(sys.argv[6])),int(sys.argv[7]),'journals' in sys.argv[8:],'crash' in sys.argv[8:]))
     elif mode=='client':
         if 'journals' in sys.argv[4:]:
             from tests.linux_journal_rotation_fixture import client as journal_client
-            asyncio.run(journal_client(sys.argv[2],Path(sys.argv[3])))
+            asyncio.run(journal_client(sys.argv[2],Path(sys.argv[3]),crash='crash' in sys.argv[4:]))
         else:asyncio.run(client(sys.argv[2],Path(sys.argv[3])))
     else:
         raise ValueError('Unknown fixture action')
