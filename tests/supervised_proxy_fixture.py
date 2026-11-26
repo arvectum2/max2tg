@@ -22,7 +22,7 @@ def chat(gid):return {'id':gid,'type':'supergroup','title':'Synthetic','is_forum
 def message(gid,mid,text,actor=900):return {'message_id':mid,'date':1700000000,'chat':chat(gid),'from':user(actor),'message_thread_id':77,'text':text,'is_topic_message':True}
 
 async def broker(network_paths=None,*,long_poll=False,mixed=False,cycles=1,delay=0,fault=False):
-    assert_sandbox();assert not any(Path(p).exists() for p in ('/keys','/secret','/registry','/keys0','/keys1','/botkeys','/botsecret'));ctx=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER);ctx.load_cert_chain('/cert/cert.pem','/cert/key.pem');paths=network_paths or ['/net0','/net1','/nettg'];tenants=len(paths)-1;assert tenants in (2,4,8,16,32);control=Path(paths[-1])
+    assert_sandbox();assert not any(Path(p).exists() for p in ('/keys','/secret','/registry','/keys0','/keys1','/botkeys','/botsecret'));ctx=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER);ctx.load_cert_chain('/cert/cert.pem','/cert/key.pem');paths=network_paths or ['/net0','/net1','/nettg'];tenants=len(paths)-1;assert tenants in (2,4,8,16,32,64);control=Path(paths[-1])
     evidence=control/'counts.json';counts=json.loads(evidence.read_text()) if evidence.exists() else {'max':[],'tg':[],'auth':[0]*tenants};servers=[];load_sockets={};load_n=0
     (control/'cut-a').unlink(missing_ok=True);(control/'cut-confirmed').unlink(missing_ok=True)
     def report():atomic(control/'counts.json',counts)
@@ -221,7 +221,7 @@ async def worker(sid,encrypted=False):
 if __name__=='__main__':
     mode=sys.argv[1]
     if mode=='init':
-        tenants=int(sys.argv[2]) if len(sys.argv)>2 else 2;assert tenants in (2,4,8,16,32);encrypted=Path('/botkeys').exists();prepare(encrypted=encrypted,tenants=tenants)
+        tenants=int(sys.argv[2]) if len(sys.argv)>2 else 2;assert tenants in (2,4,8,16,32,64);encrypted=Path('/botkeys').exists();prepare(encrypted=encrypted,tenants=tenants)
         if encrypted:
             from app.encrypted_storage import create_key
             from app.encrypted_credentials import install_encrypted_bot

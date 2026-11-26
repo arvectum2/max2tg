@@ -55,7 +55,7 @@ def profile_sink(enabled):
     return profile
 
 async def placed_worker(sid,enabled=False,wal=False):
-    assert_sandbox();assert not Path('/registry').exists();cfg=json.loads(Path('/state/worker-acl.json').read_text());assert cfg['sid']==sid and 100<=cfg['actor']<132
+    assert_sandbox();assert not Path('/registry').exists();cfg=json.loads(Path('/state/worker-acl.json').read_text());assert cfg['sid']==sid and 100<=cfg['actor']<164
     assert sorted(p.name for p in Path('/keys').iterdir())==['worker.key'] and sorted(p.name for p in Path('/secret').iterdir())==['max.enc']
     ctx=ssl.create_default_context(cafile='/state/test-ca.pem')
     await run_isolated_worker(stop_event(),socket_path='/network/proxy.sock',secret_dir='/secret',sid=sid,state='/state',channel='/channel',key_file='/state/key',forum=cfg['forum'],actor=cfg['actor'],context=ctx,secret_key_path='/keys/worker.key',profile=profile_sink(enabled),wal_maintenance=wal)
@@ -74,7 +74,7 @@ async def placed_gateway(sessions,enabled=False,wal=False,balanced=False,fault=F
                 paused.unlink(missing_ok=True)
                 return await original_drain(runtime)
             SharedGatewayRuntime.drain_once=controlled_drain
-        if len(sessions)==32:
+        if len(sessions) in (32,64):
             # Fixture-only observation of actual lease-aware lifecycle result,
             # not a replacement for the authorization or dispatch check.
             from app.shared_gateway_runtime import SharedGatewayRuntime
@@ -88,7 +88,7 @@ async def placed_gateway(sessions,enabled=False,wal=False,balanced=False,fault=F
                     atomic(Path('/registry/lease-observation.json'),tally)
                 return result
             SharedGatewayRuntime.lifecycle_snapshot=snapshot
-        await run_isolated_gateway(stop_event(),socket_path='/network/proxy.sock',registry=r,channels={sid:Path('/channels')/sid for sid,_,_ in sessions},context=ssl.create_default_context(cafile='/registry/test-ca.pem'),secret_dir='/secret',secret_key_path='/keys/bot.key',bot_id=123456,profile=profile_sink(enabled),wal_maintenance=wal,balanced=balanced)
+        await run_isolated_gateway(stop_event(),socket_path='/network/proxy.sock',registry=r,channels={sid:Path('/channels')/sid for sid,_,_ in sessions},context=ssl.create_default_context(cafile='/registry/test-ca.pem'),secret_dir='/secret',secret_key_path='/keys/bot.key',bot_id=123456,profile=profile_sink(enabled),wal_maintenance=wal,balanced=balanced,experimental_64=len(sessions)==64)
     finally:r.close()
 
 if __name__=='__main__':

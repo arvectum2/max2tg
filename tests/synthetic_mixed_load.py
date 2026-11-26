@@ -6,7 +6,7 @@ IDLE=(32,50)
 
 def schedule(tenants,cycles=1):
     if type(cycles) is not int or not 1<=cycles<=3:raise ValueError('Invalid cycle count')
-    if tenants not in (2,4,8,16,32):raise ValueError('Invalid cohort')
+    if tenants not in (2,4,8,16,32,64):raise ValueError('Invalid cohort')
     seq=Counter();waves=[]
     def add(at,counts):
         entries=[]
@@ -14,6 +14,13 @@ def schedule(tenants,cycles=1):
             for _ in range(n):
                 j=seq[i];seq[i]+=1;entries.append((i,j))
         waves.append((at,tuple(entries)))
+    if tenants==64:
+        if cycles!=1:raise ValueError('64-session rehearsal limited to one cycle')
+        # Two paced passes, 8 messages per direction every 3 seconds.
+        # Deliberately below the 64-forum nominal residual API budget.
+        for start in (0,53):
+            for k in range(8):add(start+3*k,[(i,1) for i in range(k*8,(k+1)*8)])
+        return waves
     for k,at in enumerate((0,3,6,9)):
         add(at,[(i,1) for i in range(tenants) if i%min(4,tenants)==k%min(4,tenants)])
     add(12,[(i,12 if i==0 else 4) for i in range(tenants)])

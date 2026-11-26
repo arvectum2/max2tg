@@ -14,7 +14,7 @@ from app.worker_secrets import install_worker_secret,load_worker_secret,build_ma
 UID=65532
 
 async def _prepare(*,defer_second=False,encrypted=False,tenants=2):
-    assert tenants in (2,4,8,16,32)
+    assert tenants in (2,4,8,16,32,64)
     dirs=['registry']+[f'{part}{i}' for i in range(tenants) for part in ('channel','state','secret')]
     for name in dirs:
         p=Path('/'+name);assert p.is_dir() and not list(p.iterdir());p.chmod(0o700)
