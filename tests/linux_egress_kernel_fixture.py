@@ -4,6 +4,8 @@ Public-looking synthetic addresses are assigned to loopback, never routed outsid
 import json,os,socket,subprocess,time
 from pathlib import Path
 from app.linux_egress_policy import BrokerPins
+from app.linux_namespace_gate import prepare_fresh_policy,verify_ruleset
+from app.egress_policy import EgressDenied
 
 
 def call(*args,stdin=None):
@@ -33,7 +35,18 @@ def main():
     for ip in ('8.8.8.8','9.9.9.9','1.1.1.1'):call('ip','address','add',ip+'/32','dev','lo')
     assert {v['ifname'] for v in json.loads(call('ip','-j','link','show')) if 'UP' in v['flags']}=={'lo'}
     pins=BrokerPins.parse({'max-text':['8.8.8.8'],'telegram':['9.9.9.9'],'expires_at':int(time.time())+12})
-    rules=pins.render();call('nft','-c','-f','-',stdin=rules);call('nft','-f','-',stdin=rules)
+    def observe():return json.loads(call('nft','-j','list','ruleset'))
+    def install(rules):call('nft','-c','-f','-',stdin=rules);call('nft','-f','-',stdin=rules)
+    assert prepare_fresh_policy(pins,observe=observe,install=install)['verified']
+    # Deliberate extra rule in this disposable namespace only. Reject the full
+    # observed policy before any broker start; remove exactly this own rule.
+    call('nft','add','rule','inet','m2tg_egress','output','counter','drop','comment','synthetic-drift')
+    try:verify_ruleset(pins,observe())
+    except EgressDenied:pass
+    else:raise AssertionError('Extra kernel rule accepted')
+    extra=[x['rule']['handle'] for x in observe()['nftables'] if 'rule' in x and x['rule'].get('comment')=='synthetic-drift']
+    assert len(extra)==1;call('nft','delete','rule','inet','m2tg_egress','output','handle',str(extra[0]))
+    assert verify_ruleset(pins,observe())['verified'];print('KERNEL READBACK GATE PASS: exact policy; injected drift rejected',flush=True)
     initial=counters('output');assert initial==[0,0]
     for ip in ('8.8.8.8','9.9.9.9'):connect(ip,443)
     allowed=counters('output');assert allowed[0]>=2 and allowed[1]==0
