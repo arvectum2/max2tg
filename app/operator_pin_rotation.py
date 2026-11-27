@@ -67,6 +67,24 @@ class NamespaceHandle:
         if not re.fullmatch('[0-9a-f-]{36}',boot):_deny('Invalid boot identity')
         return {'boot':boot,'pid':self.pid,'start':self.started,'namespace':list(self.identity)}
 
+    def retired(self):
+        """Read-only snapshot: loopback is the only active interface; no nonlocal routes."""
+        self.check()
+        def ip(*args):
+            result=subprocess.run(
+                ['/usr/bin/nsenter',f'--net=/proc/self/fd/{self.fd}','--',
+                 '/usr/sbin/ip','-j',*args],pass_fds=(self.fd,),
+                text=True,capture_output=True,check=True,timeout=4)
+            return json.loads(result.stdout)
+        links=ip('link')
+        routes=ip('-4','route','show','table','all')+ip('-6','route','show','table','all')
+        self.check()
+        return (type(links) is list and
+                {i['ifname'] for i in links if 'UP' in i['flags']}=={'lo'}
+                and all(r.get('dev')=='lo' and r.get('table')=='local'
+                        and r.get('type') in ('local','broadcast')
+                        and 'gateway' not in r and 'nexthops' not in r for r in routes))
+
     def _nft(self,args,*,data=None):
         self.check()
         result=subprocess.run(

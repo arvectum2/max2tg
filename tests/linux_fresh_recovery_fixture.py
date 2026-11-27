@@ -14,7 +14,7 @@ from app.rotation_fence import RotationFence
 from app.isolated_transport import isolated_max_client, isolated_telegram_bot
 from app.isolated_worker_runtime import IsolatedWorkerRuntime
 from app.linux_egress_policy import BrokerPins
-from app.linux_namespace_gate import prepare_fresh_policy
+from app.recovery_transition import RecoveryTransition
 from app.operator_pin_rotation import NamespaceHandle
 from app.pinned_broker import PinnedBroker
 from app.shared_gateway_runtime import SharedGatewayRuntime
@@ -138,11 +138,19 @@ def recover(ns,cert,root,old_handle,client_ns,anchor):
         for ip in IPS:call(*fresh,'ip','route','add',ip+'/32','via','192.0.2.1','dev','eth0')
         isolated(fresh,{'lo','eth0'})
         isolated(ns,{'lo'})
-        expiry=int(time.time())+28
-        pins=BrokerPins.parse({'max-text':[IPS[2]],'telegram':[IPS[1]],'expires_at':expiry})
-        result=prepare_fresh_policy(pins,observe=handle.observe,
-            install=lambda batch:call(*fresh,'nft','-f','-',data=batch))
-        assert result['verified'] and not result['live_launch_authorized']
+        with RotationFence(anchor,old_handle) as retained:
+            expiry=max(int(time.time())+28,retained._load()['replacement']['expires_at']+1)
+            pins=BrokerPins.parse({'max-text':[IPS[2]],'telegram':[IPS[1]],'expires_at':expiry})
+            transition=RecoveryTransition(retained,handle)
+            result=transition.prepare(pins,operator_approved=True,stopped=lambda:not children,
+                install=lambda batch:handle._nft(['-f','-'],data=batch))
+            assert result['verified'] and result['recovery_prepared'] and not result['live_launch_authorized']
+            assert transition.inspect()['prepared_policy_matches']
+            try:RecoveryTransition(retained,handle).prepare(pins,operator_approved=True,
+                stopped=lambda:not children,install=lambda batch:handle._nft(['-f','-'],data=batch))
+            except EgressDenied:pass
+            else:raise AssertionError('Prepared recovery replayed')
+            print('DURABLE RECOVERY TRANSITION PASS',flush=True)
         call(*DROP,sys.executable,'-c','from pathlib import Path;import sys;p=Path(sys.argv[1]);[(p/n).mkdir(mode=0o700) for n in ("recovery-max","recovery-tg")]',root)
         children.append(subprocess.Popen(['/usr/bin/nsenter',f'--net=/proc/self/fd/{handle.fd}','--',
             *DROP,sys.executable,'-m','tests.linux_fresh_recovery_fixture','broker',root,str(expiry),
