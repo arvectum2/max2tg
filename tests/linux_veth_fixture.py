@@ -137,7 +137,7 @@ async def exercise(cert, expiry):
 
 
 
-def main(rotation=False, clients=False, journals=False, crash=False, recovery=False):
+def main(rotation=False, clients=False, journals=False, crash=False, recovery=False, generations=False):
     isolated([], {'lo'})
     assert os.getuid() == 0 and 'NoNewPrivs:\t1' in Path('/proc/self/status').read_text()
     assert not json.loads(call('ip', '-j', '-4', 'route', 'show', 'table', 'main'))
@@ -182,7 +182,7 @@ def main(rotation=False, clients=False, journals=False, crash=False, recovery=Fa
                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
             assert select.select([mock.stdout], [], [], 5)[0], 'Mock readiness timeout'
             assert mock.stdout.readline().strip() == 'MOCK READY'
-            expiry = int(time.time()) + (40 if journals else 30 if clients else 14)
+            expiry = int(time.time()) + (40 if journals or generations else 30 if clients else 14)
             pins = BrokerPins.parse({'max-text': [IPS[0]], 'telegram': [IPS[1]],
                                      'expires_at': expiry})
             result = prepare_fresh_policy(
@@ -196,6 +196,9 @@ def main(rotation=False, clients=False, journals=False, crash=False, recovery=Fa
             elif clients:
                 from tests.linux_client_rotation_fixture import controller
                 controller(ns,d,pins,client_root,journals=journals)
+            elif generations:
+                from tests.linux_generation_fixture import controller
+                controller(ns,d,pins)
             elif rotation:
                 from tests.linux_live_rotation_fixture import controller
                 controller(ns, d, pins)
@@ -205,7 +208,7 @@ def main(rotation=False, clients=False, journals=False, crash=False, recovery=Fa
             counts = [e['counter']['packets'] for i in json.loads(call(
                 *ns, 'nft', '-j', 'list', 'chain', 'inet', 'm2tg_egress', 'output'))['nftables']
                       if 'rule' in i for e in i['rule']['expr'] if 'counter' in e]
-            assert counts[0] > 2 and counts[1] >= (1 if rotation or clients else 4), counts
+            assert counts[0] > 2 and counts[1] >= (1 if rotation or clients or generations else 4), counts
             print('VETH KERNEL COUNTERS PASS', counts, flush=True)
     finally:
         try:
@@ -229,6 +232,8 @@ def main(rotation=False, clients=False, journals=False, crash=False, recovery=Fa
 if __name__ == '__main__':
     if len(sys.argv) == 1:
         main()
+    elif sys.argv[1] == '--generations':
+        main(generations=True)
     elif sys.argv[1] == '--fresh-recovery':
         main(clients=True,journals=True,crash=True,recovery=True)
     elif sys.argv[1] == '--controller-crash':
