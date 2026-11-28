@@ -137,7 +137,7 @@ async def exercise(cert, expiry):
 
 
 
-def main(rotation=False, clients=False, journals=False, crash=False, recovery=False, generations=False, lineage=False, leased=False):
+def main(rotation=False, clients=False, journals=False, crash=False, recovery=False, generations=False, lineage=False, leased=False, watchdog=False):
     isolated([], {'lo'})
     assert os.getuid() == 0 and 'NoNewPrivs:\t1' in Path('/proc/self/status').read_text()
     assert not json.loads(call('ip', '-j', '-4', 'route', 'show', 'table', 'main'))
@@ -182,7 +182,7 @@ def main(rotation=False, clients=False, journals=False, crash=False, recovery=Fa
                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
             assert select.select([mock.stdout], [], [], 5)[0], 'Mock readiness timeout'
             assert mock.stdout.readline().strip() == 'MOCK READY'
-            expiry = int(time.time()) + (40 if journals or generations else 30 if clients else 14)
+            expiry = int(time.time()) + (40 if journals or generations or watchdog else 30 if clients else 14)
             pins = BrokerPins.parse({'max-text': [IPS[0]], 'telegram': [IPS[1]],
                                      'expires_at': expiry})
             result = prepare_fresh_policy(
@@ -196,6 +196,9 @@ def main(rotation=False, clients=False, journals=False, crash=False, recovery=Fa
             elif clients:
                 from tests.linux_client_rotation_fixture import controller
                 controller(ns,d,pins,client_root,journals=journals)
+            elif watchdog:
+                subprocess.run([*ns,*DROP,sys.executable,'-m','tests.linux_operator_watchdog_fixture',
+                    'exercise',d,str(expiry)],check=True,timeout=25)
             elif generations:
                 from tests.linux_generation_fixture import controller
                 controller(ns,d,pins,leased=leased)
@@ -208,7 +211,7 @@ def main(rotation=False, clients=False, journals=False, crash=False, recovery=Fa
             counts = [e['counter']['packets'] for i in json.loads(call(
                 *ns, 'nft', '-j', 'list', 'chain', 'inet', 'm2tg_egress', 'output'))['nftables']
                       if 'rule' in i for e in i['rule']['expr'] if 'counter' in e]
-            assert counts[0] > 2 and counts[1] >= (1 if rotation or clients or generations else 4), counts
+            assert counts[0] > 2 and counts[1] >= (1 if rotation or clients or generations or watchdog else 4), counts
             print('VETH KERNEL COUNTERS PASS', counts, flush=True)
     finally:
         try:
@@ -234,6 +237,8 @@ if __name__ == '__main__':
         main()
     elif sys.argv[1] == '--generation-recovery':
         main(clients=True,journals=True,crash=True,recovery=True,lineage=True)
+    elif sys.argv[1] == '--operator-watchdog':
+        main(watchdog=True)
     elif sys.argv[1] == '--controller-lease':
         main(generations=True,leased=True)
     elif sys.argv[1] == '--generations':
