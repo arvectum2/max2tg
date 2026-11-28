@@ -9,6 +9,7 @@ import tempfile
 
 from app.egress_policy import EgressDenied
 from app.generation_ledger import GenerationLedger
+from app.generation_controller import GenerationController
 from app.linux_egress_policy import BrokerPins
 from app.operator_pin_rotation import NamespaceHandle, digest, frame, parse, request, read_frame_fd, read_receipt
 from app.pinned_broker import PinnedBroker
@@ -99,15 +100,18 @@ def controller(ns,cert,old):
                     *DROP,sys.executable,'-m','tests.linux_generation_fixture',cert,str(old.expires_at),
                     str(identity[0]),str(identity[1]),str(handle.fd)],
                     pass_fds=(handle.fd,),stdin=subprocess.PIPE,stdout=subprocess.PIPE)
+                def send(data):
+                    assert child.stdin.write(data)==len(data)
+                    child.stdin.flush()
+                def stopped():
+                    if not child.stdin.closed:child.stdin.close()
+                    try:child.wait(timeout=10)
+                    except subprocess.TimeoutExpired:return False
+                    return child.poll() is not None
+                controller=GenerationController(ledger,send=send,
+                    receive=lambda:read_frame_fd(child.stdout.fileno(),timeout=8),stop_and_verify=stopped)
                 for current,replacement in ((old,new),(new,final)):
-                    nonce=ledger.arm(current,replacement)
-                    child.stdin.write(frame({'nonce':nonce}));child.stdin.flush()
-                    raw=read_frame_fd(child.stdout.fileno(),timeout=8)
-                    receipt=ledger.execute(raw)
-                    child.stdin.write(receipt);child.stdin.flush()
-                    ack=parse(read_frame_fd(child.stdout.fileno(),timeout=5))
-                    assert set(ack)=={'nonce','digest','ready'}
-                    ledger.confirm_adopted(nonce=ack['nonce'],pin_digest=ack['digest'],broker_ready=ack['ready'])
+                    assert controller.rotate(current,replacement)['state']=='ADOPTED'
                     if current==old:
                         bad=BrokerPins.parse(dict(new.record(),telegram=list(old.max_text),expires_at=final.expires_at))
                         try:ledger.arm(new,bad)
