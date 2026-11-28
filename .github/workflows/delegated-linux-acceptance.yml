@@ -5,6 +5,8 @@ on:
       - '.github/workflows/delegated-linux-acceptance.yml'
       - 'tests/linux_delegated_cgroup_fixture.py'
       - 'app/cgroup_readback.py'
+      - 'app/cgroup_retirement.py'
+      - 'tests/test_cgroup_retirement.py'
   workflow_dispatch:
 permissions:
   contents: read

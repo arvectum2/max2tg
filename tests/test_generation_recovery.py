@@ -130,3 +130,25 @@ def test_second_recovery_preserves_prior_epochs(lineage):
             assert len(fresh._load()[1])==4
             bad=next_pins(renewed,renewed,telegram=list(old.max_text))
             with pytest.raises(EgressDenied):fresh.arm(renewed,bad)
+
+
+
+@pytest.mark.parametrize('blocked',[None,'populated','foreign','new_running'])
+def test_recovery_requires_bound_retirement(lineage,blocked):
+    from app.cgroup_retirement import DelegatedRetirement
+    from app.operator_boundary import RetirementBoundary
+    g,ns,pins,state,install,_=lineage
+    cohort=DelegatedRetirement.__new__(DelegatedRetirement)
+    cohort.stopped=lambda:blocked!='populated'
+    boundary=RetirementBoundary(cohort,ns if blocked=='foreign' else g.namespace)
+    transition=RecoveryTransition(g,ns)
+    def prepare():
+        return transition.prepare_successor_from_boundary(pins,operator_approved=True,
+            boundary=boundary,new_stopped=lambda:blocked!='new_running',install=install)
+    if blocked is None:
+        fresh,nonce,result=prepare()
+        with fresh:assert result['recovery_prepared'] and not result['live_launch_authorized']
+        assert state.installs==1
+    else:
+        with pytest.raises(EgressDenied):prepare()
+        assert state.installs==0

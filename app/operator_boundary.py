@@ -10,6 +10,7 @@ import subprocess
 import time
 
 from app.egress_policy import EgressDenied
+from app.cgroup_retirement import DelegatedRetirement
 from app.generation_ledger import require
 from app.rotation_fence import _binding
 
@@ -59,7 +60,7 @@ class OwnedCohort:
 class RetirementBoundary:
     """Fresh read-only proof of a stopped owned cohort and retired namespace."""
     def __init__(self,cohort,namespace):
-        require(type(cohort) is OwnedCohort)
+        require(type(cohort) in (OwnedCohort,DelegatedRetirement))
         self.cohort=cohort
         self.namespace=namespace
         self.binding=_binding(namespace)
