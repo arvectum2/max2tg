@@ -44,8 +44,15 @@ async def real_broker(progress_fd,gate,action):
         raise EgressDenied('Acceptance fixture has no upstream')
     b=PinnedBroker(pins,channels,dial=deny_dial)
     stop=asyncio.Event()
-    task=asyncio.create_task(b.serve(stop,progress_fd=progress_fd))
+    gate_event=asyncio.Event()
+    task=asyncio.create_task(b.serve(stop,progress_fd=progress_fd,admission=gate_event))
     try:
+        deadline=time.monotonic()+5
+        while not Path(gate).exists():
+            assert not task.done() and time.monotonic()<deadline
+            assert not b.ready.is_set()
+            await asyncio.sleep(.025)
+        gate_event.set()
         await asyncio.wait_for(b.ready.wait(),2)
         deadline=time.monotonic()+20
         while time.monotonic()<deadline:
@@ -155,7 +162,13 @@ def main(unit,stalled=None):
         if stalled:
             def admit():
                 assert owned()
-                assert all((Path(anchor.name)/name/'proxy.sock').is_socket() for name in ('actual-max','actual-tg'))
+                import socket
+                for name,host in (('actual-max','api.oneme.ru'),('actual-tg','api.telegram.org')):
+                    with socket.socket(socket.AF_UNIX,socket.SOCK_STREAM) as sock:
+                        sock.settimeout(.5)
+                        sock.connect(str(Path(anchor.name)/name/'proxy.sock'))
+                        sock.sendall(f'CONNECT {host}:443 HTTP/1.1\r\nHost: {host}\r\n\r\n'.encode())
+                        assert b'403 Forbidden' in sock.recv(1024)
                 (Path(anchor.name)/'admitted').touch(exist_ok=False)
                 return True
             guard=CohortGuard(retirement)

@@ -100,3 +100,36 @@ def test_identity_change_after_mutation_blocks_receipt_without_retry():
     assert len(ns.calls)==1 and g.state=='BLOCKED'
     with pytest.raises(EgressDenied):g.execute(raw)
     assert len(ns.calls)==1
+
+
+@pytest.mark.parametrize('delta',[0,.002,.999])
+def test_apply_boundary_never_extends_reviewed_ttl(delta):
+    from app.linux_pin_rotation import rotation_batch
+    from app.operator_pin_rotation import _bounded_rotation_batch
+    old=BrokerPins.parse({'max-text':['8.8.8.8'],'telegram':['9.9.9.9'],'expires_at':1030},now=1000)
+    new=BrokerPins.parse({'max-text':['1.1.1.1'],'telegram':['9.9.9.9'],'expires_at':1040},now=1000)
+    submitted=rotation_batch(old,new,now=1000.999)
+    result=_bounded_rotation_batch(old,new,submitted,now=1000.999+delta)
+    ttl=min(39,new.remaining(now=1000.999+delta))-1
+    assert result==f'flush set inet m2tg_egress api_ipv4\nadd element inet m2tg_egress api_ipv4 {{ 1.1.1.1 timeout {ttl}s, 9.9.9.9 timeout {ttl}s }}\n'
+
+
+@pytest.mark.parametrize('mutation',['stale','inflated','foreign','mixed','too_short'])
+def test_apply_boundary_denies_invalid_or_exhausted_ttl(mutation):
+    from app.linux_pin_rotation import rotation_batch
+    from app.operator_pin_rotation import _bounded_rotation_batch
+    old=BrokerPins.parse({'max-text':['8.8.8.8'],'telegram':['9.9.9.9'],'expires_at':1039},now=1000)
+    new=BrokerPins.parse({'max-text':['1.1.1.1'],'telegram':['9.9.9.9'],'expires_at':1040},now=1000)
+    batch=rotation_batch(old,new,now=1000)
+    now=1000
+    if mutation=='stale':now=1002
+    elif mutation=='inflated':batch=batch.replace('40s','42s')
+    elif mutation=='foreign':batch=batch.replace('1.1.1.1','8.8.4.4')
+    elif mutation=='mixed':batch=batch.replace('40s','39s',1)
+    else:
+        # One second of transport reserve exhausts this reviewed TTL.
+        old=BrokerPins.parse(dict(old.record(),expires_at=1040),now=1039)
+        new=BrokerPins.parse(dict(new.record(),expires_at=1041),now=1039)
+        now=1039
+        batch=rotation_batch(old,new,now=now).replace('2s','1s')
+    with pytest.raises(EgressDenied):_bounded_rotation_batch(old,new,batch,now=now)

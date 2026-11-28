@@ -87,3 +87,28 @@ async def test_guard_cancellation_retires_and_keeps_readers_until_stop():
             with pytest.raises(OSError):os.fstat(fd)
     finally:
         os.close(c_wr);os.close(b_wr)
+
+
+async def test_expiry_during_ownership_verification_never_admits():
+    import time
+    cr,cw=os.pipe()
+    br,bw=os.pipe()
+    retired=[]
+    r=DelegatedRetirement.__new__(DelegatedRetirement)
+    def retire(**kwargs):
+        retired.append(True)
+        return {'state':'RETIRED'}
+    r.retire=retire
+    r.stopped=lambda:bool(retired)
+    def slow_verify():
+        time.sleep(1.05)
+        return True
+    def forbidden():
+        raise AssertionError('Expired grant admitted')
+    try:
+        renew(cw);renew(bw)
+        with pytest.raises(EgressDenied):
+            await CohortGuard(r).monitor(controller_fd=cr,broker_fd=br,seconds=1,
+                operator_approved=True,verify_owned=slow_verify,admit=forbidden)
+        assert retired==[True]
+    finally:os.close(cw);os.close(bw)

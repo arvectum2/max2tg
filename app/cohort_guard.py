@@ -36,6 +36,7 @@ class CohortGuard:
                 if not stop.is_set():
                     require(all(lease.valid() for _,lease in reasons))
                     require(verify_owned() is True)
+                    require(all(lease.valid() for _,lease in reasons))
                     require(admit() is True)
                     if all(lease.valid() for _,lease in reasons):
                         await stop.wait()
