@@ -10,6 +10,7 @@ import tempfile
 from app.egress_policy import EgressDenied
 from app.generation_ledger import GenerationLedger
 from app.generation_controller import GenerationController
+from app.controller_lease import renew
 from app.operator_boundary import OwnedCohort
 from app.linux_egress_policy import BrokerPins
 from app.operator_pin_rotation import NamespaceHandle, digest, frame, parse, request, read_frame_fd, read_receipt
@@ -23,7 +24,7 @@ def third(old,new):
     return BrokerPins.parse(dict(old.record(),expires_at=new.expires_at+8))
 
 
-async def exercise(cert,expiry,identity,fd,lifeline_fd):
+async def exercise(cert,expiry,identity,fd,lifeline_fd,leased=False):
     os.close(fd)
     info=os.stat('/proc/self/ns/net')
     assert (info.st_dev,info.st_ino)==identity
@@ -38,7 +39,8 @@ async def exercise(cert,expiry,identity,fd,lifeline_fd):
         for p in channels.values():p.mkdir(mode=0o700)
         b=PinnedBroker(old,channels)
         stop=asyncio.Event()
-        task=asyncio.create_task(b.serve_guarded(stop,lifeline_fd=lifeline_fd))
+        service=b.serve_leased(stop,lease_fd=lifeline_fd,seconds=5) if leased else b.serve_guarded(stop,lifeline_fd=lifeline_fd)
+        task=asyncio.create_task(service)
         writers=[]
         async def connect(role,host):
             reader,writer,head=await connect_request(channels[role],host)
@@ -77,13 +79,13 @@ async def exercise(cert,expiry,identity,fd,lifeline_fd):
             fr,fw=await connect('a'*24,'api.oneme.ru')
             await echo(fr,fw);await echo(tr,tw)
             print('TWO GENERATIONS TLS PASS',flush=True)
-            assert await asyncio.wait_for(task,8)==('STOPPED','EOF')
+            assert await asyncio.wait_for(task,8)==('STOPPED','LEASE_EXPIRED' if leased else 'EOF')
             assert not b.ready.is_set() and not b._streams
             assert all(not (p/'proxy.sock').exists() for p in channels.values())
             for r in (fr,tr):
                 try:assert await asyncio.wait_for(r.read(),2)==b''
                 except (ConnectionResetError,ssl.SSLEOFError):pass
-            print('IDLE LIFELINE EOF PASS: both retained TLS streams and listeners closed',flush=True)
+            print(('IDLE LEASE EXPIRY PASS' if leased else 'IDLE LIFELINE EOF PASS')+': both retained TLS streams and listeners closed',flush=True)
         finally:
             stop.set()
             await asyncio.wait_for(task,3)
@@ -93,7 +95,7 @@ async def exercise(cert,expiry,identity,fd,lifeline_fd):
                 except (OSError,TimeoutError):pass
 
 
-def controller(ns,cert,old):
+def controller(ns,cert,old,leased=False):
     pid=int(ns[2])
     info=os.stat(f'/proc/{pid}/ns/net')
     identity=(info.st_dev,info.st_ino)
@@ -105,21 +107,24 @@ def controller(ns,cert,old):
             with GenerationLedger(root,handle) as ledger:
                 ledger.initialize(old,operator_approved=True)
                 read_fd,write_fd=os.pipe()
-                owner=subprocess.Popen([sys.executable,'-c',
-                    'import sys,os;sys.stdin.buffer.read();os._exit(17)'],
-                    pass_fds=(write_fd,),stdin=subprocess.PIPE)
-                os.close(write_fd);write_fd=None
+                if leased:
+                    renew(write_fd)
+                else:
+                    owner=subprocess.Popen([sys.executable,'-c',
+                        'import sys,os;sys.stdin.buffer.read();os._exit(17)'],
+                        pass_fds=(write_fd,),stdin=subprocess.PIPE)
+                    os.close(write_fd);write_fd=None
                 child=subprocess.Popen(['/usr/bin/nsenter',f'--net=/proc/self/fd/{handle.fd}','--',
                     *DROP,sys.executable,'-m','tests.linux_generation_fixture',cert,str(old.expires_at),
-                    str(identity[0]),str(identity[1]),str(handle.fd),str(read_fd)],
+                    str(identity[0]),str(identity[1]),str(handle.fd),str(read_fd),*(["leased"] if leased else [])],
                     pass_fds=(handle.fd,read_fd),stdin=subprocess.PIPE,stdout=subprocess.PIPE)
                 os.close(read_fd);read_fd=None
-                cohort=OwnedCohort((owner,child))
+                cohort=OwnedCohort((child,) if leased else (owner,child))
                 def send(data):
                     assert child.stdin.write(data)==len(data)
                     child.stdin.flush()
                 def request_stop():
-                    if not owner.stdin.closed:owner.stdin.close()
+                    if owner is not None and not owner.stdin.closed:owner.stdin.close()
                     if not child.stdin.closed:child.stdin.close()
                     return True
                 def stopped():
@@ -128,6 +133,7 @@ def controller(ns,cert,old):
                     receive=lambda:read_frame_fd(child.stdout.fileno(),timeout=8),stop_and_verify=stopped)
                 for current,replacement in ((old,new),(new,final)):
                     assert controller.rotate(current,replacement)['state']=='ADOPTED'
+                    if leased:renew(write_fd)
                     if current==old:
                         bad=BrokerPins.parse(dict(new.record(),telegram=list(old.max_text),expires_at=final.expires_at))
                         try:ledger.arm(new,bad)
@@ -136,12 +142,15 @@ def controller(ns,cert,old):
                 assert read_frame_fd(child.stdout.fileno(),timeout=5)==b'TWO GENERATIONS TLS PASS\n'
                 # Only the auxiliary owner has the write FD. Its abnormal exit
                 # produces real EOF while the broker has active TLS streams.
-                owner.stdin.close()
-                assert owner.wait(timeout=3)==17
+                if not leased:
+                    owner.stdin.close()
+                    assert owner.wait(timeout=3)==17
+                # Leased case: actual coordinating process remains alive,
+                # retains its only write FD, and makes no further progress.
                 out,_=child.communicate(timeout=8)
                 print('TWO GENERATIONS TLS PASS',flush=True)
                 print(out.decode(),flush=True)
-                assert child.returncode==0 and b'IDLE LIFELINE EOF PASS' in out
+                assert child.returncode==0 and (b'IDLE LEASE EXPIRY PASS' if leased else b'IDLE LIFELINE EOF PASS') in out
                 assert cohort.stopped()
                 assert ledger.inspect()['matching_generations']==[2]
             with GenerationLedger(root,handle) as reopened:
@@ -164,4 +173,4 @@ def controller(ns,cert,old):
 
 
 if __name__=='__main__':
-    asyncio.run(exercise(sys.argv[1],int(sys.argv[2]),(int(sys.argv[3]),int(sys.argv[4])),int(sys.argv[5]),int(sys.argv[6])))
+    asyncio.run(exercise(sys.argv[1],int(sys.argv[2]),(int(sys.argv[3]),int(sys.argv[4])),int(sys.argv[5]),int(sys.argv[6]),'leased' in sys.argv[7:]))
