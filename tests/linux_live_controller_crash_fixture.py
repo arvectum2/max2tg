@@ -9,15 +9,17 @@ import time
 from app.egress_policy import EgressDenied
 from app.operator_pin_rotation import NamespaceHandle, frame, request, read_frame_fd
 from app.rotation_fence import RotationFence
+from app.generation_ledger import GenerationLedger
 from app.linux_egress_policy import BrokerPins
 from tests.linux_live_rotation_fixture import candidate
 from tests.linux_veth_fixture import IPS, DROP, call, isolated
 
 
-def crash(folder,pid,identity,expiry,request_fd,receipt_fd):
+def crash(folder,pid,identity,expiry,request_fd,receipt_fd,lineage=False):
     old=BrokerPins.parse({'max-text':[IPS[0]],'telegram':[IPS[1]],'expires_at':expiry})
     handle=NamespaceHandle(pid,expected=identity)
-    with RotationFence(folder,handle) as fence:
+    with (GenerationLedger if lineage else RotationFence)(folder,handle) as fence:
+        if lineage:fence.initialize(old,operator_approved=True)
         nonce=fence.arm(old,candidate(old))
         os.write(sys.stdout.fileno(),nonce.encode()+b'\n')
         raw=read_frame_fd(request_fd,timeout=20)
@@ -29,7 +31,9 @@ def crash(folder,pid,identity,expiry,request_fd,receipt_fd):
     raise AssertionError('Controller survived')
 
 
-def controller(ns,cert,old,root,recovery=False):
+def controller(ns,cert,old,root,recovery=False,lineage=False):
+    assert not lineage or recovery
+    ledger_type=GenerationLedger if lineage else RotationFence
     pid=int(ns[2])
     info=os.stat(f'/proc/{pid}/ns/net')
     identity=(info.st_dev,info.st_ino)
@@ -54,7 +58,7 @@ def controller(ns,cert,old,root,recovery=False):
             req_r,req_w=pipe();ack_r,ack_w=pipe()
             ctrl=subprocess.Popen([sys.executable,'-m','tests.linux_live_controller_crash_fixture',
                 'crash',anchor,str(pid),str(identity[0]),str(identity[1]),str(old.expires_at),
-                str(req_r),str(ack_w)],pass_fds=(req_r,ack_w),stdout=subprocess.PIPE)
+                str(req_r),str(ack_w),*(['lineage'] if lineage else [])],pass_fds=(req_r,ack_w),stdout=subprocess.PIPE)
             children.append(ctrl)
             close(req_r);close(ack_w)
             nonce=read_frame_fd(ctrl.stdout.fileno(),timeout=5).decode().strip()
@@ -72,10 +76,14 @@ def controller(ns,cert,old,root,recovery=False):
             assert ctrl.wait(timeout=22)==-signal.SIGKILL
             assert broker.wait(timeout=8)==0
             assert client.wait(timeout=12)==0
-            with RotationFence(anchor,handle) as recovered:
+            with ledger_type(anchor,handle) as recovered:
                 evidence=recovered.inspect()
-                assert evidence=={'state':'KERNEL_VERIFIED','matches':['replacement'],
-                    'automatic_retry':False,'live_launch_authorized':False,'requires_reconciliation':True}
+                if lineage:
+                    assert evidence=={'generation':1,'state':'KERNEL_VERIFIED','matching_generations':[1],
+                        'automatic_retry':False,'live_launch_authorized':False}
+                else:
+                    assert evidence=={'state':'KERNEL_VERIFIED','matches':['replacement'],
+                        'automatic_retry':False,'live_launch_authorized':False,'requires_reconciliation':True}
                 for action in (lambda:recovered.arm(old,candidate(old)),
                                lambda:recovered.execute(frame(request(nonce,old,candidate(old))))):
                     try:action()
@@ -87,8 +95,8 @@ def controller(ns,cert,old,root,recovery=False):
             print('LIVE CONTROLLER SIGKILL PASS: EOF, broker fail closed, durable fence retained',flush=True)
             if recovery:
                 from tests.linux_fresh_recovery_fixture import recover
-                recover(ns,cert,root,handle,client_ns,anchor)
-                with RotationFence(anchor,handle) as retained:
+                recover(ns,cert,root,handle,client_ns,anchor,lineage=lineage)
+                with ledger_type(anchor,handle) as retained:
                     assert retained.inspect()==evidence
                     try:retained.arm(old,candidate(old))
                     except EgressDenied:pass
@@ -108,4 +116,4 @@ def controller(ns,cert,old,root,recovery=False):
 if __name__=='__main__':
     assert sys.argv[1]=='crash'
     crash(sys.argv[2],int(sys.argv[3]),(int(sys.argv[4]),int(sys.argv[5])),
-          int(sys.argv[6]),int(sys.argv[7]),int(sys.argv[8]))
+          int(sys.argv[6]),int(sys.argv[7]),int(sys.argv[8]),'lineage' in sys.argv[9:])

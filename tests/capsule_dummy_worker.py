@@ -33,9 +33,15 @@ def main():
         "skip_personal_dotenv":os.environ.get("MAX2TG_NO_DOTENV"),
         "pid":os.getpid(),
     }
-    (state/"inspection.json").write_text(json.dumps(inspection))
+    def publish(name,payload):
+        # Match the real HealthMonitor atomic publication contract.
+        temp=state/('.'+name+'.tmp')
+        temp.write_text(json.dumps(payload))
+        os.replace(temp,state/name)
+    publish("health.json",data)
+    publish("inspection.json",inspection)
     while active:
-        (state/"health.json").write_text(json.dumps(data))
+        publish("health.json",data)
         time.sleep(0.05)
     os.close(fd)
 
