@@ -10,9 +10,12 @@ import select
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 
-from app.cgroup_readback import identity, readback, _read, _mount_id
+from app.cgroup_readback import identity, readback, _read
+from app.cgroup_retirement import RetirementJournal, DelegatedRetirement
+from app.egress_policy import EgressDenied
 
 
 UNIT=re.compile(r'max2tg-acceptance-[0-9]+-[0-9]+\.service')
@@ -42,7 +45,8 @@ def main(unit):
     assert Path('/proc/self/status').read_text().split('NoNewPrivs:\t')[1].splitlines()[0]=='1'
     path=Path('/sys/fs/cgroup')/expected.lstrip('/')
     fd=os.open(path,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
-    cohort=None;leaves=[];children=[]
+    cohort=None;leaves=[];children=[];journal=None
+    anchor=tempfile.TemporaryDirectory(prefix="cgroup-retirement-")
     try:
         source=identity(fd)
         assert os.fstat(fd).st_uid==os.getuid()
@@ -53,6 +57,9 @@ def main(unit):
         target=identity(cohort)
         assert target!=source and target['mount']==source['mount']
         assert readback(cohort,expected=target)['recursively_empty']
+        journal=RetirementJournal(anchor.name)
+        retirement=DelegatedRetirement(journal,parent_fd=fd,target_fd=cohort)
+        assert not retirement.stopped()
         for name in ('broker','worker'):
             os.mkdir(name,mode=0o700,dir_fd=cohort)
             leaf=os.open(name,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=cohort)
@@ -67,25 +74,38 @@ def main(unit):
         assert evidence['populated'] and evidence['direct_process_count']==0
         assert not evidence['recursively_empty'] and membership()==expected
         assert sorted(os.listdir(cohort)).count('broker')==1 and 'worker' in os.listdir(cohort)
-        # No arbitrary path or PID accepted. Only the newly-created subtree,
-        # exactly two owned child leaves, parent outside. All operations local.
-        for (_,leaf),p in zip(leaves,children):
-            assert p.poll() is None and _read(leaf,'cgroup.procs').splitlines()==[str(p.pid)]
-        assert identity(cohort)==target and not _read(cohort,'cgroup.procs').strip()
-        kfd=os.open('cgroup.kill',os.O_WRONLY|os.O_NOFOLLOW,dir_fd=cohort)
-        try:
-            assert _mount_id(kfd)==target['mount'] and membership()==expected
-            assert os.write(kfd,b'1')==1
-        finally:os.close(kfd)
+        def owned():
+            # Exact two leaf memberships; no extra nested groups.
+            actual={name for name in os.listdir(cohort)
+                    if (path/'max2tg-fixture'/name).is_dir()}
+            if actual!={'broker','worker'}:return False
+            for (name,leaf),p in zip(leaves,children):
+                if p.poll() is not None or _read(leaf,'cgroup.procs').splitlines()!=[str(p.pid)]:
+                    return False
+                if any((path/'max2tg-fixture'/name/member).is_dir() for member in os.listdir(leaf)):
+                    return False
+            return True
+        assert owned()
+        evidence=retirement.retire(operator_approved=True,verify_owned=owned)
+        assert evidence['state']=='RETIRED' and not evidence['live_launch_authorized']
         assert all(p.wait(timeout=5)==-signal.SIGKILL for p in children)
-        deadline=time.monotonic()+3
-        while not readback(cohort,expected=target)['recursively_empty']:
-            assert time.monotonic()<deadline
-            time.sleep(.05)
+        assert retirement.stopped()
+        try:retirement.retire(operator_approved=True,verify_owned=owned)
+        except EgressDenied:pass
+        else:raise AssertionError('Retirement replayed')
+        journal.close();journal=None
+        with RetirementJournal(anchor.name) as reopened:
+            assert reopened.inspect()==evidence
+            try:reopened.arm(source,target,expected)
+            except EgressDenied:pass
+            else:raise AssertionError('Reopened retirement armed')
+        print('DURABLE CGROUP RETIREMENT PASS: retained intent, verified empty, restart readback only',flush=True)
         assert membership()==expected and identity(fd)==source
         assert readback(fd,expected=source)['populated']
         print('DELEGATED CGROUP PASS: two owned descendant leaves, recursive kill, empty subtree, supervisor survived',flush=True)
     finally:
+        if journal is not None:journal.close()
+        anchor.cleanup()
         for p in children:
             if p.poll() is None:p.kill()
             p.wait(timeout=5)

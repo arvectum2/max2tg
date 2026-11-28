@@ -155,7 +155,10 @@ def recover(ns,cert,root,old_handle,client_ns,anchor,lineage=False,*,boundary):
             transition=RecoveryTransition(retained,handle)
             options=dict(operator_approved=True,stopped=lambda:boundary.retired() and not children,
                 install=lambda batch:handle._nft(['-f','-'],data=batch))
-            if lineage:successor,nonce,result=transition.prepare_successor(pins,**options)
+            if lineage:
+                successor,nonce,result=transition.prepare_successor_from_boundary(pins,
+                    operator_approved=True,boundary=boundary,new_stopped=lambda:not children,
+                    install=options['install'])
             else:result=transition.prepare(pins,**options)
             assert result['verified'] and result['recovery_prepared'] and not result['live_launch_authorized']
             assert transition.inspect()['prepared_policy_matches']

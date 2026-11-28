@@ -14,6 +14,7 @@ from app.linux_namespace_gate import prepare_fresh_policy, verify_ruleset
 from app.linux_pin_rotation import _handles
 from app.rotation_fence import LIMIT, RotationFence, _binding, _bundle
 from app.generation_ledger import GenerationLedger, LIMIT as GENERATION_LIMIT, MAX_ROTATIONS
+from app.operator_boundary import RetirementBoundary
 
 
 def _require(ok):
@@ -96,6 +97,14 @@ class RecoveryTransition:
         self._check(stopped)
         self._publish(dict(record,state='PREPARED',handles=[list(h) for h in _handles(observed)]),replace=True)
         return dict(result,recovery_prepared=True,automatic_retry=False)
+
+    def prepare_successor_from_boundary(self,pins,*,operator_approved,boundary,new_stopped,install):
+        # Caller retains exclusive ownership of both groups and namespaces,
+        # and establishes that this exact cohort contains all old writers.
+        _require(type(boundary) is RetirementBoundary and boundary.namespace is self.old.namespace
+                 and boundary.binding==self.old_identity)
+        return self.prepare_successor(pins,operator_approved=operator_approved,
+            stopped=lambda:boundary.retired() and new_stopped() is True,install=install)
 
     def prepare_successor(self,pins,*,operator_approved,stopped,install):
         # The successor is kept in a fixed owner-private subdirectory. The
