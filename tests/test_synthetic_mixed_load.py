@@ -44,3 +44,21 @@ def test_64_paced_rehearsal_is_bounded():
     assert summarize(64,effects,checks,samples,cycles=2)['messages']==512
     with pytest.raises(ValueError):summarize(64,effects,checks,samples[:2],cycles=2)
     with pytest.raises(ValueError):schedule(64,3)
+
+
+def test_phase_anchor_requires_all_four_fresh_checks():
+    from tests.synthetic_mixed_load import phase_anchor_ready
+    assert phase_anchor_ready(4,{0:20,1:21,2:22,3:23},24)
+    assert not phase_anchor_ready(4,{0:19.999,1:21,2:22,3:23},24)
+    assert not phase_anchor_ready(4,{0:23,1:23,2:23},24)
+    assert not phase_anchor_ready(4,{0:23,1:23,2:23,3:25},24)
+    assert not phase_anchor_ready(4,{0:23,1:23,2:23,3:float('nan')},24)
+    assert not phase_anchor_ready(32,{i:23 for i in range(32)},24)
+
+
+def test_existing_53_second_gate_not_relaxed():
+    effects=[[f'mixed-{d}-{i}-{j}',.5,at+.5] for at,pairs in schedule(4) for i,j in pairs for d in ('in','out')]
+    verified={str(i):[10,31.9,53.058,74] for i in range(4)}
+    samples=[{'at':at,'pending_in':0,'pending_out':0,'ready':4} for at in (34,45)]
+    with pytest.raises(ValueError,match='Missing repeated forum checks'):
+        summarize(4,effects,verified,samples)

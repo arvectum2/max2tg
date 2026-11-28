@@ -301,7 +301,14 @@ def main():
                     checkpoints=[]
                     if a.soak or a.storage_check:checkpoints.append({'at':0,'roles':resources_snapshot()})
                     if a.tenants>=32:exec_py(gateway,'from pathlib import Path;Path("/registry/lease-observe").touch()')
-                    begin=time.monotonic();touch('mixed-start');observations=[];deadline=begin+105+90*(cycles-1)
+                    begin=time.monotonic();touch('mixed-start')
+                    if a.tenants==4:
+                        # The broker starts the clock only after a fresh verification wave.
+                        # Sample against the observed start; do not count setup wait as load.
+                        wait(lambda:'mixed_phase_anchor' in counts(),timeout=35)
+                        begin=time.monotonic()
+                        print('MIXED PHASE ANCHOR '+json.dumps(counts()['mixed_phase_anchor'],sort_keys=True),flush=True)
+                    observations=[];deadline=begin+105+90*(cycles-1)
                     while True:
                         sample();last=samples[-1];result=counts()
                         ready_count=int(exec_py(gateway,'from pathlib import Path;print(sum((p/"egress.sock").is_socket() for p in Path("/channels").iterdir()))'))

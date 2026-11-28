@@ -48,7 +48,7 @@ class TunnelServer:
         if p.is_symlink() or st.st_uid!=os.getuid() or not stat.S_ISDIR(st.st_mode) or st.st_mode&0o077:raise PermissionError('Private channel required')
         if self.path.exists() or self.path.is_symlink():raise PermissionError('Socket path already exists')
         self.server=await asyncio.start_unix_server(self.handle,str(self.path),limit=LIMIT)
-        self.path.chmod(0o600);st=self.path.lstat();self.inode=(st.st_dev,st.st_ino)
+        st=self.path.lstat();self.inode=(st.st_dev,st.st_ino);self.path.chmod(0o600)
     async def handle(self,reader,writer):
         task=asyncio.current_task();up=None;sent=False
         if len(self.tasks)>=self.limit:await close_writer(writer);return
