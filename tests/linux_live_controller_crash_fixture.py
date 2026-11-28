@@ -9,6 +9,7 @@ import time
 from app.egress_policy import EgressDenied
 from app.operator_pin_rotation import NamespaceHandle, frame, request, read_frame_fd
 from app.rotation_fence import RotationFence
+from app.operator_boundary import OwnedCohort, RetirementBoundary
 from app.generation_ledger import GenerationLedger
 from app.linux_egress_policy import BrokerPins
 from tests.linux_live_rotation_fixture import candidate
@@ -73,9 +74,12 @@ def controller(ns,cert,old,root,recovery=False,lineage=False):
             client=subprocess.Popen([*client_ns,*DROP,sys.executable,'-m',
                 'tests.linux_client_rotation_fixture','client',cert,root,'journals','crash'])
             children.append(client)
-            assert ctrl.wait(timeout=22)==-signal.SIGKILL
-            assert broker.wait(timeout=8)==0
-            assert client.wait(timeout=12)==0
+            cohort=OwnedCohort(tuple(children))
+            boundary=RetirementBoundary(cohort,handle)
+            assert cohort.wait_stopped(25)
+            assert ctrl.returncode==-signal.SIGKILL
+            assert broker.returncode==client.returncode==0
+            assert boundary.stopped()
             with ledger_type(anchor,handle) as recovered:
                 evidence=recovered.inspect()
                 if lineage:
@@ -95,7 +99,7 @@ def controller(ns,cert,old,root,recovery=False,lineage=False):
             print('LIVE CONTROLLER SIGKILL PASS: EOF, broker fail closed, durable fence retained',flush=True)
             if recovery:
                 from tests.linux_fresh_recovery_fixture import recover
-                recover(ns,cert,root,handle,client_ns,anchor,lineage=lineage)
+                recover(ns,cert,root,handle,client_ns,anchor,lineage=lineage,boundary=boundary)
                 with ledger_type(anchor,handle) as retained:
                     assert retained.inspect()==evidence
                     try:retained.arm(old,candidate(old))

@@ -10,6 +10,7 @@ import tempfile
 from app.egress_policy import EgressDenied
 from app.generation_ledger import GenerationLedger
 from app.generation_controller import GenerationController
+from app.operator_boundary import OwnedCohort
 from app.linux_egress_policy import BrokerPins
 from app.operator_pin_rotation import NamespaceHandle, digest, frame, parse, request, read_frame_fd, read_receipt
 from app.pinned_broker import PinnedBroker
@@ -22,7 +23,7 @@ def third(old,new):
     return BrokerPins.parse(dict(old.record(),expires_at=new.expires_at+8))
 
 
-async def exercise(cert,expiry,identity,fd):
+async def exercise(cert,expiry,identity,fd,lifeline_fd):
     os.close(fd)
     info=os.stat('/proc/self/ns/net')
     assert (info.st_dev,info.st_ino)==identity
@@ -37,7 +38,7 @@ async def exercise(cert,expiry,identity,fd):
         for p in channels.values():p.mkdir(mode=0o700)
         b=PinnedBroker(old,channels)
         stop=asyncio.Event()
-        task=asyncio.create_task(b.serve(stop))
+        task=asyncio.create_task(b.serve_guarded(stop,lifeline_fd=lifeline_fd))
         writers=[]
         async def connect(role,host):
             reader,writer,head=await connect_request(channels[role],host)
@@ -76,6 +77,13 @@ async def exercise(cert,expiry,identity,fd):
             fr,fw=await connect('a'*24,'api.oneme.ru')
             await echo(fr,fw);await echo(tr,tw)
             print('TWO GENERATIONS TLS PASS',flush=True)
+            assert await asyncio.wait_for(task,8)==('STOPPED','EOF')
+            assert not b.ready.is_set() and not b._streams
+            assert all(not (p/'proxy.sock').exists() for p in channels.values())
+            for r in (fr,tr):
+                try:assert await asyncio.wait_for(r.read(),2)==b''
+                except (ConnectionResetError,ssl.SSLEOFError):pass
+            print('IDLE LIFELINE EOF PASS: both retained TLS streams and listeners closed',flush=True)
         finally:
             stop.set()
             await asyncio.wait_for(task,3)
@@ -90,24 +98,32 @@ def controller(ns,cert,old):
     info=os.stat(f'/proc/{pid}/ns/net')
     identity=(info.st_dev,info.st_ino)
     handle=NamespaceHandle(pid,expected=identity)
-    child=None
+    child=None;owner=None;read_fd=None;write_fd=None
     new=candidate(old);final=third(old,new)
     try:
         with tempfile.TemporaryDirectory(prefix='generation-anchor-') as root:
             with GenerationLedger(root,handle) as ledger:
                 ledger.initialize(old,operator_approved=True)
+                read_fd,write_fd=os.pipe()
+                owner=subprocess.Popen([sys.executable,'-c',
+                    'import sys,os;sys.stdin.buffer.read();os._exit(17)'],
+                    pass_fds=(write_fd,),stdin=subprocess.PIPE)
+                os.close(write_fd);write_fd=None
                 child=subprocess.Popen(['/usr/bin/nsenter',f'--net=/proc/self/fd/{handle.fd}','--',
                     *DROP,sys.executable,'-m','tests.linux_generation_fixture',cert,str(old.expires_at),
-                    str(identity[0]),str(identity[1]),str(handle.fd)],
-                    pass_fds=(handle.fd,),stdin=subprocess.PIPE,stdout=subprocess.PIPE)
+                    str(identity[0]),str(identity[1]),str(handle.fd),str(read_fd)],
+                    pass_fds=(handle.fd,read_fd),stdin=subprocess.PIPE,stdout=subprocess.PIPE)
+                os.close(read_fd);read_fd=None
+                cohort=OwnedCohort((owner,child))
                 def send(data):
                     assert child.stdin.write(data)==len(data)
                     child.stdin.flush()
-                def stopped():
+                def request_stop():
+                    if not owner.stdin.closed:owner.stdin.close()
                     if not child.stdin.closed:child.stdin.close()
-                    try:child.wait(timeout=10)
-                    except subprocess.TimeoutExpired:return False
-                    return child.poll() is not None
+                    return True
+                def stopped():
+                    return cohort.stop_once(request_stop,timeout=10)
                 controller=GenerationController(ledger,send=send,
                     receive=lambda:read_frame_fd(child.stdout.fileno(),timeout=8),stop_and_verify=stopped)
                 for current,replacement in ((old,new),(new,final)):
@@ -117,9 +133,16 @@ def controller(ns,cert,old):
                         try:ledger.arm(new,bad)
                         except EgressDenied:pass
                         else:raise AssertionError('Historical role transfer accepted')
+                assert read_frame_fd(child.stdout.fileno(),timeout=5)==b'TWO GENERATIONS TLS PASS\n'
+                # Only the auxiliary owner has the write FD. Its abnormal exit
+                # produces real EOF while the broker has active TLS streams.
+                owner.stdin.close()
+                assert owner.wait(timeout=3)==17
                 out,_=child.communicate(timeout=8)
+                print('TWO GENERATIONS TLS PASS',flush=True)
                 print(out.decode(),flush=True)
-                assert child.returncode==0 and b'TWO GENERATIONS TLS PASS' in out
+                assert child.returncode==0 and b'IDLE LIFELINE EOF PASS' in out
+                assert cohort.stopped()
                 assert ledger.inspect()['matching_generations']==[2]
             with GenerationLedger(root,handle) as reopened:
                 assert reopened.inspect()['state']=='ADOPTED'
@@ -129,6 +152,11 @@ def controller(ns,cert,old):
             print('PERSISTENT GENERATIONS PASS',flush=True)
     finally:
         try:
+            if write_fd is not None:os.close(write_fd)
+            if read_fd is not None:os.close(read_fd)
+            if owner is not None:
+                if not owner.stdin.closed:owner.stdin.close()
+                owner.wait(timeout=3)
             if child is not None and child.poll() is None:
                 if not child.stdin.closed:child.stdin.close()
                 child.wait(timeout=10)
@@ -136,4 +164,4 @@ def controller(ns,cert,old):
 
 
 if __name__=='__main__':
-    asyncio.run(exercise(sys.argv[1],int(sys.argv[2]),(int(sys.argv[3]),int(sys.argv[4])),int(sys.argv[5])))
+    asyncio.run(exercise(sys.argv[1],int(sys.argv[2]),(int(sys.argv[3]),int(sys.argv[4])),int(sys.argv[5]),int(sys.argv[6])))

@@ -109,6 +109,13 @@ class PinnedBroker:
         finally:
             self._rotating=False
 
+    async def serve_guarded(self,stop,*,lifeline_fd):
+        """Operator-owned broker lifetime tied to a dedicated private pipe."""
+        from app.controller_lifeline import ControllerLifeline
+        with ControllerLifeline(lifeline_fd,stop) as lifeline:
+            result=await self.serve(stop)
+            return result,lifeline.reason
+
     async def serve(self,stop):
         if self._used:raise PermissionError('Pin generation cannot be restarted')
         self._used=True;self._stop=stop;self._deadline=min(self._deadline,time.monotonic()+self.pins.remaining())
@@ -116,6 +123,7 @@ class PinnedBroker:
             for server in self.servers.values():
                 if stop.is_set():return 'STOPPED'
                 await server.start()
+            if stop.is_set():return 'STOPPED'
             self._running=True;self._accepting=True;self._valid();self.ready.set()
             while not stop.is_set():
                 try:self._lifetime()

@@ -77,3 +77,32 @@ async def test_expiry_during_dial_closes_upstream(channels):
     broker._dial=dial
     with pytest.raises(PermissionError):await broker._connect('max-text','api.oneme.ru:443')
     writer.wait_closed.assert_awaited_once()
+
+
+async def test_guarded_broker_preclosed_lifeline_never_admits(channels):
+    import os
+    rd,wr=os.pipe()
+    os.close(wr)
+    broker=PinnedBroker(pins(),channels)
+    stop=asyncio.Event()
+    assert await broker.serve_guarded(stop,lifeline_fd=rd)==('STOPPED','EOF')
+    assert stop.is_set() and not broker.ready.is_set()
+    assert all(not (p/'proxy.sock').exists() for p in channels.values())
+
+
+async def test_guarded_broker_lifeline_loss_after_ready(channels):
+    import os
+    rd,wr=os.pipe()
+    broker=PinnedBroker(pins(),channels)
+    stop=asyncio.Event()
+    task=asyncio.create_task(broker.serve_guarded(stop,lifeline_fd=rd))
+    try:
+        await asyncio.wait_for(broker.ready.wait(),2)
+        os.close(wr);wr=None
+        assert await asyncio.wait_for(task,2)==('STOPPED','EOF')
+        assert not broker.ready.is_set() and not broker._streams
+        assert all(not (p/'proxy.sock').exists() for p in channels.values())
+    finally:
+        if wr is not None:os.close(wr)
+        stop.set()
+        await asyncio.gather(task,return_exceptions=True)
