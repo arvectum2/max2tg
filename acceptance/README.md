@@ -31,3 +31,9 @@ The separate GitHub Actions workflow `delegated-linux-acceptance.yml` uses a hos
 3. On an independently retained guest volume, verify real filesystem persistence and controlled guest restart with synthetic message journals; keep UNKNOWN and never replay it. A guest restart is not host power-loss evidence.
 4. Perform sustained synthetic workload/idle monitoring, with explicit duration, no real tokens, and resource ceilings.
 5. Separate test accounts MAX and Telegram: explicit owner authorization, test forum and account binding, actual delivery/receipt tests, loss and recovery. Production data, personal services and credentials excluded. No GO for SaaS before independent acceptance.
+
+## Observed local VM preflight (2026-11-28)
+
+Owner-authorized exact create/start commands exited 0 (ARC job 0c030a6e-873d-4ff5-a21f-ee2ad24f0f28). Lima VZ instance max2tg-acceptance Running, official pinned image downloaded, management SSH loopback 127.0.0.1:64577 verified by host listener. Guest Ubuntu 24.04.5 LTS aarch64, kernel 6.8.0-147-generic, 2 CPUs, 3905 MiB RAM (3556 MiB available), ext4 root 23 GiB usable / 21 GiB free. PID 1 systemd, cgroup2 rw with nsdelegate, cgroup.kill present. No virtiofs/9p/sshfs/NFS mounts, SSH_AUTH_SOCK absent. Only guest SSH and local DNS TCP listeners observed. Default NAT route exists; this is not an air-gapped guest. Python 3.12.3 and cryptography available; pytest absent. No application code, dependencies or messenger credentials transferred. Actual local cgroup and persistence tests pending.
+
+Remote PR #77 delegated-cgroup job 140912072733 succeeded: two owned descendant leaves, recursive kill, empty subtree, supervisor survived. All seven checks passed; merged 9f63eb8529288c01dec2cebd0d89408365108e03. This validates the disposable hosted runner, not local guest or production lifecycle.
