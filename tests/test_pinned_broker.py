@@ -144,3 +144,37 @@ async def test_leased_broker_expires_with_writer_open(channels):
         os.close(wr)
         stop.set()
         await asyncio.gather(task,return_exceptions=True)
+
+
+async def test_actual_service_loop_reports_progress_and_stops(channels):
+    import os
+    from app.controller_lease import ControllerLease
+    rd,wr=os.pipe()
+    b=PinnedBroker(pins(),channels)
+    stop=asyncio.Event()
+    watchdog_stop=asyncio.Event()
+    try:
+        with ControllerLease(rd,watchdog_stop,seconds=1) as lease:
+            task=asyncio.create_task(b.serve(stop,progress_fd=wr))
+            await asyncio.wait_for(lease.ready.wait(),.5)
+            assert b.ready.is_set() and lease.valid()
+            await asyncio.sleep(1.2)
+            assert lease.valid()
+            stop.set()
+            assert await task=='STOPPED'
+            await asyncio.wait_for(watchdog_stop.wait(),2)
+            assert lease.reason=='LEASE_EXPIRED'
+    finally:os.close(wr)
+
+
+async def test_progress_writer_loss_closes_actual_service(channels):
+    import os
+    rd,wr=os.pipe()
+    b=PinnedBroker(pins(),channels)
+    os.close(rd)
+    try:
+        with pytest.raises(BrokenPipeError):
+            await b.serve(asyncio.Event(),progress_fd=wr)
+        assert not b.ready.is_set()
+        assert all(not (p/'proxy.sock').exists() for p in channels.values())
+    finally:os.close(wr)

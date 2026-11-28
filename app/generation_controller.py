@@ -5,6 +5,7 @@ callback. On ambiguity never retry: invalidate the local controller and require
 the operator to reconcile. Stopping processes is the caller's responsibility.
 """
 from app.egress_policy import EgressDenied
+from app.controller_lease import renew
 from app.generation_ledger import GenerationLedger, require
 from app.operator_pin_rotation import frame, parse
 
@@ -39,6 +40,21 @@ class GenerationController:
             raise EgressDenied('Controller failed; shutdown unverified; operator intervention required') from exc
         if stopped is not True:
             raise EgressDenied('Controller failed; shutdown unverified; operator intervention required')
+
+    def renew_progress(self,fd):
+        """Only a current usable ledger with exact live kernel evidence renews."""
+        require(not self.failed)
+        try:
+            require(self.ledger.usable and self.ledger.grant is None)
+            value,history=self.ledger._current()
+            entries=value['rotations']
+            state=entries[-1]['state'] if entries else value.get('activation',{}).get('state','INITIAL')
+            require(state in ('INITIAL','ADOPTED'))
+            self.ledger._verify(history[-1],value['handles'])
+            renew(fd)
+        except BaseException:
+            self._fail()
+            raise
 
     def rotate(self,current,replacement):
         require(not self.failed)

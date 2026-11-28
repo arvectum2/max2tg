@@ -19,7 +19,7 @@ def phase_anchor_ready(tenants, checks, now):
 
 
 def schedule(tenants,cycles=1):
-    if type(cycles) is not int or not 1<=cycles<=3:raise ValueError('Invalid cycle count')
+    if type(cycles) is not int or not (1<=cycles<=3 or tenants==4 and cycles==40):raise ValueError('Invalid cycle count')
     if tenants not in (2,4,8,16,32,64):raise ValueError('Invalid cohort')
     seq=Counter();waves=[]
     def add(at,counts):

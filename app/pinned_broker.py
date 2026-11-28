@@ -5,6 +5,7 @@ Reviewed generations; all listeners and tunnels close on expiry or ambiguity.
 import asyncio,re,time
 from pathlib import Path
 from app.egress_policy import EgressDenied
+from app.controller_lease import renew
 from app.egress_tunnel import TunnelServer,close_writer
 from app.linux_egress_policy import BrokerPins
 from app.linux_pin_rotation import rotation_batch
@@ -132,7 +133,7 @@ class PinnedBroker:
             result=await self.serve(stop)
             return ("STOPPED" if lease.reason is not None else result),lease.reason
 
-    async def serve(self,stop):
+    async def serve(self,stop,*,progress_fd=None):
         if self._used:raise PermissionError('Pin generation cannot be restarted')
         self._used=True;self._stop=stop;self._deadline=min(self._deadline,time.monotonic()+self.pins.remaining())
         try:
@@ -144,6 +145,10 @@ class PinnedBroker:
             while not stop.is_set():
                 try:self._lifetime()
                 except EgressDenied:return 'ROTATION_FAILED' if self._failed else 'EXPIRED'
+                # Only this actual service loop may renew. No separate task
+                # can mask a stalled loop, failed rotation or closed lifetime.
+                if progress_fd is not None:
+                    renew(progress_fd)
                 try:await asyncio.wait_for(stop.wait(),min(.1,max(.001,self._deadline-time.monotonic())))
                 except TimeoutError:pass
             return 'STOPPED'

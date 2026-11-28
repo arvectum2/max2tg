@@ -109,7 +109,7 @@ async def placed_broker(sessions,args):
     if 'operator' in args:
         marker.unlink(missing_ok=True)
         asyncio.get_running_loop().add_signal_handler(signal.SIGTERM,marker.touch)
-    await broker(['/network/'+sid for sid,_,_ in sessions]+['/network/telegram'],long_poll='long-poll' in args,mixed='mixed' in args,cycles=(2 if len(sessions)==64 else 3) if 'soak' in args else 1,delay=.15 if 'delay150' in args else 0,fault='balanced-fault' in args,account_binding='account-binding' in args)
+    await broker(['/network/'+sid for sid,_,_ in sessions]+['/network/telegram'],long_poll='long-poll' in args,mixed='mixed' in args,cycles=40 if 'hour-soak' in args else (2 if len(sessions)==64 else 3) if 'soak' in args else 1,delay=.15 if 'delay150' in args else 0,fault='balanced-fault' in args,account_binding='account-binding' in args)
 
 if __name__=='__main__':
     mode=sys.argv[1]

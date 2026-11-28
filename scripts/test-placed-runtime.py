@@ -8,7 +8,7 @@ from app.deployment_plan import build_plan,_verify_stopped,validate_bind_sources
 from app.container_supervisor import DockerBackend
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--image',required=True);p.add_argument('--native-volumes',action='store_true');p.add_argument('--load',type=int,choices=range(1,26));p.add_argument('--tenants',type=int,choices=(2,4,8,16,32,64),default=2);p.add_argument('--profile',action='store_true');p.add_argument('--long-poll',action='store_true');p.add_argument('--mixed',action='store_true');p.add_argument('--soak',action='store_true');p.add_argument('--storage-check',action='store_true');p.add_argument('--wal-maintenance',action='store_true');p.add_argument('--delay150',action='store_true');p.add_argument('--balanced',action='store_true');p.add_argument('--balanced-fault',action='store_true');p.add_argument('--reconcile-revoked',action='store_true');p.add_argument('--operator-lifecycle',action='store_true');p.add_argument('--operator-recovery',action='store_true');p.add_argument('--operator-backup',action='store_true');p.add_argument('--operator-restore',action='store_true');p.add_argument('--operator-sessions',action='store_true');p.add_argument('--account-binding',action='store_true');a=p.parse_args();
+    p=argparse.ArgumentParser();p.add_argument('--image',required=True);p.add_argument('--native-volumes',action='store_true');p.add_argument('--load',type=int,choices=range(1,26));p.add_argument('--tenants',type=int,choices=(2,4,8,16,32,64),default=2);p.add_argument('--profile',action='store_true');p.add_argument('--long-poll',action='store_true');p.add_argument('--mixed',action='store_true');p.add_argument('--soak',action='store_true');p.add_argument('--hour-soak',action='store_true');p.add_argument('--storage-check',action='store_true');p.add_argument('--wal-maintenance',action='store_true');p.add_argument('--delay150',action='store_true');p.add_argument('--balanced',action='store_true');p.add_argument('--balanced-fault',action='store_true');p.add_argument('--reconcile-revoked',action='store_true');p.add_argument('--operator-lifecycle',action='store_true');p.add_argument('--operator-recovery',action='store_true');p.add_argument('--operator-backup',action='store_true');p.add_argument('--operator-restore',action='store_true');p.add_argument('--operator-sessions',action='store_true');p.add_argument('--account-binding',action='store_true');a=p.parse_args();
     if a.account_binding and not (a.native_volumes and a.tenants==2 and not (a.load or a.mixed or a.balanced_fault or a.operator_lifecycle)):p.error('Account binding requires separate two-session native fixture')
     if a.operator_sessions and not (a.operator_lifecycle and not a.operator_backup):p.error('Session operations require a separate stopped lifecycle fixture')
     if a.operator_restore and not a.operator_backup:p.error('Restore requires operator backup fixture')
@@ -21,6 +21,7 @@ def main():
     if (a.delay150 or a.balanced) and not a.balanced_fault and not (a.mixed and a.profile and a.long_poll and a.native_volumes):p.error('Experimental comparison requires native profiled mixed long polling')
     if a.storage_check and not a.mixed:p.error('Storage check requires mixed workload')
     if a.wal_maintenance and not (a.storage_check or a.soak):p.error('WAL candidate requires resource checkpoints')
+    if a.hour_soak and not (a.soak and a.tenants==4 and a.wal_maintenance and not a.balanced and not a.delay150):p.error('Hour soak requires four tenants, ordinary mixed soak and WAL maintenance')
     if a.soak and not a.mixed:p.error('Soak requires mixed workload')
     if a.mixed and (a.load or not (a.native_volumes and a.profile and a.long_poll)):p.error('Mixed requires native volumes, profile, long-poll and no load')
     if a.long_poll and not ((a.load or a.mixed) and a.profile):p.error('Long polling comparison requires profiled bounded load')
@@ -82,6 +83,7 @@ def main():
                     if a.long_poll:s['command'].append('long-poll')
                     if a.mixed:s['command'].append('mixed')
                     if a.soak:s['command'].append('soak')
+                    if a.hour_soak:s['command'].append('hour-soak')
                     if a.delay150:s['command'].append('delay150')
                     if a.balanced_fault:s['command'].append('balanced-fault')
                 else:
@@ -291,7 +293,7 @@ def main():
                     from collections import Counter
                     from tests.synthetic_mixed_load import schedule,summarize
                     from app.stage_profile import aggregate_profiles
-                    cycles=(2 if a.tenants==64 else 3) if a.soak else 1;waves=schedule(a.tenants,cycles);per=Counter(i for _,pairs in waves for i,j in pairs);n=sum(per.values());target=a.tenants+n
+                    cycles=40 if a.hour_soak else (2 if a.tenants==64 else 3) if a.soak else 1;waves=schedule(a.tenants,cycles);per=Counter(i for _,pairs in waves for i,j in pairs);n=sum(per.values());target=a.tenants+n
                     def resources_snapshot():
                         by_role={}
                         for role,cid in ids.items():
