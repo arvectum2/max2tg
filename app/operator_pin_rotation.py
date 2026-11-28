@@ -98,28 +98,43 @@ class NamespaceHandle:
         return json.loads(self._nft(['-j','list','ruleset']))
 
     def apply_reviewed(self,current,replacement,batch):
-        # The exact address set is the only permitted mutation. Re-rendering
-        # is time-sensitive; compare the grammar and each approved address,
-        # using the TTL from this batch and a bounded current remaining time.
-        match=re.fullmatch(r'flush set inet m2tg_egress api_ipv4\nadd element inet m2tg_egress api_ipv4 \{ (.+) \}\n',batch)
-        if not match:_deny('Unexpected rotation transaction')
-        items=match[1].split(', ')
-        expected=replacement.max_text+replacement.telegram
-        if len(items)!=len(expected):_deny('Unexpected pin count')
-        ttls=[]
-        for item,ip in zip(items,expected):
-            m=re.fullmatch(re.escape(ip)+r' timeout ([1-9][0-9]{0,3})s',item)
-            if not m:_deny('Unexpected pin transaction')
-            ttls.append(int(m[1]))
-        remaining=replacement.remaining()
-        if len(set(ttls))!=1 or ttls[0]>remaining or remaining-ttls[0]>1:
-            _deny('Unexpected rotation lifetime')
-        rotation_batch(current,replacement,now=time.time())
-        self._nft(['-f','-'],data=batch)
+        # Validate the caller's reviewed transaction, then shorten its relative
+        # TTL at the actual apply boundary. Never extend a reviewed lifetime.
+        self.check()
+        reviewed=_bounded_rotation_batch(current,replacement,batch,now=time.time())
+        self._nft(['-f','-'],data=reviewed)
 
     def close(self):
         if self.fd is not None:
             os.close(self.fd);self.fd=None
+
+
+def _bounded_rotation_batch(current,replacement,batch,*,now):
+    # The caller and application may straddle an integer-second boundary.
+    # Permit only a one-second difference in either direction, and re-render
+    # with the smaller TTL minus a one-second transport/readback reserve.
+    # This never increases the submitted TTL and rejects stale/foreign input.
+    if type(batch) is not str:
+        _deny('Unexpected rotation transaction')
+    match=re.fullmatch(r'flush set inet m2tg_egress api_ipv4\nadd element inet m2tg_egress api_ipv4 \{ (.+) \}\n',batch)
+    if not match:_deny('Unexpected rotation transaction')
+    rotation_batch(current,replacement,now=now)
+    items=match[1].split(', ')
+    expected=replacement.max_text+replacement.telegram
+    if len(items)!=len(expected):_deny('Unexpected pin count')
+    ttls=[]
+    for item,ip in zip(items,expected):
+        m=re.fullmatch(re.escape(ip)+r' timeout ([1-9][0-9]{0,3})s',item)
+        if not m:_deny('Unexpected pin transaction')
+        ttls.append(int(m[1]))
+    remaining=replacement.remaining(now=now)
+    if len(set(ttls))!=1 or abs(ttls[0]-remaining)>1:
+        _deny('Unexpected rotation lifetime')
+    ttl=min(ttls[0],remaining)-1
+    if ttl<1:_deny('Insufficient rotation lifetime')
+    elements=', '.join(f'{ip} timeout {ttl}s' for ip in expected)
+    return ('flush set inet m2tg_egress api_ipv4\n'
+            f'add element inet m2tg_egress api_ipv4 {{ {elements} }}\n')
 
 
 def digest(pins):

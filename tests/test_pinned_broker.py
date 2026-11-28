@@ -178,3 +178,55 @@ async def test_progress_writer_loss_closes_actual_service(channels):
         assert not b.ready.is_set()
         assert all(not (p/'proxy.sock').exists() for p in channels.values())
     finally:os.close(wr)
+
+
+async def test_gated_progress_cannot_admit_early_and_revocation_is_terminal(channels):
+    import os
+    from app.controller_lease import ControllerLease
+    rd,wr=os.pipe()
+    dial=AsyncMock()
+    b=PinnedBroker(pins(),channels,dial=dial)
+    stop=asyncio.Event()
+    gate=asyncio.Event()
+    try:
+        with ControllerLease(rd,asyncio.Event(),seconds=2) as lease:
+            task=asyncio.create_task(b.serve(stop,progress_fd=wr,admission=gate))
+            await asyncio.wait_for(lease.ready.wait(),1)
+            assert not b.ready.is_set() and lease.valid()
+            r,w,head=await request(channels[SID],'api.oneme.ru')
+            assert b'403' in head
+            w.close();await w.wait_closed()
+            dial.assert_not_awaited()
+            gate.set()
+            await asyncio.wait_for(b.ready.wait(),1)
+            assert lease.valid()
+            gate.clear()
+            r,w,head=await request(channels[SID],'api.oneme.ru')
+            assert b'403' in head
+            w.close();await w.wait_closed()
+            dial.assert_not_awaited()
+            assert await asyncio.wait_for(task,1)=='STOPPED'
+            assert not b.ready.is_set()
+            gate.set()
+            with pytest.raises(PermissionError):await b.serve(stop)
+    finally:
+        os.close(wr)
+
+
+async def test_gate_without_progress_denied(channels):
+    b=PinnedBroker(pins(),channels)
+    with pytest.raises(ValueError):
+        await b.serve(asyncio.Event(),admission=asyncio.Event())
+    assert all(not (p/'proxy.sock').exists() for p in channels.values())
+
+
+async def test_initially_open_gate_denied(channels):
+    import os
+    rd,wr=os.pipe()
+    b=PinnedBroker(pins(),channels)
+    gate=asyncio.Event();gate.set()
+    try:
+        with pytest.raises(ValueError):
+            await b.serve(asyncio.Event(),progress_fd=wr,admission=gate)
+        assert all(not (p/'proxy.sock').exists() for p in channels.values())
+    finally:os.close(rd);os.close(wr)

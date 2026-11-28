@@ -29,7 +29,7 @@ class PinnedBroker:
             paths[role]=p;identities.add(identity)
         self._dial=dial;self._deadline=time.monotonic()+self.pins.remaining();self._accepting=False;self._used=False;self.ready=asyncio.Event()
         self._generation=0;self._rotating=False;self._failed=False;self._running=False
-        self._streams={};self._stop=None;self._lease=None
+        self._streams={};self._stop=None;self._lease=None;self._admission=None
         self.servers={k:TunnelServer('telegram' if k=='telegram' else 'max-text',p/'proxy.sock',connector=self._connect,max_connections=16 if k=='telegram' else 8) for k,p in paths.items()}
 
     def _lifetime(self):
@@ -41,7 +41,8 @@ class PinnedBroker:
 
     def _valid(self):
         self._lifetime()
-        if not self._accepting or (self._stop is not None and self._stop.is_set()):
+        if (not self._accepting or (self._stop is not None and self._stop.is_set())
+                or (self._admission is not None and not self._admission.is_set())):
             raise EgressDenied('Broker admission closed')
 
     def _prune(self):
@@ -133,15 +134,22 @@ class PinnedBroker:
             result=await self.serve(stop)
             return ("STOPPED" if lease.reason is not None else result),lease.reason
 
-    async def serve(self,stop,*,progress_fd=None):
+    async def serve(self,stop,*,progress_fd=None,admission=None):
         if self._used:raise PermissionError('Pin generation cannot be restarted')
-        self._used=True;self._stop=stop;self._deadline=min(self._deadline,time.monotonic()+self.pins.remaining())
+        self._used=True
+        if admission is not None and (type(admission) is not asyncio.Event or progress_fd is None
+                                      or admission.is_set()):
+            raise ValueError('Explicit progress and admission gate required')
+        self._admission=admission;self._stop=stop;self._deadline=min(self._deadline,time.monotonic()+self.pins.remaining())
         try:
             for server in self.servers.values():
                 if stop.is_set():return 'STOPPED'
                 await server.start()
             if stop.is_set():return 'STOPPED'
-            self._running=True;self._accepting=True;self._valid();self.ready.set()
+            self._running=True
+            admitted=False
+            if admission is None:
+                self._accepting=True;self._valid();self.ready.set();admitted=True
             while not stop.is_set():
                 try:self._lifetime()
                 except EgressDenied:return 'ROTATION_FAILED' if self._failed else 'EXPIRED'
@@ -149,6 +157,10 @@ class PinnedBroker:
                 # can mask a stalled loop, failed rotation or closed lifetime.
                 if progress_fd is not None:
                     renew(progress_fd)
+                if admission is not None:
+                    if admitted and not admission.is_set():return 'STOPPED'
+                    if not admitted and admission.is_set():
+                        self._accepting=True;self._valid();self.ready.set();admitted=True
                 try:await asyncio.wait_for(stop.wait(),min(.1,max(.001,self._deadline-time.monotonic())))
                 except TimeoutError:pass
             return 'STOPPED'
