@@ -11,6 +11,7 @@ import time
 from app.capsule_registry import CapsuleRegistry
 from app.egress_policy import EgressDenied
 from app.rotation_fence import RotationFence
+from app.operator_boundary import OwnedCohort, RetirementBoundary
 from app.generation_ledger import GenerationLedger
 from app.generation_controller import GenerationController
 from app.isolated_transport import isolated_max_client, isolated_telegram_bot
@@ -100,10 +101,12 @@ async def client(cert,root):
     print('FRESH JOURNALS PASS: same account, offset 3 -> 4, UNKNOWN retained, new delivery confirmed',flush=True)
 
 
-def recover(ns,cert,root,old_handle,client_ns,anchor,lineage=False):
+def recover(ns,cert,root,old_handle,client_ns,anchor,lineage=False,*,boundary):
     ledger_type=GenerationLedger if lineage else RotationFence
     # Fixture-only explicit operator decision. Old broker and clients already
     # exited, original grant retained. Retire the exact fixture link, not rules.
+    assert type(boundary) is RetirementBoundary and boundary.namespace is old_handle
+    assert boundary.stopped()
     old_handle.check()
     isolated(ns,{'lo','eth0'})
     isolated([],{'lo','m2server'})
@@ -115,6 +118,8 @@ def recover(ns,cert,root,old_handle,client_ns,anchor,lineage=False):
     isolated(ns,{'lo'})
     isolated([],{'lo'})
     assert not json.loads(call(*ns,'ip','-j','-4','route','show','table','main'))
+    assert boundary.retired()
+    print('OWNED COHORT RETIREMENT PASS',flush=True)
     keeper=subprocess.Popen(['unshare','--net','sleep','35'])
     handle=None;children=[];successor=None;nonce=None
     try:
@@ -148,14 +153,14 @@ def recover(ns,cert,root,old_handle,client_ns,anchor,lineage=False):
             expiry=max(int(time.time())+28,latest+1)
             pins=BrokerPins.parse({'max-text':[IPS[2]],'telegram':[IPS[1]],'expires_at':expiry})
             transition=RecoveryTransition(retained,handle)
-            options=dict(operator_approved=True,stopped=lambda:not children,
+            options=dict(operator_approved=True,stopped=lambda:boundary.retired() and not children,
                 install=lambda batch:handle._nft(['-f','-'],data=batch))
             if lineage:successor,nonce,result=transition.prepare_successor(pins,**options)
             else:result=transition.prepare(pins,**options)
             assert result['verified'] and result['recovery_prepared'] and not result['live_launch_authorized']
             assert transition.inspect()['prepared_policy_matches']
             try:RecoveryTransition(retained,handle).prepare(pins,operator_approved=True,
-                stopped=lambda:not children,install=lambda batch:handle._nft(['-f','-'],data=batch))
+                stopped=lambda:boundary.retired() and not children,install=lambda batch:handle._nft(['-f','-'],data=batch))
             except EgressDenied:pass
             else:raise AssertionError('Prepared recovery replayed')
             print('DURABLE RECOVERY TRANSITION PASS',flush=True)
@@ -165,15 +170,12 @@ def recover(ns,cert,root,old_handle,client_ns,anchor,lineage=False):
             str(identity[0]),str(identity[1]),str(handle.fd),*([nonce] if lineage else [])],
             pass_fds=(handle.fd,),stdout=subprocess.PIPE if lineage else None))
         if lineage:
+            broker_cohort=OwnedCohort(tuple(children))
             def stopped():
-                # Fixture broker has a bounded lifetime; caller cannot claim
-                # verified stop until the process actually exits.
-                try:children[0].wait(timeout=25)
-                except subprocess.TimeoutExpired:return False
-                return children[0].poll() is not None
+                return broker_cohort.wait_stopped(25)
             controller=GenerationController(successor,send=lambda _:None,
                 receive=lambda:read_frame_fd(children[0].stdout.fileno(),timeout=5),stop_and_verify=stopped)
-            assert old_handle.retired()
+            assert boundary.retired()
             evidence=controller.adopt_recovery(nonce)
             assert evidence['generation']==2 and evidence['state']=='ADOPTED'
             # Even addresses no longer in the immediately preceding bundle
@@ -184,8 +186,9 @@ def recover(ns,cert,root,old_handle,client_ns,anchor,lineage=False):
             else:raise AssertionError('Historical role changed across recovery')
             print('RECOVERED GENERATION ADOPTED PASS',flush=True)
         children.append(subprocess.Popen([*client_ns,*DROP,sys.executable,'-m','tests.linux_fresh_recovery_fixture','client',cert,root]))
-        assert children[1].wait(timeout=23)==0
-        assert children[0].wait(timeout=5)==0
+        fresh_cohort=OwnedCohort(tuple(children))
+        assert fresh_cohort.wait_stopped(28)
+        assert all(p.returncode==0 for p in children)
         if lineage:
             out=children[0].stdout.read()
             children[0].stdout.close()
