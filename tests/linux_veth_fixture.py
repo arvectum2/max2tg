@@ -137,7 +137,7 @@ async def exercise(cert, expiry):
 
 
 
-def main(rotation=False, clients=False, journals=False, crash=False, recovery=False, generations=False, lineage=False):
+def main(rotation=False, clients=False, journals=False, crash=False, recovery=False, generations=False, lineage=False, leased=False):
     isolated([], {'lo'})
     assert os.getuid() == 0 and 'NoNewPrivs:\t1' in Path('/proc/self/status').read_text()
     assert not json.loads(call('ip', '-j', '-4', 'route', 'show', 'table', 'main'))
@@ -198,7 +198,7 @@ def main(rotation=False, clients=False, journals=False, crash=False, recovery=Fa
                 controller(ns,d,pins,client_root,journals=journals)
             elif generations:
                 from tests.linux_generation_fixture import controller
-                controller(ns,d,pins)
+                controller(ns,d,pins,leased=leased)
             elif rotation:
                 from tests.linux_live_rotation_fixture import controller
                 controller(ns, d, pins)
@@ -234,6 +234,8 @@ if __name__ == '__main__':
         main()
     elif sys.argv[1] == '--generation-recovery':
         main(clients=True,journals=True,crash=True,recovery=True,lineage=True)
+    elif sys.argv[1] == '--controller-lease':
+        main(generations=True,leased=True)
     elif sys.argv[1] == '--generations':
         main(generations=True)
     elif sys.argv[1] == '--fresh-recovery':

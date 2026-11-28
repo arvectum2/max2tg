@@ -28,13 +28,15 @@ class PinnedBroker:
             paths[role]=p;identities.add(identity)
         self._dial=dial;self._deadline=time.monotonic()+self.pins.remaining();self._accepting=False;self._used=False;self.ready=asyncio.Event()
         self._generation=0;self._rotating=False;self._failed=False;self._running=False
-        self._streams={};self._stop=None
+        self._streams={};self._stop=None;self._lease=None
         self.servers={k:TunnelServer('telegram' if k=='telegram' else 'max-text',p/'proxy.sock',connector=self._connect,max_connections=16 if k=='telegram' else 8) for k,p in paths.items()}
 
     def _lifetime(self):
         if self._failed or self._deadline is None or time.monotonic()>=self._deadline:
             raise EgressDenied('Broker pin generation closed')
         self.pins.remaining()
+        if self._lease is not None and not self._lease.valid():
+            raise EgressDenied('Controller lease closed')
 
     def _valid(self):
         self._lifetime()
@@ -115,6 +117,20 @@ class PinnedBroker:
         with ControllerLifeline(lifeline_fd,stop) as lifeline:
             result=await self.serve(stop)
             return result,lifeline.reason
+
+    async def serve_leased(self,stop,*,lease_fd,seconds):
+        """Wait for initial progress; revoke admission on lease loss."""
+        from app.controller_lease import ControllerLease
+        if self._used or self._lease is not None:
+            raise PermissionError('Pin generation cannot be restarted')
+        with ControllerLease(lease_fd,stop,seconds=seconds) as lease:
+            self._lease=lease
+            await lease.ready.wait()
+            if not lease.valid():
+                self._used=True
+                return 'STOPPED',lease.reason
+            result=await self.serve(stop)
+            return ("STOPPED" if lease.reason is not None else result),lease.reason
 
     async def serve(self,stop):
         if self._used:raise PermissionError('Pin generation cannot be restarted')

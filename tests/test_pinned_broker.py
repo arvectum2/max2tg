@@ -106,3 +106,41 @@ async def test_guarded_broker_lifeline_loss_after_ready(channels):
         if wr is not None:os.close(wr)
         stop.set()
         await asyncio.gather(task,return_exceptions=True)
+
+
+async def test_leased_broker_never_admits_without_initial_renewal(channels):
+    import os
+    rd,wr=os.pipe()
+    broker=PinnedBroker(pins(),channels)
+    stop=asyncio.Event()
+    task=asyncio.create_task(broker.serve_leased(stop,lease_fd=rd,seconds=1))
+    try:
+        await asyncio.sleep(.05)
+        assert not broker.ready.is_set()
+        assert all(not (p/'proxy.sock').exists() for p in channels.values())
+        assert await asyncio.wait_for(task,2)==('STOPPED','LEASE_EXPIRED')
+        assert not broker.ready.is_set()
+        assert all(not (p/'proxy.sock').exists() for p in channels.values())
+    finally:
+        os.close(wr)
+        stop.set()
+        await asyncio.gather(task,return_exceptions=True)
+
+
+async def test_leased_broker_expires_with_writer_open(channels):
+    import os
+    from app.controller_lease import renew
+    rd,wr=os.pipe()
+    broker=PinnedBroker(pins(),channels)
+    stop=asyncio.Event()
+    task=asyncio.create_task(broker.serve_leased(stop,lease_fd=rd,seconds=1))
+    try:
+        renew(wr)
+        await asyncio.wait_for(broker.ready.wait(),.5)
+        assert await asyncio.wait_for(task,2)==('STOPPED','LEASE_EXPIRED')
+        assert not broker.ready.is_set() and not broker._streams
+        assert all(not (p/'proxy.sock').exists() for p in channels.values())
+    finally:
+        os.close(wr)
+        stop.set()
+        await asyncio.gather(task,return_exceptions=True)
