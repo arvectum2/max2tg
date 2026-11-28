@@ -7,6 +7,8 @@ on:
       - 'app/cgroup_readback.py'
       - 'app/cgroup_retirement.py'
       - 'tests/test_cgroup_retirement.py'
+      - 'app/cohort_guard.py'
+      - 'tests/test_cohort_guard.py'
   workflow_dispatch:
 permissions:
   contents: read
@@ -35,3 +37,34 @@ jobs:
             --property=MemoryMax=128M --property=CPUQuota=100% \
             --property="WorkingDirectory=$GITHUB_WORKSPACE" \
             "$(command -v python)" -m tests.linux_delegated_cgroup_fixture "$unit"
+      - name: Verify independent progress guard retires both owned processes
+        run: |
+          set -eu
+          for role in broker controller controller_exit; do
+            case "$role" in broker) suffix=1;; controller) suffix=2;; controller_exit) suffix=3;; esac
+            unit="max2tg-acceptance-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}${suffix}.service"
+            sudo systemd-run --unit="$unit" --wait --pipe --collect \
+              --property="User=$(id -un)" --property=Delegate=yes \
+              --property=NoNewPrivileges=yes --property=PrivateNetwork=yes \
+              --property=RuntimeMaxSec=45s --property=TasksMax=16 \
+              --property=MemoryMax=128M --property=CPUQuota=100% \
+              --property="WorkingDirectory=$GITHUB_WORKSPACE" \
+              "$(command -v python)" -m tests.linux_delegated_cgroup_fixture "$unit" "$role"
+          done
+  mixed-soak-rehearsal:
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Build exact reviewed runtime for synthetic rehearsal
+        run: docker build --pull --tag max2tg:acceptance-soak .
+      - name: Three-cycle mixed traffic and idle resource rehearsal
+        run: |
+          python3 scripts/test-placed-runtime.py --image max2tg:acceptance-soak \
+            --native-volumes --tenants 4 --profile --long-poll --mixed --soak --wal-maintenance
