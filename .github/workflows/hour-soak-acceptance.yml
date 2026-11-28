@@ -1,0 +1,25 @@
+name: Hour synthetic soak acceptance
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: max2tg-hour-synthetic-soak
+  cancel-in-progress: false
+jobs:
+  hour-soak:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Build exact source for synthetic acceptance
+        run: docker build --pull --tag max2tg:hour-soak .
+      - name: Forty cycles, four tenants, native volumes, no live APIs
+        run: |
+          python3 scripts/test-placed-runtime.py --image max2tg:hour-soak \
+            --native-volumes --tenants 4 --profile --long-poll --mixed --soak --hour-soak --wal-maintenance

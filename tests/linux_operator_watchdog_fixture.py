@@ -10,7 +10,6 @@ import sys
 import tempfile
 import time
 
-from app.controller_lease import renew
 from app.egress_policy import EgressDenied
 from app.linux_egress_policy import BrokerPins
 from app.operator_watchdog import WatchdogJournal, watch
@@ -26,13 +25,11 @@ async def broker(root,expiry,progress_fd):
     channels={'a'*24:root/'max','telegram':root/'tg'}
     b=PinnedBroker(pins,channels)
     stop=asyncio.Event()
-    task=asyncio.create_task(b.serve(stop))
+    task=asyncio.create_task(b.serve(stop,progress_fd=progress_fd))
     try:
         await asyncio.wait_for(b.ready.wait(),2)
-        renew(progress_fd)
         (root/'ready').touch()
         while not (root/'hang').exists():
-            renew(progress_fd)
             await asyncio.sleep(.1)
         # Actual blocked event loop; the lease writer remains open.
         (root/'hung').touch()

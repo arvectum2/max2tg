@@ -53,3 +53,7 @@ Owner-approved exact c6de3d9290efeaa3cdaaa0134b297341afdb8084 script, ARC job 5a
 ## Dual-progress cohort guard
 
 After explicit approval of the exact commit, run `bash acceptance/run-guest-cohort-guard.sh <full-reviewed-HEAD>` from a clean worktree. Three bounded private-network delegated guest services simulate independent broker/controller progress loss and verify complete owned group retirement. No restart. The hosted workflow also runs all three scenarios and a separate three-cycle mixed workload rehearsal (not long-duration acceptance). See docs/SAAS_COHORT_GUARD_20261128.md.
+
+## Actual progress and hour rehearsal
+
+The updated cohort guard guest harness uses actual PinnedBroker service-loop progress and refuses any upstream dial. Controller remains synthetic inside this private service. Explicitly approved invocation uses the same exact-commit run-guest-cohort-guard.sh. Separate manual-only Hour synthetic soak acceptance workflow runs four tenants for 40 cycles, 4160 messages; no real account access. It must be explicitly dispatched on a reviewed ref after CI, and results reviewed before claiming acceptance. See docs/SAAS_VERIFIED_PROGRESS_20261128.md.

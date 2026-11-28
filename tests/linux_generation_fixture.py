@@ -10,7 +10,6 @@ import tempfile
 from app.egress_policy import EgressDenied
 from app.generation_ledger import GenerationLedger
 from app.generation_controller import GenerationController
-from app.controller_lease import renew
 from app.operator_boundary import OwnedCohort
 from app.linux_egress_policy import BrokerPins
 from app.operator_pin_rotation import NamespaceHandle, digest, frame, parse, request, read_frame_fd, read_receipt
@@ -107,9 +106,7 @@ def controller(ns,cert,old,leased=False):
             with GenerationLedger(root,handle) as ledger:
                 ledger.initialize(old,operator_approved=True)
                 read_fd,write_fd=os.pipe()
-                if leased:
-                    renew(write_fd)
-                else:
+                if not leased:
                     owner=subprocess.Popen([sys.executable,'-c',
                         'import sys,os;sys.stdin.buffer.read();os._exit(17)'],
                         pass_fds=(write_fd,),stdin=subprocess.PIPE)
@@ -131,9 +128,10 @@ def controller(ns,cert,old,leased=False):
                     return cohort.stop_once(request_stop,timeout=10)
                 controller=GenerationController(ledger,send=send,
                     receive=lambda:read_frame_fd(child.stdout.fileno(),timeout=8),stop_and_verify=stopped)
+                if leased:controller.renew_progress(write_fd)
                 for current,replacement in ((old,new),(new,final)):
                     assert controller.rotate(current,replacement)['state']=='ADOPTED'
-                    if leased:renew(write_fd)
+                    if leased:controller.renew_progress(write_fd)
                     if current==old:
                         bad=BrokerPins.parse(dict(new.record(),telegram=list(old.max_text),expires_at=final.expires_at))
                         try:ledger.arm(new,bad)

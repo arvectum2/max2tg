@@ -62,3 +62,16 @@ def test_existing_53_second_gate_not_relaxed():
     samples=[{'at':at,'pending_in':0,'pending_out':0,'ready':4} for at in (34,45)]
     with pytest.raises(ValueError,match='Missing repeated forum checks'):
         summarize(4,effects,verified,samples)
+
+
+def test_hour_soak_preserves_all_forty_idle_gates():
+    waves=schedule(4,40)
+    assert len(waves)==480 and waves[-1][0]==3580
+    effects=[[f'mixed-{d}-{i}-{j}',.5,at+.5] for at,pairs in waves for i,j in pairs for d in ('in','out')]
+    assert len(effects)==4160 and len({r[0] for r in effects})==4160
+    verified={str(i):[35+90*c for c in range(40)] for i in range(4)}
+    samples=[{'at':at+90*c,'pending_in':0,'pending_out':0,'ready':4} for c in range(40) for at in (35,45)]
+    assert summarize(4,effects,verified,samples,cycles=40)['messages']==4160
+    with pytest.raises(ValueError):summarize(4,effects,verified,samples[:-1],cycles=40)
+    with pytest.raises(ValueError):schedule(4,39)
+    with pytest.raises(ValueError):schedule(16,40)
